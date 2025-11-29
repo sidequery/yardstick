@@ -41,19 +41,7 @@ FROM t GROUP BY year;
 
 **Workaround**: Create the CASE expression outside the measure, or use a subquery.
 
-### 3. AT (WHERE) Column Scope
-
-```sql
--- ISSUE: AT (WHERE) can only reference columns in the view, not base table
-CREATE VIEW v AS SELECT year, SUM(amount) AS MEASURE revenue FROM t GROUP BY year;
-
-AGGREGATE(revenue) AT (WHERE amount > 100)  -- FAILS: 'amount' not in view
-AGGREGATE(revenue) AT (WHERE year > 2022)   -- WORKS: 'year' is in view
-```
-
-**Workaround**: Only filter on dimensions that appear in the view's GROUP BY.
-
-### 4. Table Aliases with Qualified References
+### 3. Table Aliases with Qualified References
 
 ```sql
 -- ISSUE: Table aliases conflict with internal _outer alias
@@ -63,7 +51,7 @@ SELECT s.year, AGGREGATE(s.revenue) FROM sales_v s GROUP BY s.year;
 
 **Workaround**: Don't use table aliases, or don't use qualified column references.
 
-### 5. No Derived Measures
+### 4. No Derived Measures
 
 ```sql
 -- NOT YET SUPPORTED: Measures referencing other measures
@@ -77,7 +65,7 @@ FROM t GROUP BY year;
 
 **Workaround**: Calculate derived values in the SELECT using AGGREGATE().
 
-### 6. No Window Function Measures
+### 5. No Window Function Measures
 
 ```sql
 -- NOT SUPPORTED: Window functions in measure definitions
@@ -95,7 +83,7 @@ FROM t;
 | `AT (ALL dim)` | Removes specific dimension | Working |
 | `AT (ALL dim1, dim2)` | Removes multiple dimensions | Working |
 | `AT (SET dim = val)` | Fixes dimension to value | Working |
-| `AT (WHERE cond)` | Pre-aggregation filter | Partial (view columns only) |
+| `AT (WHERE cond)` | Pre-aggregation filter | Working |
 | `AT (VISIBLE)` | Uses query's WHERE clause | Working |
 | Chained AT | Multiple AT modifiers | Limited |
 
