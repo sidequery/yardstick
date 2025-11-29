@@ -26,8 +26,8 @@ SELECT
 FROM sales
 GROUP BY year, region;
 
--- Query with AGGREGATE() and AT modifiers
-SELECT
+-- Query with AGGREGATE() and AT modifiers (SEMANTIC prefix required)
+SEMANTIC SELECT
     year,
     region,
     AGGREGATE(revenue) AS revenue,
@@ -55,8 +55,10 @@ Supported aggregations: `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`
 
 ### Querying Measures
 
+Queries using `AGGREGATE()` must use the `SEMANTIC` prefix:
+
 ```sql
-SELECT
+SEMANTIC SELECT
     dimensions,
     AGGREGATE(measure_name) [AT modifier]
 FROM view_name
@@ -79,7 +81,7 @@ GROUP BY dimensions;
 ### Percent of Total
 
 ```sql
-SELECT
+SEMANTIC SELECT
     region,
     AGGREGATE(revenue) AS revenue,
     100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL) AS pct_total
@@ -90,7 +92,7 @@ GROUP BY region;
 ### Year-over-Year Growth
 
 ```sql
-SELECT
+SEMANTIC SELECT
     year,
     AGGREGATE(revenue) AS revenue,
     AGGREGATE(revenue) AT (SET year = year - 1) AS prior_year,
@@ -103,7 +105,7 @@ GROUP BY year;
 ### Contribution to Parent
 
 ```sql
-SELECT
+SEMANTIC SELECT
     year,
     region,
     AGGREGATE(revenue) AS revenue,

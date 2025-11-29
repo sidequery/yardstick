@@ -53,31 +53,3 @@ SELECT year,
 FROM t;
 ```
 
-## AT Modifier Reference
-
-| Modifier | Description | Status |
-|----------|-------------|--------|
-| `AT (ALL)` | Grand total, removes all dimensions | Working |
-| `AT (ALL dim)` | Removes specific dimension | Working |
-| `AT (ALL dim1, dim2)` | Removes multiple dimensions | Working |
-| `AT (SET dim = val)` | Fixes dimension to value | Working |
-| `AT (WHERE cond)` | Pre-aggregation filter | Working |
-| `AT (VISIBLE)` | Uses query's WHERE clause | Working |
-| Chained AT | Multiple AT modifiers | Limited |
-
-## Implementation Notes
-
-The implementation rewrites AGGREGATE() calls into correlated subqueries:
-
-```sql
--- Input:
-SELECT year, AGGREGATE(revenue) AT (ALL year) FROM v GROUP BY year;
-
--- Rewritten to:
-SELECT year, (
-  SELECT SUM(revenue) FROM v AS _outer
-  WHERE TRUE  -- AT (ALL year) removes year filter
-) FROM v GROUP BY year;
-```
-
-This approach has limitations with complex expressions and nested contexts.
