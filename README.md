@@ -120,7 +120,7 @@ GROUP BY year, region;
 Prerequisites:
 - CMake 3.5+
 - C++17 compiler
-- Rust (for the SQL rewriter)
+- Cargo
 
 ```bash
 make        # builds Rust library and DuckDB extension
