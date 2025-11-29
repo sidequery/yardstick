@@ -543,15 +543,59 @@ fn from_clause(input: &str) -> IResult<&str, &str> {
 
 /// Extract table name from SQL FROM clause
 pub fn extract_table_name_from_sql(sql: &str) -> Option<String> {
+    extract_table_and_alias_from_sql(sql).map(|(name, _)| name)
+}
+
+/// Extract table name and optional alias from SQL FROM clause
+/// Returns (table_name, Option<alias>)
+pub fn extract_table_and_alias_from_sql(sql: &str) -> Option<(String, Option<String>)> {
     // Normalize whitespace to handle newlines/tabs in SQL
     let normalized: String = sql.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).collect();
     let normalized_upper = normalized.to_uppercase();
     let from_pos = normalized_upper.find(" FROM ")?;
     let after_from = &normalized[from_pos..];
 
-    from_clause(after_from)
-        .ok()
-        .map(|(_, name)| name.to_string())
+    // Parse: FROM table_name [AS] [alias]
+    let (rest, _) = multispace1::<_, nom::error::Error<&str>>(after_from).ok()?;
+    let (rest, _) = tag_no_case::<_, _, nom::error::Error<&str>>("FROM")(rest).ok()?;
+    let (rest, _) = multispace1::<_, nom::error::Error<&str>>(rest).ok()?;
+    let (rest, table) = identifier(rest).ok()?;
+
+    // Check for alias (optional AS keyword followed by identifier)
+    let rest_trimmed = rest.trim_start();
+
+    // Check for end of FROM clause (WHERE, GROUP, ORDER, etc.)
+    let rest_upper = rest_trimmed.to_uppercase();
+    if rest_trimmed.is_empty()
+        || rest_upper.starts_with("WHERE")
+        || rest_upper.starts_with("GROUP")
+        || rest_upper.starts_with("ORDER")
+        || rest_upper.starts_with("LIMIT")
+        || rest_upper.starts_with("HAVING")
+        || rest_upper.starts_with("JOIN")
+        || rest_trimmed.starts_with(';')
+    {
+        return Some((table.to_string(), None));
+    }
+
+    // Try to parse optional AS keyword
+    let after_as = if rest_upper.starts_with("AS ") {
+        &rest_trimmed[3..]
+    } else {
+        rest_trimmed
+    };
+
+    // Parse the alias identifier
+    if let Ok((_, alias)) = identifier(after_as.trim_start()) {
+        // Make sure alias isn't a keyword
+        let alias_upper = alias.to_uppercase();
+        if matches!(alias_upper.as_str(), "WHERE" | "GROUP" | "ORDER" | "LIMIT" | "HAVING" | "JOIN") {
+            return Some((table.to_string(), None));
+        }
+        Some((table.to_string(), Some(alias.to_string())))
+    } else {
+        Some((table.to_string(), None))
+    }
 }
 
 /// Extract WHERE clause from SQL query
@@ -1086,7 +1130,11 @@ pub fn expand_at_to_sql(
             let dim_lower = dim.to_lowercase();
             let correlating_dims: Vec<_> = group_by_cols
                 .iter()
-                .filter(|col| col.to_lowercase() != dim_lower)
+                .filter(|col| {
+                    // Extract just the column name (handle qualified refs like "s.year")
+                    let col_name = col.split('.').last().unwrap_or(col);
+                    col_name.to_lowercase() != dim_lower
+                })
                 .collect();
 
             if correlating_dims.is_empty() {
@@ -1096,7 +1144,11 @@ pub fn expand_at_to_sql(
                 // Correlate on remaining dimensions
                 let where_clauses: Vec<_> = correlating_dims
                     .iter()
-                    .map(|col| format!("_inner.{} = {}.{}", col, outer_ref, col))
+                    .map(|col| {
+                        // Extract just the column name for _inner reference
+                        let col_name = col.split('.').last().unwrap_or(col);
+                        format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                    })
                     .collect();
                 format!(
                     "(SELECT {} FROM {} _inner WHERE {})",
@@ -1138,7 +1190,11 @@ pub fn expand_at_to_sql(
                 // Correlate on GROUP BY columns and apply WHERE
                 let where_clauses: Vec<_> = group_by_cols
                     .iter()
-                    .map(|col| format!("_inner.{} = {}.{}", col, outer_ref, col))
+                    .map(|col| {
+                        // Extract just the column name for _inner reference
+                        let col_name = col.split('.').last().unwrap_or(col);
+                        format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                    })
                     .collect();
                 let full_where = match outer_where {
                     Some(w) => format!("{} AND {}", where_clauses.join(" AND "), w),
@@ -1259,7 +1315,9 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         return expand_aggregate(sql);
     }
 
-    let table_name = extract_table_name_from_sql(sql).unwrap_or_else(|| "t".to_string());
+    // Extract table name and any existing alias
+    let (table_name, existing_alias) = extract_table_and_alias_from_sql(sql)
+        .unwrap_or_else(|| ("t".to_string(), None));
 
     // Extract outer WHERE clause for VISIBLE semantics
     let outer_where = extract_where_clause(sql);
@@ -1268,7 +1326,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     // Extract GROUP BY columns for AT (ALL dim) correlation
     let group_by_cols = extract_group_by_columns(sql);
 
-    // Check if any AT modifier needs correlation - we need to add an outer alias
+    // Check if any AT modifier needs correlation
     let needs_outer_alias = at_patterns.iter().any(|(_, modifiers, _, _)| {
         modifiers.iter().any(|m| {
             matches!(m, ContextModifier::Set(_, _)) ||
@@ -1278,12 +1336,17 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     });
 
     let mut result_sql = sql.to_string();
-    let outer_alias = if needs_outer_alias {
-        // Add alias to FROM clause: "FROM table" -> "FROM table _outer"
-        let from_pattern = format!("FROM {}", table_name);
-        let from_replacement = format!("FROM {} _outer", table_name);
-        result_sql = result_sql.replace(&from_pattern, &from_replacement);
-        Some("_outer")
+    let outer_alias: Option<&str> = if needs_outer_alias {
+        if let Some(ref alias) = existing_alias {
+            // User already has an alias, use it
+            Some(alias.as_str())
+        } else {
+            // No alias, add _outer
+            let from_pattern = format!("FROM {}", table_name);
+            let from_replacement = format!("FROM {} _outer", table_name);
+            result_sql = result_sql.replace(&from_pattern, &from_replacement);
+            Some("_outer")
+        }
     } else {
         None
     };
@@ -2004,5 +2067,73 @@ mod tests {
         ];
         let expanded = expand_modifiers_to_sql("revenue", "SUM", &modifiers, "sales_v", None, None, &[]);
         assert_eq!(expanded, "(SELECT SUM(revenue) FROM sales_v)");
+    }
+
+    #[test]
+    fn test_extract_table_and_alias() {
+        // No alias
+        assert_eq!(
+            extract_table_and_alias_from_sql("SELECT * FROM orders"),
+            Some(("orders".to_string(), None))
+        );
+
+        // With alias (no AS)
+        assert_eq!(
+            extract_table_and_alias_from_sql("SELECT * FROM orders o"),
+            Some(("orders".to_string(), Some("o".to_string())))
+        );
+
+        // With AS keyword
+        assert_eq!(
+            extract_table_and_alias_from_sql("SELECT * FROM sales_v AS s"),
+            Some(("sales_v".to_string(), Some("s".to_string())))
+        );
+
+        // With WHERE clause after
+        assert_eq!(
+            extract_table_and_alias_from_sql("SELECT * FROM orders o WHERE x = 1"),
+            Some(("orders".to_string(), Some("o".to_string())))
+        );
+
+        // With GROUP BY after (no alias)
+        assert_eq!(
+            extract_table_and_alias_from_sql("SELECT x FROM orders GROUP BY x"),
+            Some(("orders".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn test_expand_with_user_alias() {
+        // Setup: register a measure view
+        clear_measure_views();
+        store_measure_view(
+            "sales_v",
+            vec![ViewMeasure {
+                column_name: "revenue".to_string(),
+                expression: "SUM(amount)".to_string(),
+            }],
+            "SELECT year, SUM(amount) AS revenue FROM sales GROUP BY year",
+        );
+
+        // Test with user-provided alias "s"
+        let sql = "SELECT s.year, AGGREGATE(revenue) AT (SET year = year - 1) FROM sales_v s GROUP BY s.year";
+        let result = expand_aggregate_with_at(sql);
+
+        eprintln!("Expanded SQL: {}", result.expanded_sql);
+        assert!(result.had_aggregate);
+        // Should use "s" not "_outer"
+        assert!(result.expanded_sql.contains("s.year"));
+        assert!(!result.expanded_sql.contains("_outer"));
+    }
+
+    #[test]
+    fn test_extract_alias_multiline() {
+        // Test with newline before alias (as in actual SQL test)
+        let sql = "SELECT s.year
+FROM sales_yearly s
+GROUP BY s.year";
+        let result = extract_table_and_alias_from_sql(sql);
+        eprintln!("Result: {:?}", result);
+        assert_eq!(result, Some(("sales_yearly".to_string(), Some("s".to_string()))));
     }
 }

@@ -22,9 +22,13 @@ set(EXTENSION_SOURCES src/yardstick_extension.cpp)
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# Mark Rust library as imported so CMake tracks it
+add_library(yardstick_rust STATIC IMPORTED)
+set_target_properties(yardstick_rust PROPERTIES IMPORTED_LOCATION ${YARDSTICK_LIB})
+
 # Link the Rust static library
-target_link_libraries(${EXTENSION_NAME} ${YARDSTICK_LIB})
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${YARDSTICK_LIB})
+target_link_libraries(${EXTENSION_NAME} yardstick_rust)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} yardstick_rust)
 
 # On macOS, we need to link against some system frameworks
 if(APPLE)

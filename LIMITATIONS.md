@@ -41,17 +41,7 @@ FROM t GROUP BY year;
 
 **Workaround**: Create the CASE expression outside the measure, or use a subquery.
 
-### 3. Table Aliases with Qualified References
-
-```sql
--- ISSUE: Table aliases conflict with internal _outer alias
-SELECT s.year, AGGREGATE(s.revenue) FROM sales_v s GROUP BY s.year;
--- May produce incorrect results or errors
-```
-
-**Workaround**: Don't use table aliases, or don't use qualified column references.
-
-### 4. No Derived Measures
+### 3. No Derived Measures
 
 ```sql
 -- NOT YET SUPPORTED: Measures referencing other measures
@@ -65,7 +55,7 @@ FROM t GROUP BY year;
 
 **Workaround**: Calculate derived values in the SELECT using AGGREGATE().
 
-### 5. No Window Function Measures
+### 4. No Window Function Measures
 
 ```sql
 -- NOT SUPPORTED: Window functions in measure definitions

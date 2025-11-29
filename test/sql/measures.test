@@ -567,8 +567,35 @@ GROUP BY year, region;
 
 # =============================================================================
 # Test: AT modifiers with aliased table
-# Note: Table aliases with qualified refs currently conflict with _outer alias generation
 # =============================================================================
+
+# Table alias without AS keyword
+query IR rowsort
+SEMANTIC SELECT s.year, AGGREGATE(revenue) AT (SET year = year - 1) AS prior_year
+FROM sales_yearly s
+GROUP BY s.year;
+----
+2022	NULL
+2023	150.0
+
+# Table alias with AS keyword
+query IR rowsort
+SEMANTIC SELECT s.year, AGGREGATE(revenue) AT (ALL year) AS grand_total
+FROM sales_yearly AS s
+GROUP BY s.year;
+----
+2022	375.0
+2023	375.0
+
+# Table alias with VISIBLE modifier
+query IIR rowsort
+SEMANTIC SELECT s.year, s.region, AGGREGATE(revenue) AT (VISIBLE) AS visible_rev
+FROM sales_v AS s
+WHERE s.region = 'US'
+GROUP BY s.year, s.region;
+----
+2022	US	100.0
+2023	US	150.0
 
 # =============================================================================
 # Test: Expression in AGGREGATE argument (if supported)
