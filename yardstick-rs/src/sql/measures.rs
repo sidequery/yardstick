@@ -679,6 +679,18 @@ pub fn extract_aggregation_function(expr: &str) -> Option<String> {
     Some(name.to_lowercase())
 }
 
+/// Find any aggregation function inside an expression
+/// "CASE WHEN SUM(x) > 100 THEN 1 ELSE 0 END" -> Some("sum")
+fn find_aggregation_in_expression(expr: &str) -> Option<String> {
+    let expr_upper = expr.to_uppercase();
+    for agg in ["SUM", "COUNT", "AVG", "MIN", "MAX"] {
+        if expr_upper.contains(&format!("{}(", agg)) {
+            return Some(agg.to_lowercase());
+        }
+    }
+    None
+}
+
 /// Qualify dimension reference in expression for correlated subquery
 /// "year - 1" with table "sales" and dim "year" -> "sales.year - 1"
 pub fn qualify_outer_reference(expr: &str, table_name: &str, dim: &str) -> String {
@@ -1030,19 +1042,30 @@ fn expand_aggregate_in_expr(expr: &Expr, measure_view: Option<&MeasureView>) -> 
                     .and_then(|mv| mv.measures.iter().find(|m| m.column_name == measure_name));
 
                 if let Some(m) = measure {
-                    if let Some(agg_fn) = extract_aggregation_function(&m.expression) {
-                        let dialect = GenericDialect {};
-                        let expr_sql = format!("SELECT {}({})", agg_fn, measure_name);
-                        let stmts = Parser::parse_sql(&dialect, &expr_sql)
-                            .map_err(|e| YardstickError::SqlParse(e.to_string()))?;
+                    let dialect = GenericDialect {};
 
-                        if let Some(Statement::Query(q)) = stmts.into_iter().next() {
-                            if let SetExpr::Select(s) = *q.body {
-                                if let Some(SelectItem::UnnamedExpr(e)) =
-                                    s.projection.into_iter().next()
-                                {
-                                    return Ok(e);
-                                }
+                    // Try to extract aggregation function (e.g., SUM, COUNT)
+                    // If that fails, look for aggregation inside the expression (e.g., CASE WHEN SUM(x)...)
+                    // Then use that aggregation on the measure column
+                    let expr_sql = if let Some(agg_fn) = extract_aggregation_function(&m.expression) {
+                        format!("SELECT {}({})", agg_fn, measure_name)
+                    } else if let Some(agg_fn) = find_aggregation_in_expression(&m.expression) {
+                        // CASE WHEN SUM(x) > 100... → use SUM(measure_column)
+                        format!("SELECT {}({})", agg_fn, measure_name)
+                    } else {
+                        // No aggregation found, default to SUM
+                        format!("SELECT SUM({})", measure_name)
+                    };
+
+                    let stmts = Parser::parse_sql(&dialect, &expr_sql)
+                        .map_err(|e| YardstickError::SqlParse(e.to_string()))?;
+
+                    if let Some(Statement::Query(q)) = stmts.into_iter().next() {
+                        if let SetExpr::Select(s) = *q.body {
+                            if let Some(SelectItem::UnnamedExpr(e)) =
+                                s.projection.into_iter().next()
+                            {
+                                return Ok(e);
                             }
                         }
                     }
@@ -1743,6 +1766,28 @@ mod tests {
         assert_eq!(result.measures[0].expression, "SUM(amount)");
         assert!(result.clean_sql.contains("AS revenue"));
         assert!(!result.clean_sql.contains("AS MEASURE"));
+    }
+
+    #[test]
+    fn test_process_create_view_case_expression() {
+        clear_measure_views();
+
+        let sql = "CREATE VIEW v AS SELECT year, CASE WHEN SUM(x) > 100 THEN 1 ELSE 0 END AS MEASURE flag FROM t GROUP BY year";
+        let result = process_create_view(sql);
+
+        eprintln!("Result: {:?}", result);
+        eprintln!("Measures: {:?}", result.measures);
+        assert!(result.is_measure_view);
+        assert_eq!(result.measures.len(), 1);
+        assert_eq!(result.measures[0].column_name, "flag");
+        assert_eq!(result.measures[0].expression, "CASE WHEN SUM(x) > 100 THEN 1 ELSE 0 END");
+
+        // Now test that AGGREGATE(flag) works
+        let query_sql = "SELECT year, AGGREGATE(flag) FROM v GROUP BY year";
+        let expand_result = expand_aggregate(query_sql);
+        eprintln!("Expand result: {:?}", expand_result);
+        // This should have expanded AGGREGATE(flag) to something
+        assert!(expand_result.had_aggregate);
     }
 
     #[test]

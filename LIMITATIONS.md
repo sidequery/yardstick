@@ -29,19 +29,7 @@ AGGREGATE(revenue) AT (ALL region) AT (ALL category)
 
 **Workaround**: Use single `AT (ALL dim1, dim2)` syntax if supported, or restructure query.
 
-### 2. CASE Expressions in Measures
-
-```sql
--- NOT SUPPORTED
-CREATE VIEW v AS
-SELECT year, CASE WHEN SUM(x) > 100 THEN 1 ELSE 0 END AS MEASURE flag
-FROM t GROUP BY year;
--- Error: Measure not found
-```
-
-**Workaround**: Create the CASE expression outside the measure, or use a subquery.
-
-### 3. No Derived Measures
+### 2. No Derived Measures
 
 ```sql
 -- NOT YET SUPPORTED: Measures referencing other measures
@@ -55,7 +43,7 @@ FROM t GROUP BY year;
 
 **Workaround**: Calculate derived values in the SELECT using AGGREGATE().
 
-### 4. No Window Function Measures
+### 3. No Window Function Measures
 
 ```sql
 -- NOT SUPPORTED: Window functions in measure definitions

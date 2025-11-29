@@ -664,3 +664,21 @@ GROUP BY year, quarter;
 2022	2	7.5
 2022	3	-22.5
 2022	4	27.5
+
+# =============================================================================
+# Test: CASE expression in measure
+# =============================================================================
+
+statement ok
+CREATE OR REPLACE VIEW case_measure AS
+SELECT year, CASE WHEN SUM(amount) > 150 THEN 1 ELSE 0 END AS MEASURE high_value
+FROM (VALUES (2022, 100), (2022, 50), (2023, 200), (2023, 100)) AS t(year, amount)
+GROUP BY year;
+
+query II rowsort
+SEMANTIC SELECT year, AGGREGATE(high_value)
+FROM case_measure
+GROUP BY year;
+----
+2022	0
+2023	1
