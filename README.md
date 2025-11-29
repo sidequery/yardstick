@@ -123,20 +123,11 @@ Prerequisites:
 - Rust (for the SQL rewriter)
 
 ```bash
-# Build Rust library first
-cd yardstick-rs && cargo build --release && cd ..
-
-# Build DuckDB extension
-make
+make        # builds Rust library and DuckDB extension
+make test   # runs tests
 ```
 
 The extension will be at `build/release/extension/yardstick/yardstick.duckdb_extension`
-
-## Testing
-
-```bash
-make test
-```
 
 ## Limitations
 
