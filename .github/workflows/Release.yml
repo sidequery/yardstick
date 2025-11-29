@@ -1,0 +1,140 @@
+#
+# Manual release workflow - triggered via GitHub UI to create tagged releases
+#
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v0.1.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  create-tag:
+    name: Create release tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag_created: ${{ steps.tag.outputs.created }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version format
+        run: |
+          if [[ ! "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "Error: Version must match format v0.0.0 or v0.0.0-suffix"
+            exit 1
+          fi
+
+      - name: Check if tag exists
+        id: check
+        run: |
+          if git rev-parse "${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "Tag ${{ inputs.version }} already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create and push tag
+        id: tag
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ inputs.version }}" -m "Release ${{ inputs.version }}"
+          git push origin "${{ inputs.version }}"
+          echo "created=true" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build (${{ matrix.duckdb_arch }})
+    needs: create-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            duckdb_arch: linux_amd64
+            rust_target: x86_64-unknown-linux-gnu
+          - os: macos-13
+            duckdb_arch: osx_amd64
+            rust_target: x86_64-apple-darwin
+          - os: macos-14
+            duckdb_arch: osx_arm64
+            rust_target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Build Rust library
+        run: |
+          cd yardstick-rs
+          cargo build --release
+
+      - name: Build extension
+        run: make release
+
+      - name: Test extension
+        run: make test
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yardstick-${{ matrix.duckdb_arch }}
+          path: build/release/extension/yardstick/yardstick.duckdb_extension
+
+  release:
+    name: Create GitHub Release
+    needs: [create-tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release_assets
+          for dir in artifacts/*/; do
+            platform=$(basename "$dir")
+            for ext in "$dir"*.duckdb_extension*; do
+              [ -f "$ext" ] || continue
+              filename=$(basename "$ext")
+              newname="${filename/.duckdb_extension/-${platform}.duckdb_extension}"
+              cp "$ext" "release_assets/$newname"
+            done
+          done
+          ls -la release_assets/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: release_assets/*

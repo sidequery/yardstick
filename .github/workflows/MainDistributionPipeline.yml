@@ -1,0 +1,58 @@
+#
+# Build, test and (optionally) release the extension
+#
+name: Main Extension Distribution Pipeline
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.duckdb_arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            duckdb_arch: linux_amd64
+            rust_target: x86_64-unknown-linux-gnu
+          - os: macos-13
+            duckdb_arch: osx_amd64
+            rust_target: x86_64-apple-darwin
+          - os: macos-14
+            duckdb_arch: osx_arm64
+            rust_target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Build Rust library
+        run: |
+          cd yardstick-rs
+          cargo build --release
+
+      - name: Build extension
+        run: make release
+
+      - name: Test extension
+        run: make test
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yardstick-${{ matrix.duckdb_arch }}
+          path: build/release/extension/yardstick/yardstick.duckdb_extension

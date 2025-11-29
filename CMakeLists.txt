@@ -14,6 +14,19 @@ set(YARDSTICK_RS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/yardstick-rs")
 set(YARDSTICK_LIB "${YARDSTICK_RS_DIR}/target/release/libyardstick.a")
 set(YARDSTICK_INCLUDE "${YARDSTICK_RS_DIR}/include")
 
+# Build Rust library if it doesn't exist
+if(NOT EXISTS ${YARDSTICK_LIB})
+    message(STATUS "Building Rust library...")
+    execute_process(
+        COMMAND cargo build --release
+        WORKING_DIRECTORY ${YARDSTICK_RS_DIR}
+        RESULT_VARIABLE CARGO_RESULT
+    )
+    if(NOT CARGO_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to build Rust library")
+    endif()
+endif()
+
 # Include Rust library headers
 include_directories(${YARDSTICK_INCLUDE})
 
