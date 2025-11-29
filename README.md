@@ -1,6 +1,6 @@
 # Yardstick
 
-A DuckDB extension implementing Julian Hyde's "Measures in SQL" paper ([arXiv:2406.00251](https://arxiv.org/abs/2406.00251)).
+An experimental DuckDB extension implementing Julian Hyde's "Measures in SQL" paper ([arXiv:2406.00251](https://arxiv.org/abs/2406.00251)).
 
 ## What is this?
 
