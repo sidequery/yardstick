@@ -141,9 +141,9 @@ make test
 See [LIMITATIONS.md](LIMITATIONS.md) for known issues and workarounds.
 
 Key limitations:
-- Chained AT modifiers may not work as expected
-- CASE expressions not supported in measure definitions
-- AT (WHERE) can only filter on view columns
+- Chained AT modifiers collapse to grand total instead of removing dimensions sequentially
+- Derived measures (measures referencing other measures) not yet supported
+- Window function measures not supported
 
 ## References
 
