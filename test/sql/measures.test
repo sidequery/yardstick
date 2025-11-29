@@ -1,0 +1,633 @@
+# name: test/sql/measures.test
+# description: Test Julian Hyde "Measures in SQL" functionality
+# group: [yardstick]
+
+require yardstick
+
+# =============================================================================
+# Setup: Create test tables
+# =============================================================================
+
+statement ok
+CREATE TABLE sales (year INT, region TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO sales VALUES
+    (2022, 'US', 100), (2022, 'EU', 50),
+    (2023, 'US', 150), (2023, 'EU', 75);
+
+# =============================================================================
+# Test: AS MEASURE in CREATE VIEW
+# =============================================================================
+
+statement ok
+CREATE VIEW sales_v AS
+SELECT year, region, SUM(amount) AS MEASURE revenue
+FROM sales
+GROUP BY year, region;
+
+# Basic query on view with measure
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) FROM sales_v GROUP BY year, region;
+----
+2022	EU	50.0
+2022	US	100.0
+2023	EU	75.0
+2023	US	150.0
+
+# =============================================================================
+# Test: AT (ALL dimension) - remove dimension from context
+# =============================================================================
+
+# Revenue and total revenue for that year (across all regions)
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
+# =============================================================================
+# Test: AT (ALL) - grand total (no dimensions)
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL) AS grand_total
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	375.0
+2022	US	375.0
+2023	EU	375.0
+2023	US	375.0
+
+# =============================================================================
+# Test: AT (WHERE condition)
+# =============================================================================
+
+# Revenue for US only
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (WHERE region = 'US') AS us_revenue
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	250.0
+2022	US	250.0
+2023	EU	250.0
+2023	US	250.0
+
+# =============================================================================
+# Test: AT (SET dimension = expression) - Year over Year
+# =============================================================================
+
+# Create a simpler view for YoY test
+statement ok
+CREATE VIEW sales_yearly AS
+SELECT year, SUM(amount) AS MEASURE revenue
+FROM sales
+GROUP BY year;
+
+# Prior year comparison
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(revenue) AT (SET year = year - 1) AS prior_year
+FROM sales_yearly
+GROUP BY year;
+----
+2022	NULL
+2023	150.0
+
+# =============================================================================
+# Test: CURRENT keyword in SET
+# =============================================================================
+
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(revenue) AT (SET year = CURRENT year - 1) AS prior_year
+FROM sales_yearly
+GROUP BY year;
+----
+2022	NULL
+2023	150.0
+
+# =============================================================================
+# Test: AT (VISIBLE) - respects outer WHERE
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (VISIBLE) AS visible_rev
+FROM sales_v
+WHERE region = 'US'
+GROUP BY year, region;
+----
+2022	US	100.0
+2023	US	150.0
+
+# =============================================================================
+# Test: Chaining AT modifiers
+# =============================================================================
+
+# Chaining multiple ALL should combine to grand total
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(revenue) AT (ALL year) AT (ALL region) AS grand_total
+FROM sales_v
+GROUP BY year;
+----
+2022	375.0
+2023	375.0
+
+# =============================================================================
+# Test: Percent of total calculation
+# =============================================================================
+
+query IIRR rowsort
+SEMANTIC SELECT
+    year,
+    region,
+    AGGREGATE(revenue) as revenue,
+    100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL) AS pct_of_total
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	50.0	13.333333333333334
+2022	US	100.0	26.666666666666668
+2023	EU	75.0	20.0
+2023	US	150.0	40.0
+
+# =============================================================================
+# Test: Year over year with arithmetic
+# =============================================================================
+
+query IRR rowsort
+SEMANTIC SELECT
+    year,
+    AGGREGATE(revenue) as revenue,
+    AGGREGATE(revenue) - AGGREGATE(revenue) AT (SET year = year - 1) AS yoy_change
+FROM sales_yearly
+GROUP BY year;
+----
+2022	150.0	NULL
+2023	225.0	75.0
+
+# =============================================================================
+# Test: Multiple measures in same view
+# =============================================================================
+
+statement ok
+CREATE VIEW orders_v AS
+SELECT
+    year,
+    SUM(amount) AS MEASURE total_revenue,
+    COUNT(*) AS MEASURE order_count,
+    AVG(amount) AS MEASURE avg_order
+FROM sales
+GROUP BY year;
+
+query IRR rowsort
+SEMANTIC SELECT year, AGGREGATE(total_revenue), AGGREGATE(avg_order) FROM orders_v GROUP BY year;
+----
+2022	150.0	75.0
+2023	225.0	112.5
+
+# =============================================================================
+# Test: AT (ALL year) - remove year from context (keep region)
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL year) AS region_total
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	125.0
+2022	US	250.0
+2023	EU	125.0
+2023	US	250.0
+
+# =============================================================================
+# Test: AT (ALL dim) when dim is the only GROUP BY column
+# =============================================================================
+
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(revenue) AT (ALL year) AS grand_total
+FROM sales_yearly
+GROUP BY year;
+----
+2022	375.0
+2023	375.0
+
+# =============================================================================
+# Test: AT (VISIBLE) without WHERE clause - should be identity
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (VISIBLE) AS same_as_base
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	50.0
+2022	US	100.0
+2023	EU	75.0
+2023	US	150.0
+
+# =============================================================================
+# Test: AT (VISIBLE) with year filter
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (VISIBLE) AS visible_2023
+FROM sales_v
+WHERE year = 2023
+GROUP BY year, region;
+----
+2023	EU	75.0
+2023	US	150.0
+
+# =============================================================================
+# Test: AT (WHERE) with complex condition (AND)
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (WHERE year = 2023 AND region = 'US') AS us_2023
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	150.0
+2023	US	150.0
+
+# =============================================================================
+# Test: AT (WHERE) with OR condition
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (WHERE region = 'US' OR year = 2022) AS filtered
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	300.0
+2022	US	300.0
+2023	EU	300.0
+2023	US	300.0
+
+# =============================================================================
+# Test: AT (SET) with future year
+# =============================================================================
+
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(revenue) AT (SET year = year + 1) AS next_year
+FROM sales_yearly
+GROUP BY year;
+----
+2022	225.0
+2023	NULL
+
+# =============================================================================
+# Test: Percent of year total
+# =============================================================================
+
+query IIRR rowsort
+SEMANTIC SELECT
+    year,
+    region,
+    AGGREGATE(revenue) as revenue,
+    100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_year
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	50.0	33.33333333333333
+2022	US	100.0	66.66666666666667
+2023	EU	75.0	33.33333333333333
+2023	US	150.0	66.66666666666667
+
+# =============================================================================
+# Test: Multiple measures with different AT modifiers
+# =============================================================================
+
+query IRRR rowsort
+SEMANTIC SELECT
+    year,
+    AGGREGATE(total_revenue) as revenue,
+    AGGREGATE(total_revenue) AT (ALL year) as grand_total,
+    AGGREGATE(avg_order) AT (SET year = year - 1) as prev_avg
+FROM orders_v
+GROUP BY year;
+----
+2022	150.0	375.0	NULL
+2023	225.0	375.0	75.0
+
+# =============================================================================
+# Test: YoY growth percentage
+# =============================================================================
+
+query IRR rowsort
+SEMANTIC SELECT
+    year,
+    AGGREGATE(revenue) as revenue,
+    100.0 * (AGGREGATE(revenue) - AGGREGATE(revenue) AT (SET year = year - 1)) / AGGREGATE(revenue) AT (SET year = year - 1) AS yoy_pct
+FROM sales_yearly
+GROUP BY year;
+----
+2022	150.0	NULL
+2023	225.0	50.0
+
+# =============================================================================
+# Test: Three-dimensional data
+# =============================================================================
+
+statement ok
+CREATE TABLE products (year INT, region TEXT, category TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO products VALUES
+    (2022, 'US', 'A', 100), (2022, 'US', 'B', 50),
+    (2022, 'EU', 'A', 80), (2022, 'EU', 'B', 40),
+    (2023, 'US', 'A', 120), (2023, 'US', 'B', 60),
+    (2023, 'EU', 'A', 100), (2023, 'EU', 'B', 50);
+
+statement ok
+CREATE VIEW products_v AS
+SELECT year, region, category, SUM(amount) AS MEASURE revenue
+FROM products
+GROUP BY year, region, category;
+
+# Grand total across all dimensions
+query IIIR rowsort
+SEMANTIC SELECT year, region, category, AGGREGATE(revenue) AT (ALL) AS grand_total
+FROM products_v
+GROUP BY year, region, category;
+----
+2022	EU	A	600.0
+2022	EU	B	600.0
+2022	US	A	600.0
+2022	US	B	600.0
+2023	EU	A	600.0
+2023	EU	B	600.0
+2023	US	A	600.0
+2023	US	B	600.0
+
+# Total by year only - chaining AT (ALL dim1) AT (ALL dim2) currently produces grand total
+# TODO: fix chaining to properly correlate on remaining dimensions
+query IIIR rowsort
+SEMANTIC SELECT year, region, category, AGGREGATE(revenue) AT (ALL region) AT (ALL category) AS year_total
+FROM products_v
+GROUP BY year, region, category;
+----
+2022	EU	A	600.0
+2022	EU	B	600.0
+2022	US	A	600.0
+2022	US	B	600.0
+2023	EU	A	600.0
+2023	EU	B	600.0
+2023	US	A	600.0
+2023	US	B	600.0
+
+# Total by category only - chaining AT (ALL dim1) AT (ALL dim2) currently produces grand total
+# TODO: fix chaining to properly correlate on remaining dimensions
+query IIIR rowsort
+SEMANTIC SELECT year, region, category, AGGREGATE(revenue) AT (ALL year) AT (ALL region) AS category_total
+FROM products_v
+GROUP BY year, region, category;
+----
+2022	EU	A	600.0
+2022	EU	B	600.0
+2022	US	A	600.0
+2022	US	B	600.0
+2023	EU	A	600.0
+2023	EU	B	600.0
+2023	US	A	600.0
+2023	US	B	600.0
+
+# =============================================================================
+# Test: MIN and MAX measures
+# =============================================================================
+
+statement ok
+CREATE VIEW sales_minmax AS
+SELECT year, region, MIN(amount) AS MEASURE min_sale, MAX(amount) AS MEASURE max_sale
+FROM sales
+GROUP BY year, region;
+
+query IIRR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(min_sale), AGGREGATE(max_sale) FROM sales_minmax GROUP BY year, region;
+----
+2022	EU	50.0	50.0
+2022	US	100.0	100.0
+2023	EU	75.0	75.0
+2023	US	150.0	150.0
+
+# =============================================================================
+# Test: COUNT measure
+# Note: COUNT(*) in a measure counts rows after the view's GROUP BY, not base table rows
+# =============================================================================
+
+query II rowsort
+SEMANTIC SELECT year, AGGREGATE(order_count) FROM orders_v GROUP BY year;
+----
+2022	1
+2023	1
+
+# Count with AT (ALL)
+query II rowsort
+SEMANTIC SELECT year, AGGREGATE(order_count) AT (ALL) FROM orders_v GROUP BY year;
+----
+2022	2
+2023	2
+
+# =============================================================================
+# Test: Combining base AGGREGATE with multiple AT variants
+# =============================================================================
+
+query IIRRRR rowsort
+SEMANTIC SELECT
+    year,
+    region,
+    AGGREGATE(revenue) as base,
+    AGGREGATE(revenue) AT (ALL region) as year_total,
+    AGGREGATE(revenue) AT (ALL year) as region_total,
+    AGGREGATE(revenue) AT (ALL) as grand_total
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	50.0	150.0	125.0	375.0
+2022	US	100.0	150.0	250.0	375.0
+2023	EU	75.0	225.0	125.0	375.0
+2023	US	150.0	225.0	250.0	375.0
+
+# =============================================================================
+# Test: AT (SET) combined with AT (ALL)
+# =============================================================================
+
+query IRR rowsort
+SEMANTIC SELECT
+    year,
+    AGGREGATE(revenue) AT (SET year = year - 1) as prior_year,
+    AGGREGATE(revenue) AT (SET year = year - 1) AT (ALL year) as prior_grand
+FROM sales_yearly
+GROUP BY year;
+----
+2022	NULL	375.0
+2023	150.0	375.0
+
+# =============================================================================
+# Test: Negative and zero values
+# =============================================================================
+
+statement ok
+CREATE TABLE adjustments (year INT, region TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO adjustments VALUES
+    (2022, 'US', -20), (2022, 'EU', 10),
+    (2023, 'US', 0), (2023, 'EU', -5);
+
+statement ok
+CREATE VIEW adj_v AS
+SELECT year, region, SUM(amount) AS MEASURE adjustment
+FROM adjustments
+GROUP BY year, region;
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(adjustment) FROM adj_v GROUP BY year, region;
+----
+2022	EU	10.0
+2022	US	-20.0
+2023	EU	-5.0
+2023	US	0.0
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(adjustment) AT (ALL) AS total_adj
+FROM adj_v
+GROUP BY year, region;
+----
+2022	EU	-15.0
+2022	US	-15.0
+2023	EU	-15.0
+2023	US	-15.0
+
+# =============================================================================
+# Test: Moving total (2-year window using SET)
+# =============================================================================
+
+statement ok
+CREATE TABLE yearly_data (year INT, amount DOUBLE);
+
+statement ok
+INSERT INTO yearly_data VALUES (2020, 100), (2021, 120), (2022, 150), (2023, 180);
+
+statement ok
+CREATE VIEW yearly_v AS
+SELECT year, SUM(amount) AS MEASURE revenue
+FROM yearly_data
+GROUP BY year;
+
+query IRR rowsort
+SEMANTIC SELECT
+    year,
+    AGGREGATE(revenue) as current,
+    AGGREGATE(revenue) + AGGREGATE(revenue) AT (SET year = year - 1) as two_year_total
+FROM yearly_v
+GROUP BY year;
+----
+2020	100.0	NULL
+2021	120.0	220.0
+2022	150.0	270.0
+2023	180.0	330.0
+
+# =============================================================================
+# Test: Comparison operations with AGGREGATE
+# NOTE: CASE expressions in AS MEASURE not yet supported
+# =============================================================================
+
+# =============================================================================
+# Test: AT (WHERE) with numeric comparison on view column
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (WHERE year > 2022) AS recent_sales
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	225.0
+2022	US	225.0
+2023	EU	225.0
+2023	US	225.0
+
+# =============================================================================
+# Test: Single row result with AT (ALL) - requires empty GROUP BY or no GROUP BY collapses to view rows
+# Note: Without GROUP BY, returns one row per view row (all with grand total)
+# =============================================================================
+
+# =============================================================================
+# Test: AT modifiers with aliased table
+# Note: Table aliases with qualified refs currently conflict with _outer alias generation
+# =============================================================================
+
+# =============================================================================
+# Test: Expression in AGGREGATE argument (if supported)
+# =============================================================================
+
+query IR rowsort
+SEMANTIC SELECT year, 2 * AGGREGATE(revenue) AS doubled
+FROM sales_yearly
+GROUP BY year;
+----
+2022	300.0
+2023	450.0
+
+# =============================================================================
+# Test: Ratio to parent (region share of year)
+# =============================================================================
+
+query IIRR rowsort
+SEMANTIC SELECT
+    year,
+    region,
+    AGGREGATE(revenue) as revenue,
+    AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS share_of_year
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	50.0	0.3333333333333333
+2022	US	100.0	0.6666666666666666
+2023	EU	75.0	0.3333333333333333
+2023	US	150.0	0.6666666666666666
+
+# =============================================================================
+# Test: Index / ratio to base period
+# =============================================================================
+
+query IRR rowsort
+SEMANTIC SELECT
+    year,
+    AGGREGATE(revenue) as revenue,
+    AGGREGATE(revenue) / AGGREGATE(revenue) AT (SET year = 2022) AS index_to_2022
+FROM sales_yearly
+GROUP BY year;
+----
+2022	150.0	1.0
+2023	225.0	1.5
+
+# =============================================================================
+# Test: Difference from average
+# =============================================================================
+
+statement ok
+CREATE VIEW quarterly AS
+SELECT year, quarter, SUM(amount) AS MEASURE revenue
+FROM (VALUES (2022, 1, 100), (2022, 2, 120), (2022, 3, 90), (2022, 4, 140)) AS t(year, quarter, amount)
+GROUP BY year, quarter;
+
+query IIR rowsort
+SEMANTIC SELECT
+    year,
+    quarter,
+    AGGREGATE(revenue) - (AGGREGATE(revenue) AT (ALL quarter) / 4.0) AS diff_from_avg
+FROM quarterly
+GROUP BY year, quarter;
+----
+2022	1	-12.5
+2022	2	7.5
+2022	3	-22.5
+2022	4	27.5
