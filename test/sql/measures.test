@@ -367,6 +367,12 @@ GROUP BY year, region, category;
 2023	US	A	600.0
 2023	US	B	600.0
 
+# Scalar aggregation without GROUP BY - should return single row
+query R
+SEMANTIC SELECT AGGREGATE(revenue) FROM sales_v;
+----
+375.0
+
 # Total by year only - chaining AT (ALL dim1) AT (ALL dim2) currently produces grand total
 # TODO: fix chaining to properly correlate on remaining dimensions
 query IIIR rowsort

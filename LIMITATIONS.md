@@ -53,18 +53,7 @@ AGGREGATE(revenue) AT (WHERE year > 2022)   -- WORKS: 'year' is in view
 
 **Workaround**: Only filter on dimensions that appear in the view's GROUP BY.
 
-### 4. Queries Without GROUP BY
-
-```sql
--- ISSUE: AGGREGATE without GROUP BY returns multiple rows
-SELECT AGGREGATE(revenue) AT (ALL) FROM sales_v;
--- Expected: 1 row with grand total
--- Actual: N rows (one per source row)
-```
-
-**Workaround**: Add `GROUP BY ()` or wrap in another aggregation.
-
-### 5. Table Aliases with Qualified References
+### 4. Table Aliases with Qualified References
 
 ```sql
 -- ISSUE: Table aliases conflict with internal _outer alias
@@ -74,17 +63,7 @@ SELECT s.year, AGGREGATE(s.revenue) FROM sales_v s GROUP BY s.year;
 
 **Workaround**: Don't use table aliases, or don't use qualified column references.
 
-### 6. COUNT Semantics
-
-```sql
--- NOTE: COUNT(*) counts rows in the view, not the base table
-CREATE VIEW v AS SELECT year, COUNT(*) AS MEASURE row_count FROM t GROUP BY year;
--- row_count will be the count per year-group, not raw row count
-```
-
-This is actually correct per the paper's semantics, but may be surprising.
-
-### 7. No Derived Measures
+### 5. No Derived Measures
 
 ```sql
 -- NOT YET SUPPORTED: Measures referencing other measures
@@ -98,7 +77,7 @@ FROM t GROUP BY year;
 
 **Workaround**: Calculate derived values in the SELECT using AGGREGATE().
 
-### 8. No Window Function Measures
+### 6. No Window Function Measures
 
 ```sql
 -- NOT SUPPORTED: Window functions in measure definitions

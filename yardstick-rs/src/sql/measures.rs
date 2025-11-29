@@ -919,8 +919,8 @@ fn expand_aggregate_in_select(select: &Select) -> Result<Select> {
 
     let group_by = if has_aggregate
         && select.group_by == sqlparser::ast::GroupByExpr::Expressions(vec![], vec![])
-        && !dimension_columns.is_empty()
     {
+        // Add GROUP BY with dimensions, or GROUP BY () for scalar aggregation
         sqlparser::ast::GroupByExpr::Expressions(dimension_columns, vec![])
     } else {
         select.group_by.clone()

@@ -1,10 +1,7 @@
-//! SQL generation and query rewriting
+//! SQL processing for Measures in SQL
 
-mod generator;
 pub mod measures;
-mod rewriter;
 
-pub use generator::{SemanticQuery, SqlGenerator};
 pub use measures::{
     // Core types
     AggregateExpandResult, ContextModifier, CreateViewResult, MeasureView, ViewMeasure,
@@ -19,4 +16,3 @@ pub use measures::{
     // Measure lookup
     get_measure_aggregation,
 };
-pub use rewriter::QueryRewriter;
