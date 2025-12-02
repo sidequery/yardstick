@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.5)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED 1)
+
 # Set extension name here
 set(TARGET_NAME yardstick)
 
@@ -9,39 +12,77 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
-# Path to yardstick-rs
-set(YARDSTICK_RS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/yardstick-rs")
-set(YARDSTICK_LIB "${YARDSTICK_RS_DIR}/target/release/libyardstick.a")
-set(YARDSTICK_INCLUDE "${YARDSTICK_RS_DIR}/include")
+# Detect Rust target based on platform
+execute_process(
+    COMMAND rustup target list --installed
+    OUTPUT_VARIABLE RUST_TARGETS
+)
 
-# Build Rust library if it doesn't exist
-if(NOT EXISTS ${YARDSTICK_LIB})
-    message(STATUS "Building Rust library...")
-    execute_process(
-        COMMAND cargo build --release
-        WORKING_DIRECTORY ${YARDSTICK_RS_DIR}
-        RESULT_VARIABLE CARGO_RESULT
-    )
-    if(NOT CARGO_RESULT EQUAL 0)
-        message(FATAL_ERROR "Failed to build Rust library")
+set(Rust_CARGO_TARGET "")
+if("${OS_NAME}" STREQUAL "linux")
+    if ("${OS_ARCH}" STREQUAL "arm64")
+        set(Rust_CARGO_TARGET "aarch64-unknown-linux-gnu")
+    elseif("${CMAKE_CXX_COMPILER}" MATCHES "aarch64")
+        set(Rust_CARGO_TARGET "aarch64-unknown-linux-gnu")
+    else()
+        string(FIND "${RUST_TARGETS}" "musl" MUSL_TARGET_FOUND)
+        if(NOT MUSL_TARGET_FOUND EQUAL -1)
+            set(Rust_CARGO_TARGET "x86_64-unknown-linux-musl")
+        else()
+            set(Rust_CARGO_TARGET "x86_64-unknown-linux-gnu")
+        endif()
     endif()
+elseif("${OS_NAME}" STREQUAL "osx")
+    if ("${OSX_BUILD_ARCH}" STREQUAL "arm64")
+        set(Rust_CARGO_TARGET "aarch64-apple-darwin")
+    elseif ("${OSX_BUILD_ARCH}" STREQUAL "x86_64")
+        set(Rust_CARGO_TARGET "x86_64-apple-darwin")
+    elseif ("${OS_ARCH}" STREQUAL "arm64")
+        set(Rust_CARGO_TARGET "aarch64-apple-darwin")
+    endif()
+elseif(WIN32)
+   if (MINGW AND "${OS_ARCH}" STREQUAL "arm64")
+       set(Rust_CARGO_TARGET "aarch64-pc-windows-gnu")
+   elseif (MINGW AND "${OS_ARCH}" STREQUAL "amd64")
+       set(Rust_CARGO_TARGET "x86_64-pc-windows-gnu")
+   elseif (MSVC AND "${OS_ARCH}" STREQUAL "arm64")
+       set(Rust_CARGO_TARGET "aarch64-pc-windows-msvc")
+   elseif (MSVC AND "${OS_ARCH}" STREQUAL "amd64")
+       set(Rust_CARGO_TARGET "x86_64-pc-windows-msvc")
+   endif()
 endif()
 
+message(STATUS "Rust_CARGO_TARGET: ${Rust_CARGO_TARGET}")
+message(STATUS "OS_NAME: ${OS_NAME}")
+message(STATUS "OS_ARCH: ${OS_ARCH}")
+message(STATUS "OSX_BUILD_ARCH: ${OSX_BUILD_ARCH}")
+
+# Use Corrosion to build Rust library
+include(FetchContent)
+
+FetchContent_Declare(
+    Corrosion
+    GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+    GIT_TAG v0.5.2
+)
+FetchContent_MakeAvailable(Corrosion)
+
+# Import the Rust crate
+corrosion_import_crate(MANIFEST_PATH "${CMAKE_CURRENT_SOURCE_DIR}/yardstick-rs/Cargo.toml"
+    CRATES "yardstick"
+)
+
 # Include Rust library headers
-include_directories(${YARDSTICK_INCLUDE})
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/yardstick-rs/include)
 
 set(EXTENSION_SOURCES src/yardstick_extension.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# Mark Rust library as imported so CMake tracks it
-add_library(yardstick_rust STATIC IMPORTED)
-set_target_properties(yardstick_rust PROPERTIES IMPORTED_LOCATION ${YARDSTICK_LIB})
-
 # Link the Rust static library
-target_link_libraries(${EXTENSION_NAME} yardstick_rust)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} yardstick_rust)
+target_link_libraries(${EXTENSION_NAME} yardstick-static)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} yardstick)
 
 # On macOS, we need to link against some system frameworks
 if(APPLE)

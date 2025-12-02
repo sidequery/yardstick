@@ -1,6 +1,8 @@
 #
 # Manual release workflow - triggered via GitHub UI to create tagged releases
 #
+# Order: validate -> build/test -> create tag -> create release
+#
 name: Release
 
 on:
@@ -17,13 +19,9 @@ on:
         default: false
 
 jobs:
-  create-tag:
-    name: Create release tag
+  validate:
+    name: Validate version
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      tag_created: ${{ steps.tag.outputs.created }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,28 +35,15 @@ jobs:
           fi
 
       - name: Check if tag exists
-        id: check
         run: |
           if git rev-parse "${{ inputs.version }}" >/dev/null 2>&1; then
-            echo "Tag ${{ inputs.version }} already exists"
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Error: Tag ${{ inputs.version }} already exists"
+            exit 1
           fi
-
-      - name: Create and push tag
-        id: tag
-        if: steps.check.outputs.exists != 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ inputs.version }}" -m "Release ${{ inputs.version }}"
-          git push origin "${{ inputs.version }}"
-          echo "created=true" >> $GITHUB_OUTPUT
 
   build:
     name: Build (${{ matrix.duckdb_arch }})
-    needs: create-tag
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -101,13 +86,22 @@ jobs:
           path: build/release/extension/yardstick/yardstick.duckdb_extension
 
   release:
-    name: Create GitHub Release
-    needs: [create-tag, build]
+    name: Create tag and release
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ inputs.version }}" -m "Release ${{ inputs.version }}"
+          git push origin "${{ inputs.version }}"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
