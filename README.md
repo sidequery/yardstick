@@ -14,7 +14,33 @@ Yardstick adds **measure-aware SQL** to DuckDB. Measures are aggregations that k
 
 ```sql
 -- Load the extension
-LOAD 'yardstick';
+INSTALL yardstick FROM community;
+LOAD yardstick;
+
+-- Create the sales table
+CREATE TABLE sales (
+    id INTEGER PRIMARY KEY,
+    year INTEGER,
+    region VARCHAR(50),
+    amount DECIMAL(10, 2)
+);
+
+-- Insert sample data
+INSERT INTO sales (id, year, region, amount) VALUES
+    (1, 2023, 'North', 15000.00),
+    (2, 2023, 'North', 22000.00),
+    (3, 2023, 'South', 18000.00),
+    (4, 2023, 'South', 12000.00),
+    (5, 2023, 'East', 25000.00),
+    (6, 2023, 'West', 19000.00),
+    (7, 2024, 'North', 28000.00),
+    (8, 2024, 'North', 31000.00),
+    (9, 2024, 'South', 21000.00),
+    (10, 2024, 'South', 16000.00),
+    (11, 2024, 'East', 33000.00),
+    (12, 2024, 'East', 29000.00),
+    (13, 2024, 'West', 24000.00),
+    (14, 2024, 'West', 27000.00);
 
 -- Create a view with measures
 CREATE VIEW sales_v AS
@@ -35,6 +61,43 @@ SEMANTIC SELECT
     AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_year
 FROM sales_v
 GROUP BY year, region;
+
+-- Variance from the global average
+SEMANTIC SELECT
+    region,
+    AGGREGATE(revenue) AS revenue,
+    AGGREGATE(revenue) AT (ALL) / 4.0 AS expected_if_equal,  -- 4 regions
+    AGGREGATE(revenue) - (AGGREGATE(revenue) AT (ALL) / 4.0) AS variance
+FROM sales_v
+GROUP BY region;
+
+-- Nested percentages (% of year, and that year's % of total)
+SEMANTIC SELECT
+    year,
+    region,
+    AGGREGATE(revenue) AS revenue,
+    100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_year,
+    100.0 * AGGREGATE(revenue) AT (ALL region) / AGGREGATE(revenue) AT (ALL) AS year_pct_of_total
+FROM sales_v
+GROUP BY year, region;
+
+-- Compare 2024 performance to 2023 baseline for each region
+SEMANTIC SELECT
+    region,
+    AGGREGATE(revenue) AT (SET year = 2024) AS rev_2024,
+    AGGREGATE(revenue) AT (SET year = 2023) AS rev_2023,
+    AGGREGATE(revenue) AT (SET year = 2024) - AGGREGATE(revenue) AT (SET year = 2023) AS growth
+FROM sales_v
+GROUP BY region;
+
+-- Filter to specific segments
+SEMANTIC SELECT
+    year,
+    AGGREGATE(revenue) AS total_revenue,
+    AGGREGATE(revenue) AT (SET region = 'North') AS north_revenue,
+    AGGREGATE(revenue) AT (SET region IN ('North', 'South')) AS north_south_combined
+FROM sales_v
+GROUP BY year;
 ```
 
 ## Syntax
