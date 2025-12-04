@@ -10,7 +10,7 @@ Yardstick adds **measure-aware SQL** to DuckDB. Measures are aggregations that k
 - **Year-over-year comparisons** with simple syntax
 - **Drill-down analytics** that automatically adjust aggregation context
 
-## Quick Start
+## Quick Start & Demo
 
 ```sql
 -- Load the extension
@@ -138,45 +138,6 @@ GROUP BY dimensions;
 | `AT (SET dim = expr)` | Fix dimension to expression | `AGGREGATE(revenue) AT (SET year = year - 1)` |
 | `AT (WHERE cond)` | Pre-aggregation filter | `AGGREGATE(revenue) AT (WHERE region = 'US')` |
 | `AT (VISIBLE)` | Use query's WHERE clause | `AGGREGATE(revenue) AT (VISIBLE)` |
-
-## Examples
-
-### Percent of Total
-
-```sql
-SEMANTIC SELECT
-    region,
-    AGGREGATE(revenue) AS revenue,
-    100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL) AS pct_total
-FROM sales_v
-GROUP BY region;
-```
-
-### Year-over-Year Growth
-
-```sql
-SEMANTIC SELECT
-    year,
-    AGGREGATE(revenue) AS revenue,
-    AGGREGATE(revenue) AT (SET year = year - 1) AS prior_year,
-    100.0 * (AGGREGATE(revenue) - AGGREGATE(revenue) AT (SET year = year - 1))
-          / AGGREGATE(revenue) AT (SET year = year - 1) AS yoy_growth
-FROM sales_v
-GROUP BY year;
-```
-
-### Contribution to Parent
-
-```sql
-SEMANTIC SELECT
-    year,
-    region,
-    AGGREGATE(revenue) AS revenue,
-    AGGREGATE(revenue) AT (ALL region) AS year_total,
-    100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS contribution
-FROM sales_v
-GROUP BY year, region;
-```
 
 ## Building
 
