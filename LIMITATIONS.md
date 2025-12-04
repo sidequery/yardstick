@@ -10,6 +10,7 @@ Implementation of Julian Hyde's "Measures in SQL" paper (arXiv:2406.00251).
 - `AT (ALL dim)` - removes specific dimension from context
 - Chained AT modifiers: `AT (ALL dim1) AT (ALL dim2)` correctly correlates on remaining dimensions
 - `AT (SET dim = expr)` - fixes dimension to specific value (e.g., YoY comparisons)
+- Ad hoc dimensions: `AT (ALL MONTH(date))` and `AT (SET MONTH(date) = 6)` for computed dimensions
 - `AT (WHERE condition)` - filters before aggregation
 - `AT (VISIBLE)` - uses visible WHERE clause filters
 - Multiple measures in same view

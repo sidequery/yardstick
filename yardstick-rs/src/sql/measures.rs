@@ -169,6 +169,21 @@ fn function_call(input: &str) -> IResult<&str, (&str, &str)> {
     Ok((input, (name, args)))
 }
 
+/// Parse an expression or identifier for ad hoc dimensions
+/// Handles: `region`, `MONTH(date)`, `YEAR(order_date)`
+fn expression_or_identifier(input: &str) -> IResult<&str, String> {
+    let (input, name) = identifier(input)?;
+    let (input, _) = multispace0(input)?;
+
+    // Check if followed by opening paren (function call)
+    if input.starts_with('(') {
+        let (input, args) = delimited(char('('), balanced_parens, char(')'))(input)?;
+        Ok((input, format!("{}({})", name, args)))
+    } else {
+        Ok((input, name.to_string()))
+    }
+}
+
 // =============================================================================
 // Nom Parsers - AS MEASURE
 // =============================================================================
@@ -270,11 +285,12 @@ fn at_all_global(input: &str) -> IResult<&str, ContextModifier> {
 }
 
 /// Parse AT (ALL dimension) - remove dimension from context
+/// Supports ad hoc dimensions: `ALL region` or `ALL MONTH(date)`
 fn at_all(input: &str) -> IResult<&str, ContextModifier> {
     let (input, _) = tag_no_case("ALL")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, dim) = identifier(input)?;
-    Ok((input, ContextModifier::All(dim.to_string())))
+    let (input, dim) = expression_or_identifier(input)?;
+    Ok((input, ContextModifier::All(dim)))
 }
 
 /// Parse AT (VISIBLE) - respect outer query's WHERE clause
@@ -310,10 +326,11 @@ fn parse_current_in_expr(expr: &str) -> String {
 }
 
 /// Parse AT (SET dimension = expr)
+/// Supports ad hoc dimensions: `SET year = 2023` or `SET MONTH(date) = 3`
 fn at_set(input: &str) -> IResult<&str, ContextModifier> {
     let (input, _) = tag_no_case("SET")(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, dim) = identifier(input)?;
+    let (input, dim) = expression_or_identifier(input)?;
     let (input, _) = multispace0(input)?;
     let (input, _) = char('=')(input)?;
     let (input, _) = multispace0(input)?;
@@ -323,7 +340,7 @@ fn at_set(input: &str) -> IResult<&str, ContextModifier> {
     let processed_expr = parse_current_in_expr(expr.trim());
     Ok((
         input,
-        ContextModifier::Set(dim.to_string(), processed_expr),
+        ContextModifier::Set(dim, processed_expr),
     ))
 }
 
@@ -795,15 +812,16 @@ fn qualify_where_for_inner(where_clause: &str) -> String {
                 }
             }
 
-            // Check if followed by a dot (already qualified)
+            // Check if followed by a dot (already qualified) or paren (function call)
             let already_qualified = chars.peek() == Some(&'.');
+            let is_function = chars.peek() == Some(&'(');
 
             // SQL keywords that should not be prefixed
             let keywords = ["AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE",
                            "LIKE", "BETWEEN", "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END"];
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
 
-            if !already_qualified && !is_keyword {
+            if !already_qualified && !is_keyword && !is_function {
                 result.push_str("_inner.");
             }
             result.push_str(&ident);
@@ -1454,12 +1472,18 @@ pub fn expand_at_to_sql(
             let outer_ref = outer_alias.unwrap_or(table_name);
             // Filter group_by_cols to exclude the removed dimension (case-insensitive)
             let dim_lower = dim.to_lowercase();
+            let is_expression = dim.contains('(');
             let correlating_dims: Vec<_> = group_by_cols
                 .iter()
                 .filter(|col| {
-                    // Extract just the column name (handle qualified refs like "s.year")
-                    let col_name = col.split('.').last().unwrap_or(col);
-                    col_name.to_lowercase() != dim_lower
+                    if is_expression {
+                        // For expressions like MONTH(date), compare full expression
+                        col.to_lowercase() != dim_lower
+                    } else {
+                        // For simple columns, extract just the column name (handle qualified refs like "s.year")
+                        let col_name = col.split('.').last().unwrap_or(col);
+                        col_name.to_lowercase() != dim_lower
+                    }
                 })
                 .collect();
 
@@ -1471,9 +1495,16 @@ pub fn expand_at_to_sql(
                 let where_clauses: Vec<_> = correlating_dims
                     .iter()
                     .map(|col| {
-                        // Extract just the column name for _inner reference
-                        let col_name = col.split('.').last().unwrap_or(col);
-                        format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                        let col_is_expr = col.contains('(');
+                        if col_is_expr {
+                            // For expression dimensions, qualify column refs inside
+                            let inner_expr = qualify_where_for_inner(col);
+                            format!("{} = {}", inner_expr, col)
+                        } else {
+                            // Extract just the column name for _inner reference
+                            let col_name = col.split('.').last().unwrap_or(col);
+                            format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                        }
                     })
                     .collect();
                 format!(
@@ -1486,8 +1517,16 @@ pub fn expand_at_to_sql(
             // Use outer_alias for the correlated reference, falling back to table_name
             let outer_ref = outer_alias.unwrap_or(table_name);
             let qualified_expr = qualify_outer_reference(expr, outer_ref, dim);
+            // For ad hoc dimensions (expressions like MONTH(date)), qualify column refs with _inner
+            // For simple columns, just prefix with _inner.
+            let inner_dim = if dim.contains('(') {
+                // Expression: qualify column refs inside it
+                qualify_where_for_inner(dim)
+            } else {
+                format!("_inner.{}", dim)
+            };
             // Include outer WHERE if present
-            let where_clause = format!("_inner.{} = {}", dim, qualified_expr);
+            let where_clause = format!("{} = {}", inner_dim, qualified_expr);
             let full_where = match outer_where {
                 Some(w) => format!("{} AND {}", where_clause, w),
                 None => where_clause,
@@ -1643,7 +1682,13 @@ pub fn expand_modifiers_to_sql(
                 if !has_all_global && !removed_dims.contains(&dim_lower) {
                     let outer_ref = outer_alias.unwrap_or(table_name);
                     let qualified_expr = qualify_outer_reference(expr, outer_ref, dim);
-                    set_conditions.push(format!("_inner.{} = {}", dim, qualified_expr));
+                    // For ad hoc dimensions (expressions), qualify column refs inside
+                    let inner_dim = if dim.contains('(') {
+                        qualify_where_for_inner(dim)
+                    } else {
+                        format!("_inner.{}", dim)
+                    };
+                    set_conditions.push(format!("{} = {}", inner_dim, qualified_expr));
                 }
             }
         }
@@ -1660,8 +1705,10 @@ pub fn expand_modifiers_to_sql(
     // Filter group_by_cols to exclude removed dimensions
     let remaining_cols: Vec<&String> = group_by_cols.iter()
         .filter(|col| {
+            let col_lower = col.to_lowercase();
             let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
-            !removed_dims.iter().any(|d| *d == col_name)
+            // Check both full expression match and simple column match
+            !removed_dims.iter().any(|d| *d == col_lower || *d == col_name)
         })
         .collect();
 
@@ -1669,8 +1716,15 @@ pub fn expand_modifiers_to_sql(
     let outer_ref = outer_alias.unwrap_or(table_name);
     let correlation_conditions: Vec<String> = remaining_cols.iter()
         .map(|col| {
-            let col_name = col.split('.').last().unwrap_or(col);
-            format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+            let col_is_expr = col.contains('(');
+            if col_is_expr {
+                // For expression dimensions, qualify column refs inside
+                let inner_expr = qualify_where_for_inner(col);
+                format!("{} = {}", inner_expr, col)
+            } else {
+                let col_name = col.split('.').last().unwrap_or(col);
+                format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+            }
         })
         .collect();
 
@@ -1727,8 +1781,10 @@ fn expand_modifiers_to_sql_derived(
         // Filter group_by_cols to get remaining dimensions
         let remaining_cols: Vec<&String> = group_by_cols.iter()
             .filter(|col| {
+                let col_lower = col.to_lowercase();
                 let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
-                !removed_dims.iter().any(|d| d.to_lowercase() == col_name)
+                // Check both full expression match and simple column match
+                !removed_dims.iter().any(|d| d.to_lowercase() == col_lower || d.to_lowercase() == col_name)
             })
             .collect();
 
@@ -1741,8 +1797,15 @@ fn expand_modifiers_to_sql_derived(
         let outer_ref = outer_alias.unwrap_or(table_name);
         let where_clauses: Vec<_> = remaining_cols.iter()
             .map(|col| {
-                let col_name = col.split('.').last().unwrap_or(col);
-                format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                let col_is_expr = col.contains('(');
+                if col_is_expr {
+                    // For expression dimensions, qualify column refs inside
+                    let inner_expr = qualify_where_for_inner(col);
+                    format!("{} = {}", inner_expr, col)
+                } else {
+                    let col_name = col.split('.').last().unwrap_or(col);
+                    format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                }
             })
             .collect();
         return format!(
@@ -1791,8 +1854,10 @@ fn expand_modifiers_to_sql_derived(
     // Filter remaining dimensions
     let remaining_cols: Vec<&String> = group_by_cols.iter()
         .filter(|col| {
+            let col_lower = col.to_lowercase();
             let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
-            !removed_dims.iter().any(|d| *d == col_name)
+            // Check both full expression match and simple column match
+            !removed_dims.iter().any(|d| *d == col_lower || *d == col_name)
         })
         .collect();
 
@@ -1800,8 +1865,15 @@ fn expand_modifiers_to_sql_derived(
     let outer_ref = outer_alias.unwrap_or(table_name);
     let mut all_conditions: Vec<String> = remaining_cols.iter()
         .map(|col| {
-            let col_name = col.split('.').last().unwrap_or(col);
-            format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+            let col_is_expr = col.contains('(');
+            if col_is_expr {
+                // For expression dimensions, qualify column refs inside
+                let inner_expr = qualify_where_for_inner(col);
+                format!("{} = {}", inner_expr, col)
+            } else {
+                let col_name = col.split('.').last().unwrap_or(col);
+                format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+            }
         })
         .collect();
 
@@ -2732,5 +2804,50 @@ GROUP BY s.year";
         assert!(result.had_aggregate);
         // Should still use orders_v (the measure's source), not customers
         assert!(result.expanded_sql.contains("FROM orders_v"));
+    }
+
+    #[test]
+    fn test_parse_at_modifier_ad_hoc_dimension() {
+        // Ad hoc dimension with function expression
+        let result = parse_at_modifier("SET MONTH(order_date) = 2").unwrap();
+        assert_eq!(
+            result,
+            ContextModifier::Set("MONTH(order_date)".to_string(), "2".to_string())
+        );
+
+        // ALL with function expression
+        let result = parse_at_modifier("ALL YEAR(created_at)").unwrap();
+        assert_eq!(
+            result,
+            ContextModifier::All("YEAR(created_at)".to_string())
+        );
+
+        // Nested function
+        let result = parse_at_modifier("SET EXTRACT(month FROM date) = 6").unwrap();
+        assert_eq!(
+            result,
+            ContextModifier::Set("EXTRACT(month FROM date)".to_string(), "6".to_string())
+        );
+    }
+
+    #[test]
+    fn test_qualify_where_for_inner_with_functions() {
+        // Function calls should not get _inner. prefix
+        assert_eq!(
+            qualify_where_for_inner("MONTH(order_date) = 2"),
+            "MONTH(_inner.order_date) = 2"
+        );
+
+        // Multiple columns in function
+        assert_eq!(
+            qualify_where_for_inner("DATEDIFF(start_date, end_date) > 30"),
+            "DATEDIFF(_inner.start_date, _inner.end_date) > 30"
+        );
+
+        // Mix of functions and plain columns
+        assert_eq!(
+            qualify_where_for_inner("year = 2023 AND MONTH(date) = 6"),
+            "_inner.year = 2023 AND MONTH(_inner.date) = 6"
+        );
     }
 }

@@ -134,8 +134,10 @@ GROUP BY dimensions;
 |----------|-------------|---------|
 | `AT (ALL)` | Grand total across all dimensions | `AGGREGATE(revenue) AT (ALL)` |
 | `AT (ALL dim)` | Total excluding specific dimension | `AGGREGATE(revenue) AT (ALL region)` |
+| `AT (ALL expr)` | Total excluding ad hoc dimension | `AGGREGATE(revenue) AT (ALL MONTH(date))` |
 | `AT (SET dim = val)` | Fix dimension to specific value | `AGGREGATE(revenue) AT (SET year = 2022)` |
 | `AT (SET dim = expr)` | Fix dimension to expression | `AGGREGATE(revenue) AT (SET year = year - 1)` |
+| `AT (SET expr = val)` | Fix ad hoc dimension to value | `AGGREGATE(revenue) AT (SET MONTH(date) = 6)` |
 | `AT (WHERE cond)` | Pre-aggregation filter | `AGGREGATE(revenue) AT (WHERE region = 'US')` |
 | `AT (VISIBLE)` | Use query's WHERE clause | `AGGREGATE(revenue) AT (VISIBLE)` |
 

@@ -728,3 +728,45 @@ GROUP BY year;
 ----
 2022	110.0	340.0
 2023	230.0	340.0
+
+# =============================================================================
+# Test: Ad hoc dimensions (expressions in SET/ALL)
+# =============================================================================
+
+# Create table with dates for ad hoc dimension testing
+statement ok
+CREATE TABLE daily_orders (order_date DATE, amount DOUBLE);
+
+statement ok
+INSERT INTO daily_orders VALUES
+    ('2023-01-15', 100), ('2023-01-20', 150),
+    ('2023-02-10', 200), ('2023-02-25', 120),
+    ('2023-03-05', 180), ('2023-03-15', 90);
+
+# View exposes order_date so we can use expressions on it
+statement ok
+CREATE VIEW daily_orders_v AS
+SELECT order_date, SUM(amount) AS MEASURE revenue
+FROM daily_orders
+GROUP BY order_date;
+
+# SET with expression dimension: fix to a specific month
+# This generates WHERE MONTH(_inner.order_date) = 2
+query IRR rowsort
+SEMANTIC SELECT MONTH(order_date), AGGREGATE(revenue), AGGREGATE(revenue) AT (SET MONTH(order_date) = 2) AS feb_revenue
+FROM daily_orders_v
+GROUP BY MONTH(order_date);
+----
+1	250.0	320.0
+2	320.0	320.0
+3	270.0	320.0
+
+# ALL with expression dimension: remove the month grouping, get total
+query IRR rowsort
+SEMANTIC SELECT MONTH(order_date), AGGREGATE(revenue), AGGREGATE(revenue) AT (ALL MONTH(order_date)) AS total
+FROM daily_orders_v
+GROUP BY MONTH(order_date);
+----
+1	250.0	840.0
+2	320.0	840.0
+3	270.0	840.0
