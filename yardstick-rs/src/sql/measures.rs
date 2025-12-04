@@ -702,6 +702,47 @@ fn find_aggregation_in_expression(expr: &str) -> Option<String> {
     None
 }
 
+/// Expand derived measure expression by replacing measure references with their aggregations
+/// "revenue - cost" with measures [revenue=SUM(amount), cost=SUM(expense)]
+/// -> "SUM(revenue) - SUM(cost)"
+fn expand_derived_measure_expr(expr: &str, measure_view: &MeasureView) -> String {
+    let mut result = String::new();
+    let mut chars = expr.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c.is_alphabetic() || c == '_' {
+            // Collect identifier
+            let mut ident = String::from(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' {
+                    ident.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+
+            // Check if this identifier is a measure name
+            if let Some(m) = measure_view.measures.iter().find(|m| m.column_name.eq_ignore_ascii_case(&ident)) {
+                // Get the aggregation function from this measure's expression
+                if let Some(agg_fn) = extract_aggregation_function(&m.expression) {
+                    // Replace measure name with AGG(measure_name)
+                    result.push_str(&format!("{}({})", agg_fn.to_uppercase(), ident));
+                } else {
+                    // Fallback to SUM if no aggregation found
+                    result.push_str(&format!("SUM({})", ident));
+                }
+            } else {
+                // Not a measure, keep as-is
+                result.push_str(&ident);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 /// Qualify dimension reference in expression for correlated subquery
 /// "year - 1" with table "sales" and dim "year" -> "sales.year - 1"
 pub fn qualify_outer_reference(expr: &str, table_name: &str, dim: &str) -> String {
@@ -841,39 +882,108 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
 
 /// Extract measures from SQL using nom-based parsing
 fn extract_measures_from_sql(sql: &str) -> Result<(String, Vec<ViewMeasure>, Option<String>)> {
-    let mut measures = Vec::new();
     let view_name = extract_view_name(sql);
-
-    // Find all AS MEASURE patterns and collect replacements
     let sql_upper = sql.to_uppercase();
-    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    // First pass: collect all measures with positions
+    struct MeasureInfo {
+        name: String,
+        expression: String,
+        expr_start: usize,
+        name_end: usize,
+    }
+    let mut measure_infos: Vec<MeasureInfo> = Vec::new();
 
     let mut search_pos = 0;
     while let Some(offset) = sql_upper[search_pos..].find(" AS MEASURE ") {
         let pattern_start = search_pos + offset;
         let after_measure = pattern_start + " AS MEASURE ".len();
 
-        // Parse the measure name
         if let Ok((rest, name)) = identifier(&sql[after_measure..]) {
             let name_end = after_measure + (sql[after_measure..].len() - rest.len());
-
-            // Find the expression before AS MEASURE by walking backward
             let expr_start = find_expression_start(sql, pattern_start);
             let expression = sql[expr_start..pattern_start].trim().to_string();
 
-            measures.push(ViewMeasure {
-                column_name: name.to_string(),
+            measure_infos.push(MeasureInfo {
+                name: name.to_string(),
                 expression,
+                expr_start,
+                name_end,
             });
-
-            // Replace "AS MEASURE name" with "AS name"
-            replacements.push((pattern_start, name_end, format!(" AS {}", name)));
 
             search_pos = name_end;
         } else {
             search_pos = pattern_start + 1;
         }
     }
+
+    // Collect all measure names for derived measure detection
+    let measure_names: Vec<&str> = measure_infos.iter().map(|m| m.name.as_str()).collect();
+
+    // Check if an expression is derived (references other measures, no aggregation)
+    let is_derived = |expr: &str| -> bool {
+        if extract_aggregation_function(expr).is_some() {
+            return false; // Has aggregation, not derived
+        }
+        // Check if expression references any measure name
+        for name in &measure_names {
+            // Simple word boundary check
+            let expr_lower = expr.to_lowercase();
+            let name_lower = name.to_lowercase();
+            if expr_lower.contains(&name_lower) {
+                // More precise check: ensure it's a word boundary
+                for (i, _) in expr_lower.match_indices(&name_lower) {
+                    let before_ok = i == 0 || !expr.chars().nth(i - 1).unwrap_or(' ').is_alphanumeric();
+                    let after_ok = i + name_lower.len() >= expr.len()
+                        || !expr.chars().nth(i + name_lower.len()).unwrap_or(' ').is_alphanumeric();
+                    if before_ok && after_ok {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    };
+
+    // Generate replacements based on whether measure is base or derived
+    // (start, end, replacement) - for derived, we remove the whole column
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for info in &measure_infos {
+        if is_derived(&info.expression) {
+            // Derived measure: remove entire column including preceding comma
+            let mut remove_start = info.expr_start;
+            // Look for preceding comma
+            let before = &sql[..remove_start];
+            if let Some(comma_pos) = before.rfind(',') {
+                // Check that only whitespace between comma and expr_start
+                let between = &before[comma_pos + 1..];
+                if between.trim().is_empty() {
+                    remove_start = comma_pos;
+                }
+            }
+            replacements.push((remove_start, info.name_end, String::new()));
+        } else {
+            // Base measure: replace "AS MEASURE name" with "AS name"
+            let pattern_start = info.name_end - " AS MEASURE ".len() - info.name.len()
+                - (sql[info.expr_start..info.name_end].len() - info.expression.len() - " AS MEASURE ".len() - info.name.len());
+            // Actually, simpler: find " AS MEASURE " before name_end
+            let chunk = &sql[info.expr_start..info.name_end];
+            if let Some(am_pos) = chunk.to_uppercase().find(" AS MEASURE ") {
+                let abs_start = info.expr_start + am_pos;
+                replacements.push((abs_start, info.name_end, format!(" AS {}", info.name)));
+            }
+        }
+    }
+
+    // Build measures list
+    let measures: Vec<ViewMeasure> = measure_infos
+        .into_iter()
+        .map(|m| ViewMeasure {
+            column_name: m.name,
+            expression: m.expression,
+        })
+        .collect();
 
     // Apply replacements in reverse order
     let mut clean_sql = sql.to_string();
@@ -1144,15 +1254,24 @@ fn extract_from_clause_info(select: &Select) -> FromClauseInfo {
     info
 }
 
-/// Look up which view contains a measure and return (agg_fn, source_view_name)
+/// Look up which view contains a measure and return (agg_fn, source_view_name, derived_expr)
+/// derived_expr is Some if this is a derived measure (should use expanded expression instead of AGG(name))
 /// Prioritizes default_table (the query's FROM table), then searches other views for JOINs
-fn resolve_measure_source(measure_name: &str, default_table: &str) -> (String, String) {
+fn resolve_measure_source(measure_name: &str, default_table: &str) -> (String, String, Option<String>) {
     let views = MEASURE_VIEWS.lock().unwrap();
 
     // First, check if the measure exists in the default table (query's primary table)
     if let Some(v) = views.get(default_table) {
         if let Some(m) = v.measures.iter().find(|m| m.column_name.eq_ignore_ascii_case(measure_name)) {
-            return (extract_agg_function(&m.expression), default_table.to_string());
+            let agg_fn = extract_agg_function(&m.expression);
+            // Check if this is a derived measure (no aggregation, references other measures)
+            if extract_aggregation_function(&m.expression).is_none() {
+                let expanded = expand_derived_measure_expr(&m.expression, v);
+                if expanded != m.expression {
+                    return (agg_fn, default_table.to_string(), Some(expanded));
+                }
+            }
+            return (agg_fn, default_table.to_string(), None);
         }
     }
 
@@ -1161,9 +1280,19 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> (String, S
         .find_map(|(view_name, v)| {
             v.measures.iter()
                 .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
-                .map(|m| (extract_agg_function(&m.expression), view_name.clone()))
+                .map(|m| {
+                    let agg_fn = extract_agg_function(&m.expression);
+                    // Check if this is a derived measure
+                    if extract_aggregation_function(&m.expression).is_none() {
+                        let expanded = expand_derived_measure_expr(&m.expression, v);
+                        if expanded != m.expression {
+                            return (agg_fn, view_name.clone(), Some(expanded));
+                        }
+                    }
+                    (agg_fn, view_name.clone(), None)
+                })
         })
-        .unwrap_or_else(|| ("SUM".to_string(), default_table.to_string()))
+        .unwrap_or_else(|| ("SUM".to_string(), default_table.to_string(), None))
 }
 
 /// Find the alias used for a view in the FROM clause
@@ -1216,6 +1345,16 @@ fn expand_aggregate_in_expr(expr: &Expr, measure_view: Option<&MeasureView>) -> 
                     } else if let Some(agg_fn) = find_aggregation_in_expression(&m.expression) {
                         // CASE WHEN SUM(x) > 100... → use SUM(measure_column)
                         format!("SELECT {}({})", agg_fn, measure_name)
+                    } else if let Some(mv) = measure_view {
+                        // Check if this is a derived measure (references other measures)
+                        let expanded = expand_derived_measure_expr(&m.expression, mv);
+                        if expanded != m.expression {
+                            // Successfully expanded derived measure
+                            format!("SELECT {}", expanded)
+                        } else {
+                            // No aggregation found, default to SUM
+                            format!("SELECT SUM({})", measure_name)
+                        }
                     } else {
                         // No aggregation found, default to SUM
                         format!("SELECT SUM({})", measure_name)
@@ -1552,6 +1691,134 @@ pub fn expand_modifiers_to_sql(
     }
 }
 
+/// Expand AT modifiers for derived measures (pre-expanded expression like "SUM(revenue) - SUM(cost)")
+fn expand_modifiers_to_sql_derived(
+    derived_expr: &str,
+    modifiers: &[ContextModifier],
+    table_name: &str,
+    outer_alias: Option<&str>,
+    outer_where: Option<&str>,
+    group_by_cols: &[String],
+) -> String {
+    // For derived measures, we use the pre-expanded expression directly
+    // The logic is similar to expand_modifiers_to_sql but uses derived_expr instead of AGG(measure)
+
+    if modifiers.is_empty() {
+        // No modifiers = just use the expression
+        return format!("(SELECT {} FROM {})", derived_expr, table_name);
+    }
+
+    // Check for AllGlobal (grand total)
+    if modifiers.iter().any(|m| matches!(m, ContextModifier::AllGlobal)) {
+        return format!("(SELECT {} FROM {})", derived_expr, table_name);
+    }
+
+    // Check if all modifiers are ALL (dimension)
+    let all_are_all = modifiers.iter().all(|m| matches!(m, ContextModifier::All(_)));
+    if all_are_all {
+        // Accumulate dimensions to remove
+        let removed_dims: Vec<&str> = modifiers.iter()
+            .filter_map(|m| match m {
+                ContextModifier::All(dim) => Some(dim.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // Filter group_by_cols to get remaining dimensions
+        let remaining_cols: Vec<&String> = group_by_cols.iter()
+            .filter(|col| {
+                let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
+                !removed_dims.iter().any(|d| d.to_lowercase() == col_name)
+            })
+            .collect();
+
+        if remaining_cols.is_empty() {
+            // All dimensions removed = grand total
+            return format!("(SELECT {} FROM {})", derived_expr, table_name);
+        }
+
+        // Generate correlation on remaining dimensions
+        let outer_ref = outer_alias.unwrap_or(table_name);
+        let where_clauses: Vec<_> = remaining_cols.iter()
+            .map(|col| {
+                let col_name = col.split('.').last().unwrap_or(col);
+                format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+            })
+            .collect();
+        return format!(
+            "(SELECT {} FROM {} _inner WHERE {})",
+            derived_expr, table_name, where_clauses.join(" AND ")
+        );
+    }
+
+    // For other modifiers (SET, WHERE, VISIBLE), build conditions
+    let mut effective_where: Option<String> = None;
+    let mut has_all_global = false;
+    let mut removed_dims: Vec<String> = Vec::new();
+
+    for modifier in modifiers.iter().rev() {
+        match modifier {
+            ContextModifier::AllGlobal => {
+                has_all_global = true;
+                effective_where = None;
+            }
+            ContextModifier::All(dim) => {
+                removed_dims.push(dim.to_lowercase());
+            }
+            ContextModifier::Visible => {
+                if !has_all_global {
+                    if let Some(w) = outer_where {
+                        effective_where = Some(qualify_where_for_inner(w));
+                    }
+                }
+            }
+            ContextModifier::Where(cond) => {
+                if !has_all_global {
+                    effective_where = Some(qualify_where_for_inner(cond));
+                }
+            }
+            ContextModifier::Set(_, _) => {
+                // SET doesn't apply directly to derived measures in the same way
+                // The derived expression already includes the aggregations
+            }
+        }
+    }
+
+    if has_all_global {
+        return format!("(SELECT {} FROM {})", derived_expr, table_name);
+    }
+
+    // Filter remaining dimensions
+    let remaining_cols: Vec<&String> = group_by_cols.iter()
+        .filter(|col| {
+            let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
+            !removed_dims.iter().any(|d| *d == col_name)
+        })
+        .collect();
+
+    // Build conditions
+    let outer_ref = outer_alias.unwrap_or(table_name);
+    let mut all_conditions: Vec<String> = remaining_cols.iter()
+        .map(|col| {
+            let col_name = col.split('.').last().unwrap_or(col);
+            format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+        })
+        .collect();
+
+    if let Some(w) = effective_where {
+        all_conditions.push(w);
+    }
+
+    if all_conditions.is_empty() {
+        format!("(SELECT {} FROM {})", derived_expr, table_name)
+    } else {
+        format!(
+            "(SELECT {} FROM {} _inner WHERE {})",
+            derived_expr, table_name, all_conditions.join(" AND ")
+        )
+    }
+}
+
 /// Expand AGGREGATE() with AT modifiers in SQL
 pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     if !has_at_syntax(sql) {
@@ -1621,7 +1888,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     for (measure_name, modifiers, start, end) in patterns {
         // Look up which view contains this measure (for JOIN support)
-        let (agg_fn, source_view) = resolve_measure_source(&measure_name, &primary_table_name);
+        let (agg_fn, source_view, derived_expr) = resolve_measure_source(&measure_name, &primary_table_name);
 
         // Find the alias for this measure's source view in the FROM clause
         // If the source view is the primary table and we added _outer, use _outer
@@ -1640,7 +1907,20 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         };
         let outer_alias_ref = outer_alias.as_deref();
 
-        let expanded = expand_modifiers_to_sql(&measure_name, &agg_fn, &modifiers, &source_view, outer_alias_ref, outer_where_ref, &group_by_cols);
+        // For derived measures, use the expanded expression instead of measure_name
+        let (effective_measure, effective_agg) = if let Some(ref expr) = derived_expr {
+            // Derived measure: use expanded expression directly (no wrapping AGG)
+            (expr.as_str(), "".to_string())
+        } else {
+            (measure_name.as_str(), agg_fn)
+        };
+
+        let expanded = if derived_expr.is_some() {
+            // For derived measures, build the subquery with the expanded expression
+            expand_modifiers_to_sql_derived(effective_measure, &modifiers, &source_view, outer_alias_ref, outer_where_ref, &group_by_cols)
+        } else {
+            expand_modifiers_to_sql(&measure_name, &effective_agg, &modifiers, &source_view, outer_alias_ref, outer_where_ref, &group_by_cols)
+        };
         result_sql = format!("{}{}{}", &result_sql[..start], expanded, &result_sql[end..]);
     }
 
@@ -1649,10 +1929,14 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     plain_calls.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by position descending
 
     for (measure_name, start, end) in plain_calls {
-        let (agg_fn, _source_view) = resolve_measure_source(&measure_name, &primary_table_name);
+        let (agg_fn, _source_view, derived_expr) = resolve_measure_source(&measure_name, &primary_table_name);
 
-        // Plain AGGREGATE defaults to the raw aggregation on the measure column
-        let expanded = format!("{}({})", agg_fn, measure_name);
+        // For derived measures, use the expanded expression; otherwise use AGG(measure_name)
+        let expanded = if let Some(expr) = derived_expr {
+            expr
+        } else {
+            format!("{}({})", agg_fn, measure_name)
+        };
         result_sql = format!("{}{}{}", &result_sql[..start], expanded, &result_sql[end..]);
     }
 
@@ -1798,6 +2082,38 @@ mod tests {
         eprintln!("Expand result: {:?}", expand_result);
         // This should have expanded AGGREGATE(flag) to something
         assert!(expand_result.had_aggregate);
+    }
+
+    #[test]
+    #[serial]
+    fn test_process_create_view_derived_measure() {
+        clear_measure_views();
+
+        // Create view with base measures and a derived measure
+        let sql = "CREATE VIEW financials_v AS SELECT year, SUM(revenue) AS MEASURE revenue, SUM(cost) AS MEASURE cost, revenue - cost AS MEASURE profit FROM financials GROUP BY year";
+        let result = process_create_view(sql);
+
+        eprintln!("Clean SQL: {}", result.clean_sql);
+        eprintln!("Measures: {:?}", result.measures);
+
+        assert!(result.is_measure_view);
+        assert_eq!(result.measures.len(), 3);
+
+        // Check base measures
+        assert_eq!(result.measures[0].column_name, "revenue");
+        assert_eq!(result.measures[0].expression, "SUM(revenue)");
+        assert_eq!(result.measures[1].column_name, "cost");
+        assert_eq!(result.measures[1].expression, "SUM(cost)");
+
+        // Check derived measure
+        assert_eq!(result.measures[2].column_name, "profit");
+        assert_eq!(result.measures[2].expression, "revenue - cost");
+
+        // Clean SQL should NOT contain the derived measure column
+        assert!(result.clean_sql.contains("AS revenue"));
+        assert!(result.clean_sql.contains("AS cost"));
+        assert!(!result.clean_sql.contains("AS profit"));
+        assert!(!result.clean_sql.contains("revenue - cost"));
     }
 
     #[test]
@@ -2149,6 +2465,37 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_derived_measure_expr() {
+        // Create a measure view with revenue and cost measures
+        let mv = MeasureView {
+            view_name: "sales_v".to_string(),
+            measures: vec![
+                ViewMeasure {
+                    column_name: "revenue".to_string(),
+                    expression: "SUM(amount)".to_string(),
+                },
+                ViewMeasure {
+                    column_name: "cost".to_string(),
+                    expression: "SUM(expense)".to_string(),
+                },
+            ],
+            base_query: "".to_string(),
+        };
+
+        // Simple subtraction
+        let expanded = expand_derived_measure_expr("revenue - cost", &mv);
+        assert_eq!(expanded, "SUM(revenue) - SUM(cost)");
+
+        // With parentheses
+        let expanded2 = expand_derived_measure_expr("(revenue - cost) / revenue", &mv);
+        assert_eq!(expanded2, "(SUM(revenue) - SUM(cost)) / SUM(revenue)");
+
+        // Non-measure identifiers preserved
+        let expanded3 = expand_derived_measure_expr("revenue * 100", &mv);
+        assert_eq!(expanded3, "SUM(revenue) * 100");
+    }
+
+    #[test]
     fn test_extract_table_and_alias() {
         // No alias
         assert_eq!(
@@ -2305,14 +2652,16 @@ GROUP BY s.year";
         );
 
         // Should find revenue in orders_v
-        let (agg_fn, source) = resolve_measure_source("revenue", "fallback");
+        let (agg_fn, source, derived) = resolve_measure_source("revenue", "fallback");
         assert_eq!(agg_fn, "SUM");
         assert_eq!(source, "orders_v");
+        assert!(derived.is_none()); // Not a derived measure
 
         // Unknown measure should fallback
-        let (agg_fn2, source2) = resolve_measure_source("unknown", "fallback");
+        let (agg_fn2, source2, derived2) = resolve_measure_source("unknown", "fallback");
         assert_eq!(agg_fn2, "SUM");
         assert_eq!(source2, "fallback");
+        assert!(derived2.is_none());
     }
 
     #[test]

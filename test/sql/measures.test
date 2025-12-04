@@ -680,3 +680,51 @@ GROUP BY year;
 ----
 2022	0
 2023	1
+
+# =============================================================================
+# Test: Derived measures (measures referencing other measures)
+# =============================================================================
+
+statement ok
+CREATE TABLE financials (year INT, revenue DOUBLE, cost DOUBLE);
+
+statement ok
+INSERT INTO financials VALUES
+    (2022, 100, 60), (2022, 150, 80),
+    (2023, 200, 100), (2023, 250, 120);
+
+statement ok
+CREATE VIEW financials_v AS
+SELECT year,
+    SUM(revenue) AS MEASURE revenue,
+    SUM(cost) AS MEASURE cost,
+    revenue - cost AS MEASURE profit
+FROM financials
+GROUP BY year;
+
+# Query basic measures
+query IRR rowsort
+SEMANTIC SELECT year, AGGREGATE(revenue), AGGREGATE(cost)
+FROM financials_v
+GROUP BY year;
+----
+2022	250.0	140.0
+2023	450.0	220.0
+
+# Query derived measure (profit = revenue - cost)
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(profit)
+FROM financials_v
+GROUP BY year;
+----
+2022	110.0
+2023	230.0
+
+# Derived measure with AT modifier
+query IRR rowsort
+SEMANTIC SELECT year, AGGREGATE(profit), AGGREGATE(profit) AT (ALL) AS total_profit
+FROM financials_v
+GROUP BY year;
+----
+2022	110.0	340.0
+2023	230.0	340.0

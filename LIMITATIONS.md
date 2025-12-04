@@ -15,24 +15,11 @@ Implementation of Julian Hyde's "Measures in SQL" paper (arXiv:2406.00251).
 - Multiple measures in same view
 - Arithmetic with AGGREGATE results (ratios, percentages, differences)
 - SUM, COUNT, MIN, MAX, AVG aggregations
+- Derived measures: `revenue - cost AS MEASURE profit` expands to `SUM(revenue) - SUM(cost)`
 
 ## Known Limitations
 
-### 1. No Derived Measures
-
-```sql
--- NOT YET SUPPORTED: Measures referencing other measures
-CREATE VIEW v AS
-SELECT year,
-  SUM(revenue) AS MEASURE revenue,
-  SUM(cost) AS MEASURE cost,
-  revenue - cost AS MEASURE profit  -- NOT SUPPORTED
-FROM t GROUP BY year;
-```
-
-**Workaround**: Calculate derived values in the SELECT using AGGREGATE().
-
-### 2. SET Cannot Reach Beyond WHERE Clause
+### 1. SET Cannot Reach Beyond WHERE Clause
 
 ```sql
 -- ISSUE: SET cannot access data filtered out by the outer WHERE clause
@@ -49,7 +36,7 @@ Per the paper, `AT (SET year = CURRENT year - 1)` should evaluate over the *enti
 
 **Workaround**: Remove the WHERE clause and filter in application code, or use a CTE.
 
-### 3. No Window Function Measures
+### 2. No Window Function Measures
 
 ```sql
 -- NOT SUPPORTED: Window functions in measure definitions
