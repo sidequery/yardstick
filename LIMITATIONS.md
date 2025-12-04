@@ -8,6 +8,7 @@ Implementation of Julian Hyde's "Measures in SQL" paper (arXiv:2406.00251).
 - `AGGREGATE(measure)` function to evaluate measures
 - `AT (ALL)` - grand total (removes all dimensions)
 - `AT (ALL dim)` - removes specific dimension from context
+- Chained AT modifiers: `AT (ALL dim1) AT (ALL dim2)` correctly correlates on remaining dimensions
 - `AT (SET dim = expr)` - fixes dimension to specific value (e.g., YoY comparisons)
 - `AT (WHERE condition)` - filters before aggregation
 - `AT (VISIBLE)` - uses visible WHERE clause filters
@@ -17,19 +18,7 @@ Implementation of Julian Hyde's "Measures in SQL" paper (arXiv:2406.00251).
 
 ## Known Limitations
 
-### 1. Chained AT Modifiers
-
-```sql
--- ISSUE: Chaining multiple AT modifiers doesn't work as expected
-AGGREGATE(revenue) AT (ALL region) AT (ALL category)
--- Returns grand total instead of year-only total
--- Expected: Remove region, then remove category (keeping year)
--- Actual: Removes all dimensions
-```
-
-**Workaround**: Use single `AT (ALL dim1, dim2)` syntax if supported, or restructure query.
-
-### 2. No Derived Measures
+### 1. No Derived Measures
 
 ```sql
 -- NOT YET SUPPORTED: Measures referencing other measures
@@ -43,7 +32,7 @@ FROM t GROUP BY year;
 
 **Workaround**: Calculate derived values in the SELECT using AGGREGATE().
 
-### 3. SET Cannot Reach Beyond WHERE Clause
+### 2. SET Cannot Reach Beyond WHERE Clause
 
 ```sql
 -- ISSUE: SET cannot access data filtered out by the outer WHERE clause
@@ -60,7 +49,7 @@ Per the paper, `AT (SET year = CURRENT year - 1)` should evaluate over the *enti
 
 **Workaround**: Remove the WHERE clause and filter in application code, or use a CTE.
 
-### 4. No Window Function Measures
+### 3. No Window Function Measures
 
 ```sql
 -- NOT SUPPORTED: Window functions in measure definitions

@@ -373,37 +373,35 @@ SEMANTIC SELECT AGGREGATE(revenue) FROM sales_v;
 ----
 375.0
 
-# Total by year only - chaining AT (ALL dim1) AT (ALL dim2) currently produces grand total
-# TODO: fix chaining to properly correlate on remaining dimensions
+# Total by year only - chaining AT (ALL region) AT (ALL category) correlates on year
 query IIIR rowsort
 SEMANTIC SELECT year, region, category, AGGREGATE(revenue) AT (ALL region) AT (ALL category) AS year_total
 FROM products_v
 GROUP BY year, region, category;
 ----
-2022	EU	A	600.0
-2022	EU	B	600.0
-2022	US	A	600.0
-2022	US	B	600.0
-2023	EU	A	600.0
-2023	EU	B	600.0
-2023	US	A	600.0
-2023	US	B	600.0
+2022	EU	A	270.0
+2022	EU	B	270.0
+2022	US	A	270.0
+2022	US	B	270.0
+2023	EU	A	330.0
+2023	EU	B	330.0
+2023	US	A	330.0
+2023	US	B	330.0
 
-# Total by category only - chaining AT (ALL dim1) AT (ALL dim2) currently produces grand total
-# TODO: fix chaining to properly correlate on remaining dimensions
+# Total by category only - chaining AT (ALL year) AT (ALL region) correlates on category
 query IIIR rowsort
 SEMANTIC SELECT year, region, category, AGGREGATE(revenue) AT (ALL year) AT (ALL region) AS category_total
 FROM products_v
 GROUP BY year, region, category;
 ----
-2022	EU	A	600.0
-2022	EU	B	600.0
-2022	US	A	600.0
-2022	US	B	600.0
-2023	EU	A	600.0
-2023	EU	B	600.0
-2023	US	A	600.0
-2023	US	B	600.0
+2022	EU	A	400.0
+2022	EU	B	200.0
+2022	US	A	400.0
+2022	US	B	200.0
+2023	EU	A	400.0
+2023	EU	B	200.0
+2023	US	A	400.0
+2023	US	B	200.0
 
 # =============================================================================
 # Test: MIN and MAX measures

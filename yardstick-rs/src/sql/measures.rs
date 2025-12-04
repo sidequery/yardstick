@@ -735,6 +735,59 @@ pub fn qualify_outer_reference(expr: &str, table_name: &str, dim: &str) -> Strin
     result
 }
 
+/// Qualify column references in a WHERE clause for use inside _inner subquery
+/// "region = 'US'" -> "_inner.region = 'US'"
+/// "year > 2020 AND region = 'US'" -> "_inner.year > 2020 AND _inner.region = 'US'"
+fn qualify_where_for_inner(where_clause: &str) -> String {
+    let mut result = String::new();
+    let mut chars = where_clause.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c.is_alphabetic() || c == '_' {
+            // Collect identifier
+            let mut ident = String::from(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' {
+                    ident.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+
+            // Check if followed by a dot (already qualified)
+            let already_qualified = chars.peek() == Some(&'.');
+
+            // SQL keywords that should not be prefixed
+            let keywords = ["AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE",
+                           "LIKE", "BETWEEN", "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END"];
+            let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
+
+            if !already_qualified && !is_keyword {
+                result.push_str("_inner.");
+            }
+            result.push_str(&ident);
+        } else if c == '\'' {
+            // String literal - copy as-is until closing quote
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '\'' {
+                    // Check for escaped quote ''
+                    if chars.peek() == Some(&'\'') {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 // =============================================================================
 // Core Functions - Process CREATE VIEW
 // =============================================================================
@@ -1092,9 +1145,18 @@ fn extract_from_clause_info(select: &Select) -> FromClauseInfo {
 }
 
 /// Look up which view contains a measure and return (agg_fn, source_view_name)
-/// Falls back to default_table if measure not found in catalog
+/// Prioritizes default_table (the query's FROM table), then searches other views for JOINs
 fn resolve_measure_source(measure_name: &str, default_table: &str) -> (String, String) {
     let views = MEASURE_VIEWS.lock().unwrap();
+
+    // First, check if the measure exists in the default table (query's primary table)
+    if let Some(v) = views.get(default_table) {
+        if let Some(m) = v.measures.iter().find(|m| m.column_name.eq_ignore_ascii_case(measure_name)) {
+            return (extract_agg_function(&m.expression), default_table.to_string());
+        }
+    }
+
+    // If not found in default table, search other views (for JOIN support)
     views.iter()
         .find_map(|(view_name, v)| {
             v.measures.iter()
@@ -1353,10 +1415,48 @@ pub fn expand_modifiers_to_sql(
         return expand_at_to_sql(measure_col, agg_fn, &modifiers[0], table_name, outer_alias, outer_where, group_by_cols);
     }
 
-    // Check if all modifiers are ALL (dimension or global) - combine to grand total
+    // Check if all modifiers are ALL (dimension or global)
     let all_are_all = modifiers.iter().all(|m| matches!(m, ContextModifier::All(_) | ContextModifier::AllGlobal));
     if all_are_all {
-        return expand_at_to_sql(measure_col, agg_fn, &ContextModifier::AllGlobal, table_name, outer_alias, outer_where, group_by_cols);
+        // Check for explicit AllGlobal - that means grand total
+        if modifiers.iter().any(|m| matches!(m, ContextModifier::AllGlobal)) {
+            return expand_at_to_sql(measure_col, agg_fn, &ContextModifier::AllGlobal, table_name, outer_alias, outer_where, group_by_cols);
+        }
+
+        // Accumulate all dimensions to remove
+        let removed_dims: Vec<&str> = modifiers.iter()
+            .filter_map(|m| match m {
+                ContextModifier::All(dim) => Some(dim.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // Filter group_by_cols to get remaining dimensions
+        let remaining_cols: Vec<&String> = group_by_cols.iter()
+            .filter(|col| {
+                let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
+                !removed_dims.iter().any(|d| d.to_lowercase() == col_name)
+            })
+            .collect();
+
+        if remaining_cols.is_empty() {
+            // All dimensions removed = grand total
+            return expand_at_to_sql(measure_col, agg_fn, &ContextModifier::AllGlobal, table_name, outer_alias, outer_where, group_by_cols);
+        }
+
+        // Generate correlation on remaining dimensions only
+        let outer_ref = outer_alias.unwrap_or(table_name);
+        let measure_expr = format!("{}({})", agg_fn, measure_col);
+        let where_clauses: Vec<_> = remaining_cols.iter()
+            .map(|col| {
+                let col_name = col.split('.').last().unwrap_or(col);
+                format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+            })
+            .collect();
+        return format!(
+            "(SELECT {} FROM {} _inner WHERE {})",
+            measure_expr, table_name, where_clauses.join(" AND ")
+        );
     }
 
     // Apply modifiers right-to-left
@@ -1369,6 +1469,7 @@ pub fn expand_modifiers_to_sql(
     let mut effective_where: Option<String> = None;
     let mut has_all_global = false;
     let mut set_conditions: Vec<String> = Vec::new();
+    let mut removed_dims: Vec<String> = Vec::new();
 
     // Process modifiers (in order, which is right-to-left per paper)
     for modifier in modifiers.iter().rev() {
@@ -1378,25 +1479,29 @@ pub fn expand_modifiers_to_sql(
                 effective_where = None;
                 set_conditions.clear();
             }
-            ContextModifier::All(_) => {
+            ContextModifier::All(dim) => {
                 // ALL dim removes that dimension from context
-                // For simplicity, treat multiple ALLs as removing all context
-                has_all_global = true;
+                // Track which dimensions are removed for later filtering
+                removed_dims.push(dim.to_lowercase());
             }
             ContextModifier::Visible => {
                 if !has_all_global {
                     if let Some(w) = outer_where {
-                        effective_where = Some(w.to_string());
+                        // Qualify column references with _inner
+                        effective_where = Some(qualify_where_for_inner(w));
                     }
                 }
             }
             ContextModifier::Where(cond) => {
                 if !has_all_global {
-                    effective_where = Some(cond.clone());
+                    // Qualify column references with _inner
+                    effective_where = Some(qualify_where_for_inner(cond));
                 }
             }
             ContextModifier::Set(dim, expr) => {
-                if !has_all_global {
+                // Skip SET if ALL(dim) was already processed (dimension removed from context)
+                let dim_lower = dim.to_lowercase();
+                if !has_all_global && !removed_dims.contains(&dim_lower) {
                     let outer_ref = outer_alias.unwrap_or(table_name);
                     let qualified_expr = qualify_outer_reference(expr, outer_ref, dim);
                     set_conditions.push(format!("_inner.{} = {}", dim, qualified_expr));
@@ -1413,8 +1518,26 @@ pub fn expand_modifiers_to_sql(
         return format!("(SELECT {} FROM {})", measure_expr, table_name);
     }
 
-    // Combine conditions
-    let mut all_conditions: Vec<String> = set_conditions;
+    // Filter group_by_cols to exclude removed dimensions
+    let remaining_cols: Vec<&String> = group_by_cols.iter()
+        .filter(|col| {
+            let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
+            !removed_dims.iter().any(|d| *d == col_name)
+        })
+        .collect();
+
+    // Build correlation conditions for remaining dimensions
+    let outer_ref = outer_alias.unwrap_or(table_name);
+    let correlation_conditions: Vec<String> = remaining_cols.iter()
+        .map(|col| {
+            let col_name = col.split('.').last().unwrap_or(col);
+            format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+        })
+        .collect();
+
+    // Combine all conditions: correlation + SET conditions + WHERE
+    let mut all_conditions: Vec<String> = correlation_conditions;
+    all_conditions.extend(set_conditions);
     if let Some(w) = effective_where {
         all_conditions.push(w);
     }
@@ -1986,12 +2109,42 @@ mod tests {
 
     #[test]
     fn test_expand_modifiers_to_sql_chained_all() {
-        // Chaining ALL year AT (ALL region) should produce grand total
+        // Chaining AT (ALL region) AT (ALL category) should correlate on remaining dims (year)
+        let modifiers = vec![
+            ContextModifier::All("region".to_string()),
+            ContextModifier::All("category".to_string()),
+        ];
+        let group_by = vec!["year".to_string(), "region".to_string(), "category".to_string()];
+        let expanded = expand_modifiers_to_sql("revenue", "SUM", &modifiers, "sales_v", Some("_outer"), None, &group_by);
+        // Should correlate on year only (not grand total)
+        assert_eq!(
+            expanded,
+            "(SELECT SUM(revenue) FROM sales_v _inner WHERE _inner.year = _outer.year)"
+        );
+    }
+
+    #[test]
+    fn test_expand_modifiers_all_dims_removed() {
+        // When all GROUP BY dimensions are removed, should produce grand total
         let modifiers = vec![
             ContextModifier::All("year".to_string()),
             ContextModifier::All("region".to_string()),
         ];
-        let expanded = expand_modifiers_to_sql("revenue", "SUM", &modifiers, "sales_v", None, None, &[]);
+        let group_by = vec!["year".to_string(), "region".to_string()];
+        let expanded = expand_modifiers_to_sql("revenue", "SUM", &modifiers, "sales_v", None, None, &group_by);
+        assert_eq!(expanded, "(SELECT SUM(revenue) FROM sales_v)");
+    }
+
+    #[test]
+    fn test_expand_modifiers_set_then_all() {
+        // SET year = year - 1, then ALL year should produce grand total (SET is overridden)
+        let modifiers = vec![
+            ContextModifier::Set("year".to_string(), "year - 1".to_string()),
+            ContextModifier::All("year".to_string()),
+        ];
+        let group_by = vec!["year".to_string()];
+        let expanded = expand_modifiers_to_sql("revenue", "SUM", &modifiers, "sales_v", Some("_outer"), None, &group_by);
+        // ALL year should override SET year, resulting in grand total
         assert_eq!(expanded, "(SELECT SUM(revenue) FROM sales_v)");
     }
 

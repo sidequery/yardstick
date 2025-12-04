@@ -158,7 +158,6 @@ The extension will be at `build/release/extension/yardstick/yardstick.duckdb_ext
 See [LIMITATIONS.md](LIMITATIONS.md) for known issues and workarounds.
 
 Key limitations:
-- Chained AT modifiers collapse to grand total instead of removing dimensions sequentially
 - Derived measures (measures referencing other measures) not yet supported
 - Window function measures not supported
 
