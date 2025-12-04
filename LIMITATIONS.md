@@ -17,6 +17,7 @@ Implementation of Julian Hyde's "Measures in SQL" paper (arXiv:2406.00251).
 - Arithmetic with AGGREGATE results (ratios, percentages, differences)
 - SUM, COUNT, MIN, MAX, AVG aggregations
 - Derived measures: `revenue - cost AS MEASURE profit` expands to `SUM(revenue) - SUM(cost)`
+- Multi-fact JOINs: measures from different views can be queried together in a single JOIN
 
 ## Known Limitations
 

@@ -770,3 +770,60 @@ GROUP BY MONTH(order_date);
 1	250.0	840.0
 2	320.0	840.0
 3	270.0	840.0
+
+# =============================================================================
+# Test: Multi-fact JOINs (wide tables)
+# =============================================================================
+
+# Create two fact tables
+statement ok
+CREATE TABLE fact_orders (year INT, region TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO fact_orders VALUES (2022, 'US', 100), (2022, 'EU', 50), (2023, 'US', 150), (2023, 'EU', 75);
+
+statement ok
+CREATE TABLE fact_returns (year INT, region TEXT, return_amount DOUBLE);
+
+statement ok
+INSERT INTO fact_returns VALUES (2022, 'US', 10), (2022, 'EU', 5), (2023, 'US', 20), (2023, 'EU', 8);
+
+# Create two measure views
+statement ok
+CREATE VIEW fact_orders_v AS SELECT year, region, SUM(amount) AS MEASURE revenue FROM fact_orders GROUP BY year, region;
+
+statement ok
+CREATE VIEW fact_returns_v AS SELECT year, region, SUM(return_amount) AS MEASURE refunds FROM fact_returns GROUP BY year, region;
+
+# Query measures from both fact tables in a JOIN
+query IIRR rowsort
+SEMANTIC SELECT o.year, o.region, AGGREGATE(revenue), AGGREGATE(refunds)
+FROM fact_orders_v o JOIN fact_returns_v r ON o.year = r.year AND o.region = r.region
+GROUP BY o.year, o.region;
+----
+2022	EU	50.0	5.0
+2022	US	100.0	10.0
+2023	EU	75.0	8.0
+2023	US	150.0	20.0
+
+# Compute derived metric across fact tables (net revenue = revenue - refunds)
+query IIRRR rowsort
+SEMANTIC SELECT o.year, o.region, AGGREGATE(revenue), AGGREGATE(refunds), AGGREGATE(revenue) - AGGREGATE(refunds) AS net_revenue
+FROM fact_orders_v o JOIN fact_returns_v r ON o.year = r.year AND o.region = r.region
+GROUP BY o.year, o.region;
+----
+2022	EU	50.0	5.0	45.0
+2022	US	100.0	10.0	90.0
+2023	EU	75.0	8.0	67.0
+2023	US	150.0	20.0	130.0
+
+# AT modifiers work with multi-fact JOINs
+query IIRR rowsort
+SEMANTIC SELECT o.year, o.region, AGGREGATE(revenue), AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM fact_orders_v o JOIN fact_returns_v r ON o.year = r.year AND o.region = r.region
+GROUP BY o.year, o.region;
+----
+2022	EU	50.0	150.0
+2022	US	100.0	150.0
+2023	EU	75.0	225.0
+2023	US	150.0	225.0

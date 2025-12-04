@@ -1162,7 +1162,7 @@ fn expand_aggregate_in_select(select: &Select) -> Result<Select> {
     let projection: Vec<SelectItem> = select
         .projection
         .iter()
-        .map(|item| expand_aggregate_in_select_item(item, measure_view))
+        .map(|item| expand_aggregate_in_select_item(item, measure_view, Some(&views)))
         .collect::<Result<Vec<_>>>()?;
 
     let group_by = if has_aggregate
@@ -1324,14 +1324,15 @@ fn find_alias_for_view<'a>(from_info: &'a FromClauseInfo, view_name: &str) -> Op
 fn expand_aggregate_in_select_item(
     item: &SelectItem,
     measure_view: Option<&MeasureView>,
+    all_views: Option<MeasureViewsRef>,
 ) -> Result<SelectItem> {
     match item {
         SelectItem::UnnamedExpr(expr) => {
-            let expanded = expand_aggregate_in_expr(expr, measure_view)?;
+            let expanded = expand_aggregate_in_expr(expr, measure_view, all_views)?;
             Ok(SelectItem::UnnamedExpr(expanded))
         }
         SelectItem::ExprWithAlias { expr, alias } => {
-            let expanded = expand_aggregate_in_expr(expr, measure_view)?;
+            let expanded = expand_aggregate_in_expr(expr, measure_view, all_views)?;
             Ok(SelectItem::ExprWithAlias {
                 expr: expanded,
                 alias: alias.clone(),
@@ -1341,7 +1342,14 @@ fn expand_aggregate_in_select_item(
     }
 }
 
-fn expand_aggregate_in_expr(expr: &Expr, measure_view: Option<&MeasureView>) -> Result<Expr> {
+/// All measure views available for lookup (passed to avoid re-locking)
+type MeasureViewsRef<'a> = &'a HashMap<String, MeasureView>;
+
+fn expand_aggregate_in_expr(
+    expr: &Expr,
+    measure_view: Option<&MeasureView>,
+    all_views: Option<MeasureViewsRef>,
+) -> Result<Expr> {
     match expr {
         Expr::Function(func) => {
             let func_name = func.name.to_string().to_uppercase();
@@ -1349,8 +1357,24 @@ fn expand_aggregate_in_expr(expr: &Expr, measure_view: Option<&MeasureView>) -> 
             if func_name == "AGGREGATE" {
                 let measure_name = extract_aggregate_arg(func)?;
 
-                let measure = measure_view
+                // First try the primary measure view
+                let mut measure = measure_view
                     .and_then(|mv| mv.measures.iter().find(|m| m.column_name == measure_name));
+
+                // For JOINs: if not found in primary view, search all registered views
+                let mut fallback_view: Option<&MeasureView> = None;
+                if measure.is_none() {
+                    if let Some(views) = all_views {
+                        for v in views.values() {
+                            if let Some(m) = v.measures.iter().find(|m| m.column_name.eq_ignore_ascii_case(&measure_name)) {
+                                measure = Some(m);
+                                fallback_view = Some(v);
+                                break;
+                            }
+                        }
+                    }
+                }
+                let effective_view = fallback_view.or(measure_view);
 
                 if let Some(m) = measure {
                     let dialect = GenericDialect {};
@@ -1363,7 +1387,7 @@ fn expand_aggregate_in_expr(expr: &Expr, measure_view: Option<&MeasureView>) -> 
                     } else if let Some(agg_fn) = find_aggregation_in_expression(&m.expression) {
                         // CASE WHEN SUM(x) > 100... → use SUM(measure_column)
                         format!("SELECT {}({})", agg_fn, measure_name)
-                    } else if let Some(mv) = measure_view {
+                    } else if let Some(mv) = effective_view {
                         // Check if this is a derived measure (references other measures)
                         let expanded = expand_derived_measure_expr(&m.expression, mv);
                         if expanded != m.expression {
@@ -1401,8 +1425,8 @@ fn expand_aggregate_in_expr(expr: &Expr, measure_view: Option<&MeasureView>) -> 
             Ok(Expr::Function(func.clone()))
         }
         Expr::BinaryOp { left, op, right } => {
-            let left = expand_aggregate_in_expr(left, measure_view)?;
-            let right = expand_aggregate_in_expr(right, measure_view)?;
+            let left = expand_aggregate_in_expr(left, measure_view, all_views)?;
+            let right = expand_aggregate_in_expr(right, measure_view, all_views)?;
             Ok(Expr::BinaryOp {
                 left: Box::new(left),
                 op: op.clone(),
@@ -1410,7 +1434,7 @@ fn expand_aggregate_in_expr(expr: &Expr, measure_view: Option<&MeasureView>) -> 
             })
         }
         Expr::Nested(inner) => {
-            let inner = expand_aggregate_in_expr(inner, measure_view)?;
+            let inner = expand_aggregate_in_expr(inner, measure_view, all_views)?;
             Ok(Expr::Nested(Box::new(inner)))
         }
         other => Ok(other.clone()),
