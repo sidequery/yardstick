@@ -827,3 +827,44 @@ GROUP BY o.year, o.region;
 2022	US	100.0	150.0
 2023	EU	75.0	225.0
 2023	US	150.0	225.0
+
+# =============================================================================
+# Test: SET reaches beyond WHERE clause (paper semantics)
+# Per paper: SET should evaluate over data removed by outer WHERE clause
+# =============================================================================
+
+# SET should reach 2022 data even when outer WHERE filters to 2023
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(revenue) AT (SET year = year - 1) AS prior_year
+FROM sales_yearly
+WHERE year = 2023
+GROUP BY year;
+----
+2023	150.0
+
+# =============================================================================
+# Test: SET correlates on remaining dimensions (paper semantics)
+# Per paper: SET only removes terms for specified dimension, correlates on others
+# =============================================================================
+
+# SET year=2022 should return 2022's value per region (not grand total)
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (SET year = 2022) AS fixed_2022
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	50.0
+2022	US	100.0
+2023	EU	50.0
+2023	US	100.0
+
+# Verify: without SET, each row shows its own revenue
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AS own_revenue
+FROM sales_v
+GROUP BY year, region;
+----
+2022	EU	50.0
+2022	US	100.0
+2023	EU	75.0
+2023	US	150.0

@@ -21,24 +21,7 @@ Implementation of Julian Hyde's "Measures in SQL" paper (arXiv:2406.00251).
 
 ## Known Limitations
 
-### 1. SET Cannot Reach Beyond WHERE Clause
-
-```sql
--- ISSUE: SET cannot access data filtered out by the outer WHERE clause
-SEMANTIC SELECT year,
-  AGGREGATE(revenue) AT (SET year = CURRENT year - 1) AS prior_year
-FROM sales_v
-WHERE year = 2023
-GROUP BY year;
--- Returns NULL for prior_year instead of 2022's revenue
--- The WHERE clause filters the view before the subquery runs
-```
-
-Per the paper, `AT (SET year = CURRENT year - 1)` should evaluate over the *entire* source table, reaching 2022 data even when the outer query has `WHERE year = 2023`. Our implementation queries the already-filtered result.
-
-**Workaround**: Remove the WHERE clause and filter in application code, or use a CTE.
-
-### 2. No Window Function Measures
+### 1. No Window Function Measures
 
 ```sql
 -- NOT SUPPORTED: Window functions in measure definitions

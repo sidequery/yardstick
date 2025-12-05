@@ -1549,15 +1549,44 @@ pub fn expand_at_to_sql(
             } else {
                 format!("_inner.{}", dim)
             };
-            // Include outer WHERE if present
-            let where_clause = format!("{} = {}", inner_dim, qualified_expr);
-            let full_where = match outer_where {
-                Some(w) => format!("{} AND {}", where_clause, w),
-                None => where_clause,
-            };
+
+            // SET condition for the specified dimension
+            let set_condition = format!("{} = {}", inner_dim, qualified_expr);
+
+            // Build correlation conditions for OTHER GROUP BY columns (not the SET dim)
+            // Per paper: SET only removes terms for the specified dimension, correlates on others
+            let dim_lower = dim.to_lowercase();
+            let is_expression = dim.contains('(');
+            let correlation_conditions: Vec<String> = group_by_cols
+                .iter()
+                .filter(|col| {
+                    if is_expression {
+                        col.to_lowercase() != dim_lower
+                    } else {
+                        let col_name = col.split('.').last().unwrap_or(col);
+                        col_name.to_lowercase() != dim_lower
+                    }
+                })
+                .map(|col| {
+                    let col_is_expr = col.contains('(');
+                    if col_is_expr {
+                        let inner_expr = qualify_where_for_inner(col);
+                        format!("{} = {}", inner_expr, col)
+                    } else {
+                        let col_name = col.split('.').last().unwrap_or(col);
+                        format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                    }
+                })
+                .collect();
+
+            // Combine: SET condition + correlation on other dims
+            // NOTE: Do NOT include outer_where - SET bypasses outer WHERE per paper
+            let mut all_conditions = vec![set_condition];
+            all_conditions.extend(correlation_conditions);
+
             format!(
                 "(SELECT {} FROM {} _inner WHERE {})",
-                measure_expr, table_name, full_where
+                measure_expr, table_name, all_conditions.join(" AND ")
             )
         }
         ContextModifier::Where(condition) => {
@@ -1663,10 +1692,13 @@ pub fn expand_modifiers_to_sql(
 
     // Apply modifiers right-to-left
     // For now, collect the effects:
-    // - VISIBLE adds outer WHERE
+    // - VISIBLE adds outer WHERE (but SET bypasses it per paper)
     // - ALL removes all filters
-    // - SET changes a dimension
+    // - SET changes a dimension and bypasses outer WHERE
     // - WHERE adds a filter
+
+    // Check if SET is present - per paper, SET bypasses outer WHERE
+    let has_set = modifiers.iter().any(|m| matches!(m, ContextModifier::Set(_, _)));
 
     let mut effective_where: Option<String> = None;
     let mut has_all_global = false;
@@ -1687,7 +1719,8 @@ pub fn expand_modifiers_to_sql(
                 removed_dims.push(dim.to_lowercase());
             }
             ContextModifier::Visible => {
-                if !has_all_global {
+                // Per paper: SET bypasses outer WHERE, so VISIBLE has no effect when SET is present
+                if !has_set && !has_all_global {
                     if let Some(w) = outer_where {
                         // Qualify column references with _inner
                         effective_where = Some(qualify_where_for_inner(w));
@@ -1839,6 +1872,9 @@ fn expand_modifiers_to_sql_derived(
     }
 
     // For other modifiers (SET, WHERE, VISIBLE), build conditions
+    // Check if SET is present - per paper, SET bypasses outer WHERE
+    let has_set = modifiers.iter().any(|m| matches!(m, ContextModifier::Set(_, _)));
+
     let mut effective_where: Option<String> = None;
     let mut has_all_global = false;
     let mut removed_dims: Vec<String> = Vec::new();
@@ -1853,7 +1889,8 @@ fn expand_modifiers_to_sql_derived(
                 removed_dims.push(dim.to_lowercase());
             }
             ContextModifier::Visible => {
-                if !has_all_global {
+                // Per paper: SET bypasses outer WHERE, so VISIBLE has no effect when SET is present
+                if !has_set && !has_all_global {
                     if let Some(w) = outer_where {
                         effective_where = Some(qualify_where_for_inner(w));
                     }
