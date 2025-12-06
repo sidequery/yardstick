@@ -983,9 +983,6 @@ fn extract_measures_from_sql(sql: &str) -> Result<(String, Vec<ViewMeasure>, Opt
             replacements.push((remove_start, info.name_end, String::new()));
         } else {
             // Base measure: replace "AS MEASURE name" with "AS name"
-            let pattern_start = info.name_end - " AS MEASURE ".len() - info.name.len()
-                - (sql[info.expr_start..info.name_end].len() - info.expression.len() - " AS MEASURE ".len() - info.name.len());
-            // Actually, simpler: find " AS MEASURE " before name_end
             let chunk = &sql[info.expr_start..info.name_end];
             if let Some(am_pos) = chunk.to_uppercase().find(" AS MEASURE ") {
                 let abs_start = info.expr_start + am_pos;
@@ -1008,6 +1005,32 @@ fn extract_measures_from_sql(sql: &str) -> Result<(String, Vec<ViewMeasure>, Opt
     replacements.sort_by(|a, b| b.0.cmp(&a.0));
     for (start, end, replacement) in replacements {
         clean_sql = format!("{}{}{}", &clean_sql[..start], replacement, &clean_sql[end..]);
+    }
+
+    // If there are aggregate measures but no GROUP BY, add GROUP BY ALL
+    // This enables the "extension" syntax from the paper where views define
+    // measures without explicit grouping
+    let has_aggregate_measure = measures.iter().any(|m| find_aggregation_in_expression(&m.expression).is_some());
+    let clean_sql_upper = clean_sql.to_uppercase();
+    let has_group_by = clean_sql_upper.contains("GROUP BY");
+
+    if has_aggregate_measure && !has_group_by {
+        // Find insertion point: before ORDER BY, LIMIT, or at end
+        let insert_pos = ["ORDER BY", "LIMIT", ";"]
+            .iter()
+            .filter_map(|kw| clean_sql_upper.find(kw))
+            .min()
+            .unwrap_or(clean_sql.len());
+
+        clean_sql = format!(
+            "{} GROUP BY ALL{}",
+            clean_sql[..insert_pos].trim_end(),
+            if insert_pos < clean_sql.len() {
+                format!(" {}", clean_sql[insert_pos..].trim_start())
+            } else {
+                String::new()
+            }
+        );
     }
 
     Ok((clean_sql, measures, view_name))
@@ -2247,6 +2270,33 @@ mod tests {
         assert!(result.clean_sql.contains("AS cost"));
         assert!(!result.clean_sql.contains("AS profit"));
         assert!(!result.clean_sql.contains("revenue - cost"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_process_create_view_without_group_by() {
+        clear_measure_views();
+
+        // Per the paper, views can define measures without GROUP BY
+        let sql = r#"CREATE VIEW orders_extended AS
+SELECT
+    id,
+    product,
+    region,
+    amount,
+    SUM(amount) AS MEASURE revenue
+FROM orders"#;
+        let result = process_create_view(sql);
+
+        eprintln!("is_measure_view: {}", result.is_measure_view);
+        eprintln!("clean_sql: {}", result.clean_sql);
+        eprintln!("measures: {:?}", result.measures);
+
+        assert!(result.is_measure_view);
+        assert_eq!(result.measures.len(), 1);
+        assert_eq!(result.measures[0].column_name, "revenue");
+        // The clean_sql should NOT contain the measure column at all for no-groupby views
+        // because it can't be evaluated without a GROUP BY
     }
 
     #[test]

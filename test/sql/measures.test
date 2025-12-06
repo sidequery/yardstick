@@ -23,8 +23,7 @@ INSERT INTO sales VALUES
 statement ok
 CREATE VIEW sales_v AS
 SELECT year, region, SUM(amount) AS MEASURE revenue
-FROM sales
-GROUP BY year, region;
+FROM sales;
 
 # Basic query on view with measure
 query IIR rowsort
@@ -87,8 +86,7 @@ GROUP BY year, region;
 statement ok
 CREATE VIEW sales_yearly AS
 SELECT year, SUM(amount) AS MEASURE revenue
-FROM sales
-GROUP BY year;
+FROM sales;
 
 # Prior year comparison
 query IR rowsort
@@ -181,8 +179,7 @@ SELECT
     SUM(amount) AS MEASURE total_revenue,
     COUNT(*) AS MEASURE order_count,
     AVG(amount) AS MEASURE avg_order
-FROM sales
-GROUP BY year;
+FROM sales;
 
 query IRR rowsort
 SEMANTIC SELECT year, AGGREGATE(total_revenue), AGGREGATE(avg_order) FROM orders_v GROUP BY year;
@@ -349,8 +346,7 @@ INSERT INTO products VALUES
 statement ok
 CREATE VIEW products_v AS
 SELECT year, region, category, SUM(amount) AS MEASURE revenue
-FROM products
-GROUP BY year, region, category;
+FROM products;
 
 # Grand total across all dimensions
 query IIIR rowsort
@@ -410,8 +406,7 @@ GROUP BY year, region, category;
 statement ok
 CREATE VIEW sales_minmax AS
 SELECT year, region, MIN(amount) AS MEASURE min_sale, MAX(amount) AS MEASURE max_sale
-FROM sales
-GROUP BY year, region;
+FROM sales;
 
 query IIRR rowsort
 SEMANTIC SELECT year, region, AGGREGATE(min_sale), AGGREGATE(max_sale) FROM sales_minmax GROUP BY year, region;
@@ -489,8 +484,7 @@ INSERT INTO adjustments VALUES
 statement ok
 CREATE VIEW adj_v AS
 SELECT year, region, SUM(amount) AS MEASURE adjustment
-FROM adjustments
-GROUP BY year, region;
+FROM adjustments;
 
 query IIR rowsort
 SEMANTIC SELECT year, region, AGGREGATE(adjustment) FROM adj_v GROUP BY year, region;
@@ -523,8 +517,7 @@ INSERT INTO yearly_data VALUES (2020, 100), (2021, 120), (2022, 150), (2023, 180
 statement ok
 CREATE VIEW yearly_v AS
 SELECT year, SUM(amount) AS MEASURE revenue
-FROM yearly_data
-GROUP BY year;
+FROM yearly_data;
 
 query IRR rowsort
 SEMANTIC SELECT
@@ -647,8 +640,7 @@ GROUP BY year;
 statement ok
 CREATE VIEW quarterly AS
 SELECT year, quarter, SUM(amount) AS MEASURE revenue
-FROM (VALUES (2022, 1, 100), (2022, 2, 120), (2022, 3, 90), (2022, 4, 140)) AS t(year, quarter, amount)
-GROUP BY year, quarter;
+FROM (VALUES (2022, 1, 100), (2022, 2, 120), (2022, 3, 90), (2022, 4, 140)) AS t(year, quarter, amount);
 
 query IIR rowsort
 SEMANTIC SELECT
@@ -670,8 +662,7 @@ GROUP BY year, quarter;
 statement ok
 CREATE OR REPLACE VIEW case_measure AS
 SELECT year, CASE WHEN SUM(amount) > 150 THEN 1 ELSE 0 END AS MEASURE high_value
-FROM (VALUES (2022, 100), (2022, 50), (2023, 200), (2023, 100)) AS t(year, amount)
-GROUP BY year;
+FROM (VALUES (2022, 100), (2022, 50), (2023, 200), (2023, 100)) AS t(year, amount);
 
 query II rowsort
 SEMANTIC SELECT year, AGGREGATE(high_value)
@@ -699,8 +690,7 @@ SELECT year,
     SUM(revenue) AS MEASURE revenue,
     SUM(cost) AS MEASURE cost,
     revenue - cost AS MEASURE profit
-FROM financials
-GROUP BY year;
+FROM financials;
 
 # Query basic measures
 query IRR rowsort
@@ -747,8 +737,7 @@ INSERT INTO daily_orders VALUES
 statement ok
 CREATE VIEW daily_orders_v AS
 SELECT order_date, SUM(amount) AS MEASURE revenue
-FROM daily_orders
-GROUP BY order_date;
+FROM daily_orders;
 
 # SET with expression dimension: fix to a specific month
 # This generates WHERE MONTH(_inner.order_date) = 2
@@ -790,10 +779,10 @@ INSERT INTO fact_returns VALUES (2022, 'US', 10), (2022, 'EU', 5), (2023, 'US', 
 
 # Create two measure views
 statement ok
-CREATE VIEW fact_orders_v AS SELECT year, region, SUM(amount) AS MEASURE revenue FROM fact_orders GROUP BY year, region;
+CREATE VIEW fact_orders_v AS SELECT year, region, SUM(amount) AS MEASURE revenue FROM fact_orders;
 
 statement ok
-CREATE VIEW fact_returns_v AS SELECT year, region, SUM(return_amount) AS MEASURE refunds FROM fact_returns GROUP BY year, region;
+CREATE VIEW fact_returns_v AS SELECT year, region, SUM(return_amount) AS MEASURE refunds FROM fact_returns;
 
 # Query measures from both fact tables in a JOIN
 query IIRR rowsort

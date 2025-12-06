@@ -49,8 +49,7 @@ SELECT
     region,
     SUM(amount) AS MEASURE revenue,
     COUNT(*) AS MEASURE order_count
-FROM sales
-GROUP BY year, region;
+FROM sales;
 
 -- Query with AGGREGATE() and AT modifiers (SEMANTIC prefix required)
 SEMANTIC SELECT
@@ -110,11 +109,10 @@ SELECT
     dimension1,
     dimension2,
     AGG(expr) AS MEASURE measure_name
-FROM table
-GROUP BY dimension1, dimension2;
+FROM table;
 ```
 
-Supported aggregations: `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`
+Yardstick automatically handles the grouping. Supported aggregations: `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`
 
 ### Querying Measures
 
