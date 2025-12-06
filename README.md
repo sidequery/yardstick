@@ -58,8 +58,7 @@ SEMANTIC SELECT
     AGGREGATE(revenue) AS revenue,
     AGGREGATE(revenue) AT (ALL region) AS year_total,
     AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_year
-FROM sales_v
-GROUP BY year, region;
+FROM sales_v;
 
 -- Variance from the global average
 SEMANTIC SELECT
@@ -67,8 +66,7 @@ SEMANTIC SELECT
     AGGREGATE(revenue) AS revenue,
     AGGREGATE(revenue) AT (ALL) / 4.0 AS expected_if_equal,  -- 4 regions
     AGGREGATE(revenue) - (AGGREGATE(revenue) AT (ALL) / 4.0) AS variance
-FROM sales_v
-GROUP BY region;
+FROM sales_v;
 
 -- Nested percentages (% of year, and that year's % of total)
 SEMANTIC SELECT
@@ -77,8 +75,7 @@ SEMANTIC SELECT
     AGGREGATE(revenue) AS revenue,
     100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_year,
     100.0 * AGGREGATE(revenue) AT (ALL region) / AGGREGATE(revenue) AT (ALL) AS year_pct_of_total
-FROM sales_v
-GROUP BY year, region;
+FROM sales_v;
 
 -- Compare 2024 performance to 2023 baseline for each region
 SEMANTIC SELECT
@@ -86,8 +83,7 @@ SEMANTIC SELECT
     AGGREGATE(revenue) AT (SET year = 2024) AS rev_2024,
     AGGREGATE(revenue) AT (SET year = 2023) AS rev_2023,
     AGGREGATE(revenue) AT (SET year = 2024) - AGGREGATE(revenue) AT (SET year = 2023) AS growth
-FROM sales_v
-GROUP BY region;
+FROM sales_v;
 
 -- Filter to specific segments
 SEMANTIC SELECT
@@ -95,8 +91,7 @@ SEMANTIC SELECT
     AGGREGATE(revenue) AS total_revenue,
     AGGREGATE(revenue) AT (SET region = 'North') AS north_revenue,
     AGGREGATE(revenue) AT (SET region IN ('North', 'South')) AS north_south_combined
-FROM sales_v
-GROUP BY year;
+FROM sales_v;
 ```
 
 ## Syntax
@@ -122,8 +117,7 @@ Queries using `AGGREGATE()` must use the `SEMANTIC` prefix:
 SEMANTIC SELECT
     dimensions,
     AGGREGATE(measure_name) [AT modifier]
-FROM view_name
-GROUP BY dimensions;
+FROM view_name;
 ```
 
 ### AT Modifiers

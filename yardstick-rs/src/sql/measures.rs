@@ -2009,6 +2009,10 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     // Extract GROUP BY columns for AT (ALL dim) correlation
     let group_by_cols = extract_group_by_columns(sql);
 
+    // Extract dimension columns from original SQL for implicit GROUP BY
+    // (must be done before expansion since expanded SQL has SUM() etc)
+    let original_dim_cols = extract_dimension_columns_from_select(sql);
+
     // Check if any AT modifier needs correlation (for alias handling)
     let needs_outer_alias = at_patterns.iter().any(|(_, modifiers, _, _)| {
         modifiers.iter().any(|m| {
@@ -2101,6 +2105,29 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         return expand_aggregate(&result_sql);
     }
 
+    // If no GROUP BY, add explicit GROUP BY with dimension columns from original SQL
+    // (GROUP BY ALL doesn't work reliably with scalar subqueries mixed with aggregates)
+    let result_upper = result_sql.to_uppercase();
+    if !result_upper.contains("GROUP BY") && !original_dim_cols.is_empty() {
+        // Find insertion point: before ORDER BY, LIMIT, HAVING, or at end
+        let insert_pos = ["ORDER BY", "LIMIT", "HAVING", ";"]
+            .iter()
+            .filter_map(|kw| result_upper.find(kw))
+            .min()
+            .unwrap_or(result_sql.len());
+
+        result_sql = format!(
+            "{} GROUP BY {}{}",
+            result_sql[..insert_pos].trim_end(),
+            original_dim_cols.join(", "),
+            if insert_pos < result_sql.len() {
+                format!(" {}", result_sql[insert_pos..].trim_start())
+            } else {
+                String::new()
+            }
+        );
+    }
+
     AggregateExpandResult {
         had_aggregate: true,
         expanded_sql: result_sql,
@@ -2168,6 +2195,72 @@ fn extract_group_by_columns(sql: &str) -> Vec<String> {
             if !col.is_empty() && !col.chars().all(|c| c.is_ascii_digit()) {
                 columns.push(col.to_string());
             }
+        }
+    }
+
+    // If no GROUP BY, infer dimension columns from SELECT (non-AGGREGATE columns)
+    if columns.is_empty() {
+        columns = extract_dimension_columns_from_select(sql);
+    }
+
+    columns
+}
+
+/// Extract non-AGGREGATE columns from SELECT clause to use as implicit GROUP BY columns
+fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
+    let sql_upper = sql.to_uppercase();
+    let mut columns = Vec::new();
+
+    // Find SELECT ... FROM
+    let select_pos = sql_upper.find("SELECT").unwrap_or(0) + 6;
+    let from_pos = sql_upper.find("FROM").unwrap_or(sql.len());
+
+    if select_pos >= from_pos {
+        return columns;
+    }
+
+    let select_content = &sql[select_pos..from_pos];
+
+    // Split by comma, but be careful about nested parens
+    let mut depth = 0;
+    let mut current = String::new();
+    let mut items = Vec::new();
+
+    for c in select_content.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                items.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        items.push(current.trim().to_string());
+    }
+
+    // Filter out AGGREGATE() calls and extract column names
+    for item in items {
+        let item_upper = item.to_uppercase();
+        if item_upper.contains("AGGREGATE(") {
+            continue;
+        }
+        // Handle "col AS alias" - use the column name, not alias
+        let col = if let Some(as_pos) = item_upper.find(" AS ") {
+            item[..as_pos].trim()
+        } else {
+            item.trim()
+        };
+        if !col.is_empty() {
+            columns.push(col.to_string());
         }
     }
 
@@ -2490,6 +2583,34 @@ FROM orders"#;
         assert!(result.had_aggregate);
         assert!(result.expanded_sql.contains("_outer"));
         assert!(result.expanded_sql.contains("_inner"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_expand_aggregate_no_group_by() {
+        // Test that queries without GROUP BY get implicit GROUP BY with dimension columns
+        clear_measure_views();
+        store_measure_view(
+            "sales_v",
+            vec![ViewMeasure {
+                column_name: "revenue".to_string(),
+                expression: "SUM(amount)".to_string(),
+            }],
+            "SELECT year, region, SUM(amount) AS revenue FROM sales GROUP BY ALL",
+        );
+
+        let sql = r#"SELECT year, region, AGGREGATE(revenue) AS revenue, AGGREGATE(revenue) AT (ALL region) AS year_total, AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct FROM sales_v"#;
+        let result = expand_aggregate_with_at(sql);
+
+        eprintln!("Expanded SQL: {}", result.expanded_sql);
+        assert!(result.had_aggregate);
+        // Should have GROUP BY with explicit columns (not GROUP BY ALL)
+        let upper = result.expanded_sql.to_uppercase();
+        assert!(upper.contains("GROUP BY"));
+        assert!(upper.contains("YEAR"));
+        assert!(upper.contains("REGION"));
+        // Should correlate on year (not region, since AT ALL region removes it)
+        assert!(result.expanded_sql.contains("_inner.year = _outer.year"));
     }
 
     #[test]
