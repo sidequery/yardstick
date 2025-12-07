@@ -178,7 +178,7 @@ fn expression_or_identifier(input: &str) -> IResult<&str, String> {
     // Check if followed by opening paren (function call)
     if input.starts_with('(') {
         let (input, args) = delimited(char('('), balanced_parens, char(')'))(input)?;
-        Ok((input, format!("{}({})", name, args)))
+        Ok((input, format!("{name}({args})")))
     } else {
         Ok((input, name.to_string()))
     }
@@ -200,8 +200,7 @@ pub fn has_as_measure(sql: &str) -> bool {
 pub fn has_aggregate_function(sql: &str) -> bool {
     let mut remaining = sql;
     while !remaining.is_empty() {
-        if let Ok((rest, _)) =
-            take_until::<_, _, nom::error::Error<&str>>("AGGREGATE(")(remaining)
+        if let Ok((rest, _)) = take_until::<_, _, nom::error::Error<&str>>("AGGREGATE(")(remaining)
         {
             // Verify it's actually AGGREGATE( not part of another word
             if rest.len() >= 10 {
@@ -256,7 +255,7 @@ pub fn expand_curly_braces(sql: &str) -> String {
                 ident.push(chars.next().unwrap());
             }
             if !ident.is_empty() {
-                result.push_str(&format!("AGGREGATE({})", ident));
+                result.push_str(&format!("AGGREGATE({ident})"));
             } else {
                 result.push('{');
             }
@@ -280,7 +279,10 @@ fn at_all_global(input: &str) -> IResult<&str, ContextModifier> {
     if input.is_empty() || input.starts_with(')') {
         Ok((input, ContextModifier::AllGlobal))
     } else {
-        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Char)))
+        Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Char,
+        )))
     }
 }
 
@@ -338,10 +340,7 @@ fn at_set(input: &str) -> IResult<&str, ContextModifier> {
     let (input, expr) = take_while(|c: char| c != ')')(input)?;
     // Process CURRENT references in the expression
     let processed_expr = parse_current_in_expr(expr.trim());
-    Ok((
-        input,
-        ContextModifier::Set(dim, processed_expr),
-    ))
+    Ok((input, ContextModifier::Set(dim, processed_expr)))
 }
 
 /// Parse AT (WHERE condition)
@@ -364,7 +363,7 @@ fn at_modifier(input: &str) -> IResult<&str, ContextModifier> {
 pub fn parse_at_modifier(content: &str) -> Result<ContextModifier> {
     at_modifier(content)
         .map(|(_, m)| m)
-        .map_err(|e| YardstickError::Validation(format!("Failed to parse AT modifier: {:?}", e)))
+        .map_err(|e| YardstickError::Validation(format!("Failed to parse AT modifier: {e:?}")))
 }
 
 /// Check if SQL contains AT syntax using nom
@@ -419,7 +418,10 @@ fn at_modifiers_content(input: &str) -> IResult<&str, Vec<ContextModifier>> {
     }
 
     if modifiers.is_empty() {
-        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+        Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )))
     } else {
         Ok((remaining, modifiers))
     }
@@ -438,19 +440,17 @@ fn aggregate_with_at(input: &str) -> IResult<&str, (&str, Vec<ContextModifier>)>
 
     loop {
         // Try to parse AT (...)
-        let at_start: IResult<&str, _> = tuple((
-            multispace0,
-            tag_no_case("AT"),
-            multispace0,
-            char('('),
-        ))(remaining);
+        let at_start: IResult<&str, _> =
+            tuple((multispace0, tag_no_case("AT"), multispace0, char('(')))(remaining);
 
         match at_start {
             Ok((after_open, _)) => {
                 // Find the matching close paren
                 if let Ok((after_content, content)) = balanced_parens(after_open) {
                     // Skip the closing paren
-                    if let Ok((after_close, _)) = char::<_, nom::error::Error<&str>>(')')(after_content) {
+                    if let Ok((after_close, _)) =
+                        char::<_, nom::error::Error<&str>>(')')(after_content)
+                    {
                         // Parse modifiers from content
                         if let Ok((_, mods)) = at_modifiers_content(content) {
                             all_modifiers.extend(mods);
@@ -471,7 +471,9 @@ fn aggregate_with_at(input: &str) -> IResult<&str, (&str, Vec<ContextModifier>)>
 }
 
 /// Extract all AGGREGATE(...) [AT (...)]+ patterns from SQL with full modifier list
-pub fn extract_aggregate_with_at_full(sql: &str) -> Vec<(String, Vec<ContextModifier>, usize, usize)> {
+pub fn extract_aggregate_with_at_full(
+    sql: &str,
+) -> Vec<(String, Vec<ContextModifier>, usize, usize)> {
     let mut results = Vec::new();
     let sql_upper = sql.to_uppercase();
     let mut search_pos = 0;
@@ -502,7 +504,9 @@ pub fn extract_aggregate_with_at(sql: &str) -> Vec<(String, ContextModifier, usi
                 modifiers.remove(0)
             } else {
                 // Check if all are ALL modifiers
-                let all_are_all = modifiers.iter().all(|m| matches!(m, ContextModifier::All(_) | ContextModifier::AllGlobal));
+                let all_are_all = modifiers
+                    .iter()
+                    .all(|m| matches!(m, ContextModifier::All(_) | ContextModifier::AllGlobal));
                 if all_are_all {
                     ContextModifier::AllGlobal
                 } else {
@@ -578,7 +582,10 @@ pub fn extract_table_name_from_sql(sql: &str) -> Option<String> {
 /// Returns (table_name, Option<alias>)
 pub fn extract_table_and_alias_from_sql(sql: &str) -> Option<(String, Option<String>)> {
     // Normalize whitespace to handle newlines/tabs in SQL
-    let normalized: String = sql.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).collect();
+    let normalized: String = sql
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
     let normalized_upper = normalized.to_uppercase();
     let from_pos = normalized_upper.find(" FROM ")?;
     let after_from = &normalized[from_pos..];
@@ -617,7 +624,10 @@ pub fn extract_table_and_alias_from_sql(sql: &str) -> Option<(String, Option<Str
     if let Ok((_, alias)) = identifier(after_as.trim_start()) {
         // Make sure alias isn't a keyword
         let alias_upper = alias.to_uppercase();
-        if matches!(alias_upper.as_str(), "WHERE" | "GROUP" | "ORDER" | "LIMIT" | "HAVING" | "JOIN") {
+        if matches!(
+            alias_upper.as_str(),
+            "WHERE" | "GROUP" | "ORDER" | "LIMIT" | "HAVING" | "JOIN"
+        ) {
             return Some((table.to_string(), None));
         }
         Some((table.to_string(), Some(alias.to_string())))
@@ -629,7 +639,10 @@ pub fn extract_table_and_alias_from_sql(sql: &str) -> Option<(String, Option<Str
 /// Extract WHERE clause from SQL query
 pub fn extract_where_clause(sql: &str) -> Option<String> {
     // Normalize whitespace
-    let normalized: String = sql.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).collect();
+    let normalized: String = sql
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
     let normalized_upper = normalized.to_uppercase();
 
     // Find WHERE keyword (not inside a subquery)
@@ -643,7 +656,7 @@ pub fn extract_where_clause(sql: &str) -> Option<String> {
             ')' => depth -= 1,
             _ => {
                 if depth == 0 && i + 6 <= chars.len() {
-                    let word = &normalized_upper[i..i+6];
+                    let word = &normalized_upper[i..i + 6];
                     if word == "WHERE " {
                         where_start = Some(i + 6);
                         break;
@@ -712,7 +725,7 @@ pub fn extract_aggregation_function(expr: &str) -> Option<String> {
 fn find_aggregation_in_expression(expr: &str) -> Option<String> {
     let expr_upper = expr.to_uppercase();
     for agg in ["SUM", "COUNT", "AVG", "MIN", "MAX"] {
-        if expr_upper.contains(&format!("{}(", agg)) {
+        if expr_upper.contains(&format!("{agg}(")) {
             return Some(agg.to_lowercase());
         }
     }
@@ -739,14 +752,18 @@ fn expand_derived_measure_expr(expr: &str, measure_view: &MeasureView) -> String
             }
 
             // Check if this identifier is a measure name
-            if let Some(m) = measure_view.measures.iter().find(|m| m.column_name.eq_ignore_ascii_case(&ident)) {
+            if let Some(m) = measure_view
+                .measures
+                .iter()
+                .find(|m| m.column_name.eq_ignore_ascii_case(&ident))
+            {
                 // Get the aggregation function from this measure's expression
                 if let Some(agg_fn) = extract_aggregation_function(&m.expression) {
                     // Replace measure name with AGG(measure_name)
                     result.push_str(&format!("{}({})", agg_fn.to_uppercase(), ident));
                 } else {
                     // Fallback to SUM if no aggregation found
-                    result.push_str(&format!("SUM({})", ident));
+                    result.push_str(&format!("SUM({ident})"));
                 }
             } else {
                 // Not a measure, keep as-is
@@ -817,8 +834,10 @@ fn qualify_where_for_inner(where_clause: &str) -> String {
             let is_function = chars.peek() == Some(&'(');
 
             // SQL keywords that should not be prefixed
-            let keywords = ["AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE",
-                           "LIKE", "BETWEEN", "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END"];
+            let keywords = [
+                "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
+                "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
+            ];
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
 
             if !already_qualified && !is_keyword && !is_function {
@@ -951,9 +970,14 @@ fn extract_measures_from_sql(sql: &str) -> Result<(String, Vec<ViewMeasure>, Opt
             if expr_lower.contains(&name_lower) {
                 // More precise check: ensure it's a word boundary
                 for (i, _) in expr_lower.match_indices(&name_lower) {
-                    let before_ok = i == 0 || !expr.chars().nth(i - 1).unwrap_or(' ').is_alphanumeric();
+                    let before_ok =
+                        i == 0 || !expr.chars().nth(i - 1).unwrap_or(' ').is_alphanumeric();
                     let after_ok = i + name_lower.len() >= expr.len()
-                        || !expr.chars().nth(i + name_lower.len()).unwrap_or(' ').is_alphanumeric();
+                        || !expr
+                            .chars()
+                            .nth(i + name_lower.len())
+                            .unwrap_or(' ')
+                            .is_alphanumeric();
                     if before_ok && after_ok {
                         return true;
                     }
@@ -1004,13 +1028,20 @@ fn extract_measures_from_sql(sql: &str) -> Result<(String, Vec<ViewMeasure>, Opt
     let mut clean_sql = sql.to_string();
     replacements.sort_by(|a, b| b.0.cmp(&a.0));
     for (start, end, replacement) in replacements {
-        clean_sql = format!("{}{}{}", &clean_sql[..start], replacement, &clean_sql[end..]);
+        clean_sql = format!(
+            "{}{}{}",
+            &clean_sql[..start],
+            replacement,
+            &clean_sql[end..]
+        );
     }
 
     // If there are aggregate measures but no GROUP BY, add GROUP BY ALL
     // This enables the "extension" syntax from the paper where views define
     // measures without explicit grouping
-    let has_aggregate_measure = measures.iter().any(|m| find_aggregation_in_expression(&m.expression).is_some());
+    let has_aggregate_measure = measures
+        .iter()
+        .any(|m| find_aggregation_in_expression(&m.expression).is_some());
     let clean_sql_upper = clean_sql.to_uppercase();
     let has_group_by = clean_sql_upper.contains("GROUP BY");
 
@@ -1172,7 +1203,9 @@ fn expand_aggregate_in_select(select: &Select) -> Result<Select> {
     for item in &select.projection {
         let (expr, is_agg) = match item {
             SelectItem::UnnamedExpr(expr) => (Some(expr.clone()), contains_aggregate(expr)),
-            SelectItem::ExprWithAlias { expr, .. } => (Some(expr.clone()), contains_aggregate(expr)),
+            SelectItem::ExprWithAlias { expr, .. } => {
+                (Some(expr.clone()), contains_aggregate(expr))
+            }
             _ => (None, false),
         };
         if is_agg {
@@ -1253,7 +1286,10 @@ fn extract_table_info_from_factor(factor: &TableFactor) -> Option<TableInfo> {
                 has_alias: true,
             })
         }
-        TableFactor::NestedJoin { table_with_joins, alias } => {
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
             // For nested joins, prefer the alias if present
             if let Some(a) = alias {
                 Some(TableInfo {
@@ -1281,13 +1317,15 @@ fn extract_from_clause_info(select: &Select) -> FromClauseInfo {
             if i == 0 && info.primary_table.is_none() {
                 info.primary_table = Some(table_info.clone());
             }
-            info.tables.insert(table_info.effective_name.clone(), table_info);
+            info.tables
+                .insert(table_info.effective_name.clone(), table_info);
         }
 
         // Extract all JOINed tables
         for join in &table_with_joins.joins {
             if let Some(table_info) = extract_table_info_from_factor(&join.relation) {
-                info.tables.insert(table_info.effective_name.clone(), table_info);
+                info.tables
+                    .insert(table_info.effective_name.clone(), table_info);
             }
         }
     }
@@ -1298,12 +1336,19 @@ fn extract_from_clause_info(select: &Select) -> FromClauseInfo {
 /// Look up which view contains a measure and return (agg_fn, source_view_name, derived_expr)
 /// derived_expr is Some if this is a derived measure (should use expanded expression instead of AGG(name))
 /// Prioritizes default_table (the query's FROM table), then searches other views for JOINs
-fn resolve_measure_source(measure_name: &str, default_table: &str) -> (String, String, Option<String>) {
+fn resolve_measure_source(
+    measure_name: &str,
+    default_table: &str,
+) -> (String, String, Option<String>) {
     let views = MEASURE_VIEWS.lock().unwrap();
 
     // First, check if the measure exists in the default table (query's primary table)
     if let Some(v) = views.get(default_table) {
-        if let Some(m) = v.measures.iter().find(|m| m.column_name.eq_ignore_ascii_case(measure_name)) {
+        if let Some(m) = v
+            .measures
+            .iter()
+            .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
+        {
             let agg_fn = extract_agg_function(&m.expression);
             // Check if this is a derived measure (no aggregation, references other measures)
             if extract_aggregation_function(&m.expression).is_none() {
@@ -1317,9 +1362,11 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> (String, S
     }
 
     // If not found in default table, search other views (for JOIN support)
-    views.iter()
+    views
+        .iter()
         .find_map(|(view_name, v)| {
-            v.measures.iter()
+            v.measures
+                .iter()
                 .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
                 .map(|m| {
                     let agg_fn = extract_agg_function(&m.expression);
@@ -1339,7 +1386,9 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> (String, S
 /// Find the alias used for a view in the FROM clause
 /// Returns the effective_name (alias) if the view is in the FROM clause
 fn find_alias_for_view<'a>(from_info: &'a FromClauseInfo, view_name: &str) -> Option<&'a str> {
-    from_info.tables.values()
+    from_info
+        .tables
+        .values()
         .find(|t| t.name.eq_ignore_ascii_case(view_name))
         .map(|t| t.effective_name.as_str())
 }
@@ -1389,7 +1438,11 @@ fn expand_aggregate_in_expr(
                 if measure.is_none() {
                     if let Some(views) = all_views {
                         for v in views.values() {
-                            if let Some(m) = v.measures.iter().find(|m| m.column_name.eq_ignore_ascii_case(&measure_name)) {
+                            if let Some(m) = v
+                                .measures
+                                .iter()
+                                .find(|m| m.column_name.eq_ignore_ascii_case(&measure_name))
+                            {
                                 measure = Some(m);
                                 fallback_view = Some(v);
                                 break;
@@ -1405,24 +1458,25 @@ fn expand_aggregate_in_expr(
                     // Try to extract aggregation function (e.g., SUM, COUNT)
                     // If that fails, look for aggregation inside the expression (e.g., CASE WHEN SUM(x)...)
                     // Then use that aggregation on the measure column
-                    let expr_sql = if let Some(agg_fn) = extract_aggregation_function(&m.expression) {
-                        format!("SELECT {}({})", agg_fn, measure_name)
+                    let expr_sql = if let Some(agg_fn) = extract_aggregation_function(&m.expression)
+                    {
+                        format!("SELECT {agg_fn}({measure_name})")
                     } else if let Some(agg_fn) = find_aggregation_in_expression(&m.expression) {
                         // CASE WHEN SUM(x) > 100... → use SUM(measure_column)
-                        format!("SELECT {}({})", agg_fn, measure_name)
+                        format!("SELECT {agg_fn}({measure_name})")
                     } else if let Some(mv) = effective_view {
                         // Check if this is a derived measure (references other measures)
                         let expanded = expand_derived_measure_expr(&m.expression, mv);
                         if expanded != m.expression {
                             // Successfully expanded derived measure
-                            format!("SELECT {}", expanded)
+                            format!("SELECT {expanded}")
                         } else {
                             // No aggregation found, default to SUM
-                            format!("SELECT SUM({})", measure_name)
+                            format!("SELECT SUM({measure_name})")
                         }
                     } else {
                         // No aggregation found, default to SUM
-                        format!("SELECT SUM({})", measure_name)
+                        format!("SELECT SUM({measure_name})")
                     };
 
                     let stmts = Parser::parse_sql(&dialect, &expr_sql)
@@ -1440,8 +1494,7 @@ fn expand_aggregate_in_expr(
                 }
 
                 return Err(YardstickError::Validation(format!(
-                    "Measure '{}' not found",
-                    measure_name
+                    "Measure '{measure_name}' not found"
                 )));
             }
 
@@ -1507,12 +1560,12 @@ pub fn expand_at_to_sql(
     outer_where: Option<&str>,
     group_by_cols: &[String],
 ) -> String {
-    let measure_expr = format!("{}({})", agg_fn, measure_col);
+    let measure_expr = format!("{agg_fn}({measure_col})");
 
     match modifier {
         ContextModifier::AllGlobal => {
             // Grand total - no WHERE clause, aggregate over entire table
-            format!("(SELECT {} FROM {})", measure_expr, table_name)
+            format!("(SELECT {measure_expr} FROM {table_name})")
         }
         ContextModifier::All(dim) => {
             // Remove dimension from context - correlate on other GROUP BY dimensions
@@ -1528,7 +1581,7 @@ pub fn expand_at_to_sql(
                         col.to_lowercase() != dim_lower
                     } else {
                         // For simple columns, extract just the column name (handle qualified refs like "s.year")
-                        let col_name = col.split('.').last().unwrap_or(col);
+                        let col_name = col.split('.').next_back().unwrap_or(col);
                         col_name.to_lowercase() != dim_lower
                     }
                 })
@@ -1536,7 +1589,7 @@ pub fn expand_at_to_sql(
 
             if correlating_dims.is_empty() {
                 // No other dimensions - same as AllGlobal
-                format!("(SELECT {} FROM {})", measure_expr, table_name)
+                format!("(SELECT {measure_expr} FROM {table_name})")
             } else {
                 // Correlate on remaining dimensions
                 let where_clauses: Vec<_> = correlating_dims
@@ -1546,17 +1599,19 @@ pub fn expand_at_to_sql(
                         if col_is_expr {
                             // For expression dimensions, qualify column refs inside
                             let inner_expr = qualify_where_for_inner(col);
-                            format!("{} = {}", inner_expr, col)
+                            format!("{inner_expr} = {col}")
                         } else {
                             // Extract just the column name for _inner reference
-                            let col_name = col.split('.').last().unwrap_or(col);
-                            format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                            let col_name = col.split('.').next_back().unwrap_or(col);
+                            format!("_inner.{col_name} = {outer_ref}.{col_name}")
                         }
                     })
                     .collect();
                 format!(
                     "(SELECT {} FROM {} _inner WHERE {})",
-                    measure_expr, table_name, where_clauses.join(" AND ")
+                    measure_expr,
+                    table_name,
+                    where_clauses.join(" AND ")
                 )
             }
         }
@@ -1570,11 +1625,11 @@ pub fn expand_at_to_sql(
                 // Expression: qualify column refs inside it
                 qualify_where_for_inner(dim)
             } else {
-                format!("_inner.{}", dim)
+                format!("_inner.{dim}")
             };
 
             // SET condition for the specified dimension
-            let set_condition = format!("{} = {}", inner_dim, qualified_expr);
+            let set_condition = format!("{inner_dim} = {qualified_expr}");
 
             // Build correlation conditions for OTHER GROUP BY columns (not the SET dim)
             // Per paper: SET only removes terms for the specified dimension, correlates on others
@@ -1586,7 +1641,7 @@ pub fn expand_at_to_sql(
                     if is_expression {
                         col.to_lowercase() != dim_lower
                     } else {
-                        let col_name = col.split('.').last().unwrap_or(col);
+                        let col_name = col.split('.').next_back().unwrap_or(col);
                         col_name.to_lowercase() != dim_lower
                     }
                 })
@@ -1594,10 +1649,10 @@ pub fn expand_at_to_sql(
                     let col_is_expr = col.contains('(');
                     if col_is_expr {
                         let inner_expr = qualify_where_for_inner(col);
-                        format!("{} = {}", inner_expr, col)
+                        format!("{inner_expr} = {col}")
                     } else {
-                        let col_name = col.split('.').last().unwrap_or(col);
-                        format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                        let col_name = col.split('.').next_back().unwrap_or(col);
+                        format!("_inner.{col_name} = {outer_ref}.{col_name}")
                     }
                 })
                 .collect();
@@ -1609,13 +1664,14 @@ pub fn expand_at_to_sql(
 
             format!(
                 "(SELECT {} FROM {} _inner WHERE {})",
-                measure_expr, table_name, all_conditions.join(" AND ")
+                measure_expr,
+                table_name,
+                all_conditions.join(" AND ")
             )
         }
         ContextModifier::Where(condition) => {
             format!(
-                "(SELECT {} FROM {} WHERE {})",
-                measure_expr, table_name, condition
+                "(SELECT {measure_expr} FROM {table_name} WHERE {condition})"
             )
         }
         ContextModifier::Visible => {
@@ -1624,7 +1680,7 @@ pub fn expand_at_to_sql(
             if group_by_cols.is_empty() {
                 // No GROUP BY - just apply WHERE
                 match outer_where {
-                    Some(w) => format!("(SELECT {} FROM {} WHERE {})", measure_expr, table_name, w),
+                    Some(w) => format!("(SELECT {measure_expr} FROM {table_name} WHERE {w})"),
                     None => measure_expr,
                 }
             } else {
@@ -1633,8 +1689,8 @@ pub fn expand_at_to_sql(
                     .iter()
                     .map(|col| {
                         // Extract just the column name for _inner reference
-                        let col_name = col.split('.').last().unwrap_or(col);
-                        format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                        let col_name = col.split('.').next_back().unwrap_or(col);
+                        format!("_inner.{col_name} = {outer_ref}.{col_name}")
                     })
                     .collect();
                 let full_where = match outer_where {
@@ -1642,8 +1698,7 @@ pub fn expand_at_to_sql(
                     None => where_clauses.join(" AND "),
                 };
                 format!(
-                    "(SELECT {} FROM {} _inner WHERE {})",
-                    measure_expr, table_name, full_where
+                    "(SELECT {measure_expr} FROM {table_name} _inner WHERE {full_where})"
                 )
             }
         }
@@ -1662,23 +1717,53 @@ pub fn expand_modifiers_to_sql(
 ) -> String {
     if modifiers.is_empty() {
         // No modifiers = default VISIBLE behavior (respect outer WHERE)
-        return expand_at_to_sql(measure_col, agg_fn, &ContextModifier::Visible, table_name, outer_alias, outer_where, group_by_cols);
+        return expand_at_to_sql(
+            measure_col,
+            agg_fn,
+            &ContextModifier::Visible,
+            table_name,
+            outer_alias,
+            outer_where,
+            group_by_cols,
+        );
     }
 
     if modifiers.len() == 1 {
-        return expand_at_to_sql(measure_col, agg_fn, &modifiers[0], table_name, outer_alias, outer_where, group_by_cols);
+        return expand_at_to_sql(
+            measure_col,
+            agg_fn,
+            &modifiers[0],
+            table_name,
+            outer_alias,
+            outer_where,
+            group_by_cols,
+        );
     }
 
     // Check if all modifiers are ALL (dimension or global)
-    let all_are_all = modifiers.iter().all(|m| matches!(m, ContextModifier::All(_) | ContextModifier::AllGlobal));
+    let all_are_all = modifiers
+        .iter()
+        .all(|m| matches!(m, ContextModifier::All(_) | ContextModifier::AllGlobal));
     if all_are_all {
         // Check for explicit AllGlobal - that means grand total
-        if modifiers.iter().any(|m| matches!(m, ContextModifier::AllGlobal)) {
-            return expand_at_to_sql(measure_col, agg_fn, &ContextModifier::AllGlobal, table_name, outer_alias, outer_where, group_by_cols);
+        if modifiers
+            .iter()
+            .any(|m| matches!(m, ContextModifier::AllGlobal))
+        {
+            return expand_at_to_sql(
+                measure_col,
+                agg_fn,
+                &ContextModifier::AllGlobal,
+                table_name,
+                outer_alias,
+                outer_where,
+                group_by_cols,
+            );
         }
 
         // Accumulate all dimensions to remove
-        let removed_dims: Vec<&str> = modifiers.iter()
+        let removed_dims: Vec<&str> = modifiers
+            .iter()
             .filter_map(|m| match m {
                 ContextModifier::All(dim) => Some(dim.as_str()),
                 _ => None,
@@ -1686,30 +1771,42 @@ pub fn expand_modifiers_to_sql(
             .collect();
 
         // Filter group_by_cols to get remaining dimensions
-        let remaining_cols: Vec<&String> = group_by_cols.iter()
+        let remaining_cols: Vec<&String> = group_by_cols
+            .iter()
             .filter(|col| {
-                let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
+                let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
                 !removed_dims.iter().any(|d| d.to_lowercase() == col_name)
             })
             .collect();
 
         if remaining_cols.is_empty() {
             // All dimensions removed = grand total
-            return expand_at_to_sql(measure_col, agg_fn, &ContextModifier::AllGlobal, table_name, outer_alias, outer_where, group_by_cols);
+            return expand_at_to_sql(
+                measure_col,
+                agg_fn,
+                &ContextModifier::AllGlobal,
+                table_name,
+                outer_alias,
+                outer_where,
+                group_by_cols,
+            );
         }
 
         // Generate correlation on remaining dimensions only
         let outer_ref = outer_alias.unwrap_or(table_name);
-        let measure_expr = format!("{}({})", agg_fn, measure_col);
-        let where_clauses: Vec<_> = remaining_cols.iter()
+        let measure_expr = format!("{agg_fn}({measure_col})");
+        let where_clauses: Vec<_> = remaining_cols
+            .iter()
             .map(|col| {
-                let col_name = col.split('.').last().unwrap_or(col);
-                format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                let col_name = col.split('.').next_back().unwrap_or(col);
+                format!("_inner.{col_name} = {outer_ref}.{col_name}")
             })
             .collect();
         return format!(
             "(SELECT {} FROM {} _inner WHERE {})",
-            measure_expr, table_name, where_clauses.join(" AND ")
+            measure_expr,
+            table_name,
+            where_clauses.join(" AND ")
         );
     }
 
@@ -1721,7 +1818,9 @@ pub fn expand_modifiers_to_sql(
     // - WHERE adds a filter
 
     // Check if SET is present - per paper, SET bypasses outer WHERE
-    let has_set = modifiers.iter().any(|m| matches!(m, ContextModifier::Set(_, _)));
+    let has_set = modifiers
+        .iter()
+        .any(|m| matches!(m, ContextModifier::Set(_, _)));
 
     let mut effective_where: Option<String> = None;
     let mut has_all_global = false;
@@ -1766,44 +1865,48 @@ pub fn expand_modifiers_to_sql(
                     let inner_dim = if dim.contains('(') {
                         qualify_where_for_inner(dim)
                     } else {
-                        format!("_inner.{}", dim)
+                        format!("_inner.{dim}")
                     };
-                    set_conditions.push(format!("{} = {}", inner_dim, qualified_expr));
+                    set_conditions.push(format!("{inner_dim} = {qualified_expr}"));
                 }
             }
         }
     }
 
     // Build final SQL
-    let measure_expr = format!("{}({})", agg_fn, measure_col);
+    let measure_expr = format!("{agg_fn}({measure_col})");
 
     if has_all_global && set_conditions.is_empty() {
         // Pure grand total
-        return format!("(SELECT {} FROM {})", measure_expr, table_name);
+        return format!("(SELECT {measure_expr} FROM {table_name})");
     }
 
     // Filter group_by_cols to exclude removed dimensions
-    let remaining_cols: Vec<&String> = group_by_cols.iter()
+    let remaining_cols: Vec<&String> = group_by_cols
+        .iter()
         .filter(|col| {
             let col_lower = col.to_lowercase();
-            let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
+            let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
             // Check both full expression match and simple column match
-            !removed_dims.iter().any(|d| *d == col_lower || *d == col_name)
+            !removed_dims
+                .iter()
+                .any(|d| *d == col_lower || *d == col_name)
         })
         .collect();
 
     // Build correlation conditions for remaining dimensions
     let outer_ref = outer_alias.unwrap_or(table_name);
-    let correlation_conditions: Vec<String> = remaining_cols.iter()
+    let correlation_conditions: Vec<String> = remaining_cols
+        .iter()
         .map(|col| {
             let col_is_expr = col.contains('(');
             if col_is_expr {
                 // For expression dimensions, qualify column refs inside
                 let inner_expr = qualify_where_for_inner(col);
-                format!("{} = {}", inner_expr, col)
+                format!("{inner_expr} = {col}")
             } else {
-                let col_name = col.split('.').last().unwrap_or(col);
-                format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                let col_name = col.split('.').next_back().unwrap_or(col);
+                format!("_inner.{col_name} = {outer_ref}.{col_name}")
             }
         })
         .collect();
@@ -1816,11 +1919,13 @@ pub fn expand_modifiers_to_sql(
     }
 
     if all_conditions.is_empty() {
-        format!("(SELECT {} FROM {})", measure_expr, table_name)
+        format!("(SELECT {measure_expr} FROM {table_name})")
     } else {
         format!(
             "(SELECT {} FROM {} _inner WHERE {})",
-            measure_expr, table_name, all_conditions.join(" AND ")
+            measure_expr,
+            table_name,
+            all_conditions.join(" AND ")
         )
     }
 }
@@ -1839,19 +1944,25 @@ fn expand_modifiers_to_sql_derived(
 
     if modifiers.is_empty() {
         // No modifiers = just use the expression
-        return format!("(SELECT {} FROM {})", derived_expr, table_name);
+        return format!("(SELECT {derived_expr} FROM {table_name})");
     }
 
     // Check for AllGlobal (grand total)
-    if modifiers.iter().any(|m| matches!(m, ContextModifier::AllGlobal)) {
-        return format!("(SELECT {} FROM {})", derived_expr, table_name);
+    if modifiers
+        .iter()
+        .any(|m| matches!(m, ContextModifier::AllGlobal))
+    {
+        return format!("(SELECT {derived_expr} FROM {table_name})");
     }
 
     // Check if all modifiers are ALL (dimension)
-    let all_are_all = modifiers.iter().all(|m| matches!(m, ContextModifier::All(_)));
+    let all_are_all = modifiers
+        .iter()
+        .all(|m| matches!(m, ContextModifier::All(_)));
     if all_are_all {
         // Accumulate dimensions to remove
-        let removed_dims: Vec<&str> = modifiers.iter()
+        let removed_dims: Vec<&str> = modifiers
+            .iter()
             .filter_map(|m| match m {
                 ContextModifier::All(dim) => Some(dim.as_str()),
                 _ => None,
@@ -1859,44 +1970,52 @@ fn expand_modifiers_to_sql_derived(
             .collect();
 
         // Filter group_by_cols to get remaining dimensions
-        let remaining_cols: Vec<&String> = group_by_cols.iter()
+        let remaining_cols: Vec<&String> = group_by_cols
+            .iter()
             .filter(|col| {
                 let col_lower = col.to_lowercase();
-                let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
+                let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
                 // Check both full expression match and simple column match
-                !removed_dims.iter().any(|d| d.to_lowercase() == col_lower || d.to_lowercase() == col_name)
+                !removed_dims
+                    .iter()
+                    .any(|d| d.to_lowercase() == col_lower || d.to_lowercase() == col_name)
             })
             .collect();
 
         if remaining_cols.is_empty() {
             // All dimensions removed = grand total
-            return format!("(SELECT {} FROM {})", derived_expr, table_name);
+            return format!("(SELECT {derived_expr} FROM {table_name})");
         }
 
         // Generate correlation on remaining dimensions
         let outer_ref = outer_alias.unwrap_or(table_name);
-        let where_clauses: Vec<_> = remaining_cols.iter()
+        let where_clauses: Vec<_> = remaining_cols
+            .iter()
             .map(|col| {
                 let col_is_expr = col.contains('(');
                 if col_is_expr {
                     // For expression dimensions, qualify column refs inside
                     let inner_expr = qualify_where_for_inner(col);
-                    format!("{} = {}", inner_expr, col)
+                    format!("{inner_expr} = {col}")
                 } else {
-                    let col_name = col.split('.').last().unwrap_or(col);
-                    format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                    let col_name = col.split('.').next_back().unwrap_or(col);
+                    format!("_inner.{col_name} = {outer_ref}.{col_name}")
                 }
             })
             .collect();
         return format!(
             "(SELECT {} FROM {} _inner WHERE {})",
-            derived_expr, table_name, where_clauses.join(" AND ")
+            derived_expr,
+            table_name,
+            where_clauses.join(" AND ")
         );
     }
 
     // For other modifiers (SET, WHERE, VISIBLE), build conditions
     // Check if SET is present - per paper, SET bypasses outer WHERE
-    let has_set = modifiers.iter().any(|m| matches!(m, ContextModifier::Set(_, _)));
+    let has_set = modifiers
+        .iter()
+        .any(|m| matches!(m, ContextModifier::Set(_, _)));
 
     let mut effective_where: Option<String> = None;
     let mut has_all_global = false;
@@ -1932,31 +2051,35 @@ fn expand_modifiers_to_sql_derived(
     }
 
     if has_all_global {
-        return format!("(SELECT {} FROM {})", derived_expr, table_name);
+        return format!("(SELECT {derived_expr} FROM {table_name})");
     }
 
     // Filter remaining dimensions
-    let remaining_cols: Vec<&String> = group_by_cols.iter()
+    let remaining_cols: Vec<&String> = group_by_cols
+        .iter()
         .filter(|col| {
             let col_lower = col.to_lowercase();
-            let col_name = col.split('.').last().unwrap_or(col).to_lowercase();
+            let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
             // Check both full expression match and simple column match
-            !removed_dims.iter().any(|d| *d == col_lower || *d == col_name)
+            !removed_dims
+                .iter()
+                .any(|d| *d == col_lower || *d == col_name)
         })
         .collect();
 
     // Build conditions
     let outer_ref = outer_alias.unwrap_or(table_name);
-    let mut all_conditions: Vec<String> = remaining_cols.iter()
+    let mut all_conditions: Vec<String> = remaining_cols
+        .iter()
         .map(|col| {
             let col_is_expr = col.contains('(');
             if col_is_expr {
                 // For expression dimensions, qualify column refs inside
                 let inner_expr = qualify_where_for_inner(col);
-                format!("{} = {}", inner_expr, col)
+                format!("{inner_expr} = {col}")
             } else {
-                let col_name = col.split('.').last().unwrap_or(col);
-                format!("_inner.{} = {}.{}", col_name, outer_ref, col_name)
+                let col_name = col.split('.').next_back().unwrap_or(col);
+                format!("_inner.{col_name} = {outer_ref}.{col_name}")
             }
         })
         .collect();
@@ -1966,11 +2089,13 @@ fn expand_modifiers_to_sql_derived(
     }
 
     if all_conditions.is_empty() {
-        format!("(SELECT {} FROM {})", derived_expr, table_name)
+        format!("(SELECT {derived_expr} FROM {table_name})")
     } else {
         format!(
             "(SELECT {} FROM {} _inner WHERE {})",
-            derived_expr, table_name, all_conditions.join(" AND ")
+            derived_expr,
+            table_name,
+            all_conditions.join(" AND ")
         )
     }
 }
@@ -1988,18 +2113,22 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     // Extract table info using string-based approach (works with AGGREGATE syntax)
     // Note: sqlparser can't parse AGGREGATE() since it's not standard SQL
-    let (primary_table_name, existing_alias) = extract_table_and_alias_from_sql(sql)
-        .unwrap_or_else(|| ("t".to_string(), None));
+    let (primary_table_name, existing_alias) =
+        extract_table_and_alias_from_sql(sql).unwrap_or_else(|| ("t".to_string(), None));
 
     // Build FromClauseInfo from string-based extraction for now
     // TODO: For proper JOIN support, we'd need to extract all tables from the FROM clause
     let mut from_info = FromClauseInfo::default();
     let primary_table = TableInfo {
         name: primary_table_name.clone(),
-        effective_name: existing_alias.clone().unwrap_or_else(|| primary_table_name.clone()),
+        effective_name: existing_alias
+            .clone()
+            .unwrap_or_else(|| primary_table_name.clone()),
         has_alias: existing_alias.is_some(),
     };
-    from_info.tables.insert(primary_table.effective_name.clone(), primary_table.clone());
+    from_info
+        .tables
+        .insert(primary_table.effective_name.clone(), primary_table.clone());
     from_info.primary_table = Some(primary_table);
 
     // Extract outer WHERE clause for VISIBLE semantics
@@ -2016,9 +2145,9 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     // Check if any AT modifier needs correlation (for alias handling)
     let needs_outer_alias = at_patterns.iter().any(|(_, modifiers, _, _)| {
         modifiers.iter().any(|m| {
-            matches!(m, ContextModifier::Set(_, _)) ||
-            matches!(m, ContextModifier::All(_)) ||
-            matches!(m, ContextModifier::Visible)
+            matches!(m, ContextModifier::Set(_, _))
+                || matches!(m, ContextModifier::All(_))
+                || matches!(m, ContextModifier::Visible)
         })
     });
 
@@ -2048,7 +2177,8 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     for (measure_name, modifiers, start, end) in patterns {
         // Look up which view contains this measure (for JOIN support)
-        let (agg_fn, source_view, derived_expr) = resolve_measure_source(&measure_name, &primary_table_name);
+        let (agg_fn, source_view, derived_expr) =
+            resolve_measure_source(&measure_name, &primary_table_name);
 
         // Find the alias for this measure's source view in the FROM clause
         // If the source view is the primary table and we added _outer, use _outer
@@ -2077,9 +2207,24 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
         let expanded = if derived_expr.is_some() {
             // For derived measures, build the subquery with the expanded expression
-            expand_modifiers_to_sql_derived(effective_measure, &modifiers, &source_view, outer_alias_ref, outer_where_ref, &group_by_cols)
+            expand_modifiers_to_sql_derived(
+                effective_measure,
+                &modifiers,
+                &source_view,
+                outer_alias_ref,
+                outer_where_ref,
+                &group_by_cols,
+            )
         } else {
-            expand_modifiers_to_sql(&measure_name, &effective_agg, &modifiers, &source_view, outer_alias_ref, outer_where_ref, &group_by_cols)
+            expand_modifiers_to_sql(
+                &measure_name,
+                &effective_agg,
+                &modifiers,
+                &source_view,
+                outer_alias_ref,
+                outer_where_ref,
+                &group_by_cols,
+            )
         };
         result_sql = format!("{}{}{}", &result_sql[..start], expanded, &result_sql[end..]);
     }
@@ -2089,13 +2234,14 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     plain_calls.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by position descending
 
     for (measure_name, start, end) in plain_calls {
-        let (agg_fn, _source_view, derived_expr) = resolve_measure_source(&measure_name, &primary_table_name);
+        let (agg_fn, _source_view, derived_expr) =
+            resolve_measure_source(&measure_name, &primary_table_name);
 
         // For derived measures, use the expanded expression; otherwise use AGG(measure_name)
         let expanded = if let Some(expr) = derived_expr {
             expr
         } else {
-            format!("{}({})", agg_fn, measure_name)
+            format!("{agg_fn}({measure_name})")
         };
         result_sql = format!("{}{}{}", &result_sql[..start], expanded, &result_sql[end..]);
     }
@@ -2318,17 +2464,20 @@ mod tests {
         let sql = "CREATE VIEW v AS SELECT year, CASE WHEN SUM(x) > 100 THEN 1 ELSE 0 END AS MEASURE flag FROM t GROUP BY year";
         let result = process_create_view(sql);
 
-        eprintln!("Result: {:?}", result);
+        eprintln!("Result: {result:?}");
         eprintln!("Measures: {:?}", result.measures);
         assert!(result.is_measure_view);
         assert_eq!(result.measures.len(), 1);
         assert_eq!(result.measures[0].column_name, "flag");
-        assert_eq!(result.measures[0].expression, "CASE WHEN SUM(x) > 100 THEN 1 ELSE 0 END");
+        assert_eq!(
+            result.measures[0].expression,
+            "CASE WHEN SUM(x) > 100 THEN 1 ELSE 0 END"
+        );
 
         // Now test that AGGREGATE(flag) works
         let query_sql = "SELECT year, AGGREGATE(flag) FROM v GROUP BY year";
         let expand_result = expand_aggregate(query_sql);
-        eprintln!("Expand result: {:?}", expand_result);
+        eprintln!("Expand result: {expand_result:?}");
         // This should have expanded AGGREGATE(flag) to something
         assert!(expand_result.had_aggregate);
     }
@@ -2418,10 +2567,7 @@ FROM orders"#;
     #[test]
     fn test_parse_at_modifier_where() {
         let result = parse_at_modifier("WHERE region = 'US'").unwrap();
-        assert_eq!(
-            result,
-            ContextModifier::Where("region = 'US'".to_string())
-        );
+        assert_eq!(result, ContextModifier::Where("region = 'US'".to_string()));
     }
 
     #[test]
@@ -2724,7 +2870,10 @@ FROM orders"#;
         assert_eq!(extract_where_clause(sql2), None);
 
         let sql3 = "SELECT x FROM t WHERE a = 1 AND b = 2 ORDER BY x";
-        assert_eq!(extract_where_clause(sql3), Some("a = 1 AND b = 2".to_string()));
+        assert_eq!(
+            extract_where_clause(sql3),
+            Some("a = 1 AND b = 2".to_string())
+        );
     }
 
     #[test]
@@ -2734,8 +2883,20 @@ FROM orders"#;
             ContextModifier::All("region".to_string()),
             ContextModifier::All("category".to_string()),
         ];
-        let group_by = vec!["year".to_string(), "region".to_string(), "category".to_string()];
-        let expanded = expand_modifiers_to_sql("revenue", "SUM", &modifiers, "sales_v", Some("_outer"), None, &group_by);
+        let group_by = vec![
+            "year".to_string(),
+            "region".to_string(),
+            "category".to_string(),
+        ];
+        let expanded = expand_modifiers_to_sql(
+            "revenue",
+            "SUM",
+            &modifiers,
+            "sales_v",
+            Some("_outer"),
+            None,
+            &group_by,
+        );
         // Should correlate on year only (not grand total)
         assert_eq!(
             expanded,
@@ -2751,7 +2912,9 @@ FROM orders"#;
             ContextModifier::All("region".to_string()),
         ];
         let group_by = vec!["year".to_string(), "region".to_string()];
-        let expanded = expand_modifiers_to_sql("revenue", "SUM", &modifiers, "sales_v", None, None, &group_by);
+        let expanded = expand_modifiers_to_sql(
+            "revenue", "SUM", &modifiers, "sales_v", None, None, &group_by,
+        );
         assert_eq!(expanded, "(SELECT SUM(revenue) FROM sales_v)");
     }
 
@@ -2763,7 +2926,15 @@ FROM orders"#;
             ContextModifier::All("year".to_string()),
         ];
         let group_by = vec!["year".to_string()];
-        let expanded = expand_modifiers_to_sql("revenue", "SUM", &modifiers, "sales_v", Some("_outer"), None, &group_by);
+        let expanded = expand_modifiers_to_sql(
+            "revenue",
+            "SUM",
+            &modifiers,
+            "sales_v",
+            Some("_outer"),
+            None,
+            &group_by,
+        );
         // ALL year should override SET year, resulting in grand total
         assert_eq!(expanded, "(SELECT SUM(revenue) FROM sales_v)");
     }
@@ -2864,8 +3035,11 @@ FROM orders"#;
 FROM sales_yearly s
 GROUP BY s.year";
         let result = extract_table_and_alias_from_sql(sql);
-        eprintln!("Result: {:?}", result);
-        assert_eq!(result, Some(("sales_yearly".to_string(), Some("s".to_string()))));
+        eprintln!("Result: {result:?}");
+        assert_eq!(
+            result,
+            Some(("sales_yearly".to_string(), Some("s".to_string())))
+        );
     }
 
     // =========================================================================
@@ -3049,10 +3223,7 @@ GROUP BY s.year";
 
         // ALL with function expression
         let result = parse_at_modifier("ALL YEAR(created_at)").unwrap();
-        assert_eq!(
-            result,
-            ContextModifier::All("YEAR(created_at)".to_string())
-        );
+        assert_eq!(result, ContextModifier::All("YEAR(created_at)".to_string()));
 
         // Nested function
         let result = parse_at_modifier("SET EXTRACT(month FROM date) = 6").unwrap();
