@@ -6,21 +6,39 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
 
-// Rust FFI - Julian Hyde "Measures in SQL" (arXiv:2406.00251)
+// Include FFI types header
+#include "yardstick_ffi.h"
+
+// Forward declare C++ parser FFI functions (defined in yardstick_parser_ffi.cpp)
 extern "C" {
-    struct YardstickCreateViewResult {
-        bool is_measure_view;
-        char *view_name;
-        char *clean_sql;
-        char *error;
-    };
+    YardstickAggregateCallList* yardstick_find_aggregates(const char* sql);
+    void yardstick_free_aggregate_list(YardstickAggregateCallList* list);
+    YardstickSelectInfo* yardstick_parse_select(const char* sql);
+    void yardstick_free_select_info(YardstickSelectInfo* info);
+    YardstickExpressionInfo* yardstick_parse_expression(const char* expr);
+    void yardstick_free_expression_info(YardstickExpressionInfo* info);
+    YardstickCreateViewInfo* yardstick_parse_create_view(const char* sql);
+    void yardstick_free_create_view_info(YardstickCreateViewInfo* info);
+    char* yardstick_replace_range(const char* sql, uint32_t start, uint32_t end, const char* replacement);
+    char* yardstick_apply_replacements(const char* sql, const YardstickReplacement* replacements, size_t count);
+    void yardstick_free_string(char* ptr);
+    char* yardstick_expand_aggregate_call(
+        const char* measure_name,
+        const char* agg_func,
+        const YardstickAtModifier* modifiers,
+        size_t modifier_count,
+        const char* table_name,
+        const char* outer_alias,
+        const char* outer_where,
+        const char* const* group_by_cols,
+        size_t group_by_count
+    );
+}
 
-    struct YardstickAggregateResult {
-        bool had_aggregate;
-        char *expanded_sql;
-        char *error;
-    };
-
+// Rust FFI - Julian Hyde "Measures in SQL" (arXiv:2406.00251)
+// Note: Struct types (YardstickCreateViewResult, YardstickAggregateResult, etc.)
+// are already defined in yardstick_ffi.h
+extern "C" {
     bool yardstick_has_as_measure(const char *sql);
     bool yardstick_has_aggregate(const char *sql);
     YardstickCreateViewResult yardstick_process_create_view(const char *sql);
@@ -28,6 +46,22 @@ extern "C" {
     void yardstick_free(char *ptr);
     void yardstick_free_create_view_result(YardstickCreateViewResult result);
     void yardstick_free_aggregate_result(YardstickAggregateResult result);
+
+    // Initialize parser FFI function pointers in Rust
+    void yardstick_init_parser_ffi(
+        YardstickAggregateCallList* (*find_aggregates)(const char*),
+        void (*free_aggregate_list)(YardstickAggregateCallList*),
+        YardstickSelectInfo* (*parse_select)(const char*),
+        void (*free_select_info)(YardstickSelectInfo*),
+        YardstickExpressionInfo* (*parse_expression)(const char*),
+        void (*free_expression_info)(YardstickExpressionInfo*),
+        YardstickCreateViewInfo* (*parse_create_view)(const char*),
+        void (*free_create_view_info)(YardstickCreateViewInfo*),
+        char* (*replace_range)(const char*, uint32_t, uint32_t, const char*),
+        char* (*apply_replacements)(const char*, const YardstickReplacement*, size_t),
+        void (*free_string)(char*),
+        char* (*expand_aggregate_call)(const char*, const char*, const YardstickAtModifier*, size_t, const char*, const char*, const char*, const char* const*, size_t)
+    );
 }
 
 namespace duckdb {
@@ -275,6 +309,22 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
 //=============================================================================
 
 static void LoadInternal(ExtensionLoader &loader) {
+    // Initialize parser FFI function pointers in Rust (must be done first)
+    yardstick_init_parser_ffi(
+        yardstick_find_aggregates,
+        yardstick_free_aggregate_list,
+        yardstick_parse_select,
+        yardstick_free_select_info,
+        yardstick_parse_expression,
+        yardstick_free_expression_info,
+        yardstick_parse_create_view,
+        yardstick_free_create_view_info,
+        yardstick_replace_range,
+        yardstick_apply_replacements,
+        yardstick_free_string,
+        yardstick_expand_aggregate_call
+    );
+
     auto &db = loader.GetDatabaseInstance();
     auto &config = DBConfig::GetConfig(db);
 

@@ -153,64 +153,141 @@ pub struct YardstickReplacement {
 }
 
 // =============================================================================
-// Extern "C" declarations for C++ functions
+// Function pointer types for C++ functions (set at runtime to avoid link errors)
 // =============================================================================
 
-extern "C" {
-    /// Find all AGGREGATE() calls in SQL, including AT modifiers.
-    fn yardstick_find_aggregates(sql: *const c_char) -> *mut YardstickAggregateCallList;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
-    /// Free an aggregate call list returned by yardstick_find_aggregates().
-    fn yardstick_free_aggregate_list(list: *mut YardstickAggregateCallList);
+type FnFindAggregates = unsafe extern "C" fn(*const c_char) -> *mut YardstickAggregateCallList;
+type FnFreeAggregateList = unsafe extern "C" fn(*mut YardstickAggregateCallList);
+type FnParseSelect = unsafe extern "C" fn(*const c_char) -> *mut YardstickSelectInfo;
+type FnFreeSelectInfo = unsafe extern "C" fn(*mut YardstickSelectInfo);
+type FnParseExpression = unsafe extern "C" fn(*const c_char) -> *mut YardstickExpressionInfo;
+type FnFreeExpressionInfo = unsafe extern "C" fn(*mut YardstickExpressionInfo);
+type FnParseCreateView = unsafe extern "C" fn(*const c_char) -> *mut YardstickCreateViewInfo;
+type FnFreeCreateViewInfo = unsafe extern "C" fn(*mut YardstickCreateViewInfo);
+type FnReplaceRange = unsafe extern "C" fn(*const c_char, u32, u32, *const c_char) -> *mut c_char;
+type FnApplyReplacements = unsafe extern "C" fn(*const c_char, *const YardstickReplacement, usize) -> *mut c_char;
+type FnFreeString = unsafe extern "C" fn(*mut c_char);
+type FnExpandAggregateCall = unsafe extern "C" fn(
+    *const c_char, *const c_char, *const YardstickAtModifier, usize,
+    *const c_char, *const c_char, *const c_char, *const *const c_char, usize
+) -> *mut c_char;
 
-    /// Parse SELECT statement and extract clause information.
-    fn yardstick_parse_select(sql: *const c_char) -> *mut YardstickSelectInfo;
+// Static function pointers - set by C++ at init time
+static FN_FIND_AGGREGATES: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_FREE_AGGREGATE_LIST: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_PARSE_SELECT: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_FREE_SELECT_INFO: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_PARSE_EXPRESSION: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_FREE_EXPRESSION_INFO: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_PARSE_CREATE_VIEW: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_FREE_CREATE_VIEW_INFO: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_REPLACE_RANGE: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_APPLY_REPLACEMENTS: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_FREE_STRING: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_EXPAND_AGGREGATE_CALL: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
-    /// Free a select info structure.
-    fn yardstick_free_select_info(info: *mut YardstickSelectInfo);
+/// Initialize function pointers - called by C++ at extension load time
+#[no_mangle]
+pub extern "C" fn yardstick_init_parser_ffi(
+    find_aggregates: FnFindAggregates,
+    free_aggregate_list: FnFreeAggregateList,
+    parse_select: FnParseSelect,
+    free_select_info: FnFreeSelectInfo,
+    parse_expression: FnParseExpression,
+    free_expression_info: FnFreeExpressionInfo,
+    parse_create_view: FnParseCreateView,
+    free_create_view_info: FnFreeCreateViewInfo,
+    replace_range: FnReplaceRange,
+    apply_replacements: FnApplyReplacements,
+    free_string: FnFreeString,
+    expand_aggregate_call: FnExpandAggregateCall,
+) {
+    FN_FIND_AGGREGATES.store(find_aggregates as *mut (), Ordering::SeqCst);
+    FN_FREE_AGGREGATE_LIST.store(free_aggregate_list as *mut (), Ordering::SeqCst);
+    FN_PARSE_SELECT.store(parse_select as *mut (), Ordering::SeqCst);
+    FN_FREE_SELECT_INFO.store(free_select_info as *mut (), Ordering::SeqCst);
+    FN_PARSE_EXPRESSION.store(parse_expression as *mut (), Ordering::SeqCst);
+    FN_FREE_EXPRESSION_INFO.store(free_expression_info as *mut (), Ordering::SeqCst);
+    FN_PARSE_CREATE_VIEW.store(parse_create_view as *mut (), Ordering::SeqCst);
+    FN_FREE_CREATE_VIEW_INFO.store(free_create_view_info as *mut (), Ordering::SeqCst);
+    FN_REPLACE_RANGE.store(replace_range as *mut (), Ordering::SeqCst);
+    FN_APPLY_REPLACEMENTS.store(apply_replacements as *mut (), Ordering::SeqCst);
+    FN_FREE_STRING.store(free_string as *mut (), Ordering::SeqCst);
+    FN_EXPAND_AGGREGATE_CALL.store(expand_aggregate_call as *mut (), Ordering::SeqCst);
+}
 
-    /// Parse a single SQL expression.
-    fn yardstick_parse_expression(expr: *const c_char) -> *mut YardstickExpressionInfo;
+// Helper macros to call function pointers
+macro_rules! call_ffi {
+    ($ptr:expr, $type:ty, $($arg:expr),*) => {{
+        let p = $ptr.load(Ordering::SeqCst);
+        if p.is_null() {
+            panic!("Parser FFI not initialized - call yardstick_init_parser_ffi first");
+        }
+        let f: $type = std::mem::transmute(p);
+        f($($arg),*)
+    }};
+}
 
-    /// Free an expression info structure.
-    fn yardstick_free_expression_info(info: *mut YardstickExpressionInfo);
+unsafe fn yardstick_find_aggregates(sql: *const c_char) -> *mut YardstickAggregateCallList {
+    call_ffi!(FN_FIND_AGGREGATES, FnFindAggregates, sql)
+}
 
-    /// Parse CREATE VIEW with AS MEASURE syntax.
-    fn yardstick_parse_create_view(sql: *const c_char) -> *mut YardstickCreateViewInfo;
+unsafe fn yardstick_free_aggregate_list(list: *mut YardstickAggregateCallList) {
+    call_ffi!(FN_FREE_AGGREGATE_LIST, FnFreeAggregateList, list)
+}
 
-    /// Free a create view info structure.
-    fn yardstick_free_create_view_info(info: *mut YardstickCreateViewInfo);
+unsafe fn yardstick_parse_select(sql: *const c_char) -> *mut YardstickSelectInfo {
+    call_ffi!(FN_PARSE_SELECT, FnParseSelect, sql)
+}
 
-    /// Replace a single range in SQL.
-    fn yardstick_replace_range(
-        sql: *const c_char,
-        start: u32,
-        end: u32,
-        replacement: *const c_char,
-    ) -> *mut c_char;
+unsafe fn yardstick_free_select_info(info: *mut YardstickSelectInfo) {
+    call_ffi!(FN_FREE_SELECT_INFO, FnFreeSelectInfo, info)
+}
 
-    /// Apply multiple replacements to SQL.
-    fn yardstick_apply_replacements(
-        sql: *const c_char,
-        replacements: *const YardstickReplacement,
-        count: usize,
-    ) -> *mut c_char;
+unsafe fn yardstick_parse_expression(expr: *const c_char) -> *mut YardstickExpressionInfo {
+    call_ffi!(FN_PARSE_EXPRESSION, FnParseExpression, expr)
+}
 
-    /// Free a string allocated by yardstick functions.
-    fn yardstick_free_string(ptr: *mut c_char);
+unsafe fn yardstick_free_expression_info(info: *mut YardstickExpressionInfo) {
+    call_ffi!(FN_FREE_EXPRESSION_INFO, FnFreeExpressionInfo, info)
+}
 
-    /// Expand a single AGGREGATE() call to SQL.
-    fn yardstick_expand_aggregate_call(
-        measure_name: *const c_char,
-        agg_func: *const c_char,
-        modifiers: *const YardstickAtModifier,
-        modifier_count: usize,
-        table_name: *const c_char,
-        outer_alias: *const c_char,
-        outer_where: *const c_char,
-        group_by_cols: *const *const c_char,
-        group_by_count: usize,
-    ) -> *mut c_char;
+unsafe fn yardstick_parse_create_view(sql: *const c_char) -> *mut YardstickCreateViewInfo {
+    call_ffi!(FN_PARSE_CREATE_VIEW, FnParseCreateView, sql)
+}
+
+unsafe fn yardstick_free_create_view_info(info: *mut YardstickCreateViewInfo) {
+    call_ffi!(FN_FREE_CREATE_VIEW_INFO, FnFreeCreateViewInfo, info)
+}
+
+unsafe fn yardstick_replace_range(sql: *const c_char, start: u32, end: u32, replacement: *const c_char) -> *mut c_char {
+    call_ffi!(FN_REPLACE_RANGE, FnReplaceRange, sql, start, end, replacement)
+}
+
+unsafe fn yardstick_apply_replacements(sql: *const c_char, replacements: *const YardstickReplacement, count: usize) -> *mut c_char {
+    call_ffi!(FN_APPLY_REPLACEMENTS, FnApplyReplacements, sql, replacements, count)
+}
+
+unsafe fn yardstick_free_string(ptr: *mut c_char) {
+    call_ffi!(FN_FREE_STRING, FnFreeString, ptr)
+}
+
+unsafe fn yardstick_expand_aggregate_call(
+    measure_name: *const c_char,
+    agg_func: *const c_char,
+    modifiers: *const YardstickAtModifier,
+    modifier_count: usize,
+    table_name: *const c_char,
+    outer_alias: *const c_char,
+    outer_where: *const c_char,
+    group_by_cols: *const *const c_char,
+    group_by_count: usize,
+) -> *mut c_char {
+    call_ffi!(FN_EXPAND_AGGREGATE_CALL, FnExpandAggregateCall,
+        measure_name, agg_func, modifiers, modifier_count,
+        table_name, outer_alias, outer_where, group_by_cols, group_by_count)
 }
 
 // =============================================================================
