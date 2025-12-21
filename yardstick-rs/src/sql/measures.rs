@@ -19,14 +19,9 @@ use nom::{
     IResult,
 };
 use once_cell::sync::Lazy;
-use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem,
-    SetExpr, Statement, TableFactor,
-};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 use crate::error::{Result, YardstickError};
+use crate::parser_ffi::{self, SelectInfo};
 
 // =============================================================================
 // Data Structures
@@ -693,17 +688,14 @@ pub fn extract_where_clause(sql: &str) -> Option<String> {
 // Nom Parsers - Expression Helpers
 // =============================================================================
 
-/// Parse aggregation function name: SUM, COUNT, AVG, MIN, MAX, etc.
+/// Parse aggregation function name - accepts any identifier followed by (
+/// This allows all DuckDB aggregate functions to work as measures
 fn agg_function_name(input: &str) -> IResult<&str, &str> {
-    alt((
-        tag_no_case("SUM"),
-        tag_no_case("COUNT"),
-        tag_no_case("AVG"),
-        tag_no_case("MIN"),
-        tag_no_case("MAX"),
-        tag_no_case("STDDEV"),
-        tag_no_case("VARIANCE"),
-    ))(input)
+    // Match any identifier (alphanumeric + underscore) that's followed by (
+    let (remaining, name) = nom::bytes::complete::take_while1(|c: char| c.is_alphanumeric() || c == '_')(input)?;
+    // Verify it's followed by a paren (but don't consume it)
+    let _ = nom::character::complete::char('(')(remaining)?;
+    Ok((remaining, name))
 }
 
 /// Extract aggregation function from expression like "SUM(amount)"
@@ -715,20 +707,131 @@ pub fn extract_agg_function(expr: &str) -> String {
 
 /// Extract aggregation function name from full expression
 /// "SUM(amount)" -> "sum"
+/// "COUNT(DISTINCT x)" -> "count"
 pub fn extract_aggregation_function(expr: &str) -> Option<String> {
     let (_, (name, _)) = function_call(expr.trim()).ok()?;
     Some(name.to_lowercase())
 }
 
+/// Check if expression contains DISTINCT modifier
+/// "COUNT(DISTINCT region)" -> true
+fn has_distinct_modifier(expr: &str) -> bool {
+    let expr_upper = expr.to_uppercase();
+    // Look for DISTINCT after opening paren
+    if let Some(paren_pos) = expr_upper.find('(') {
+        let after_paren = &expr_upper[paren_pos + 1..];
+        after_paren.trim_start().starts_with("DISTINCT")
+    } else {
+        false
+    }
+}
+
+/// Non-decomposable aggregate functions that cannot be re-aggregated
+const NON_DECOMPOSABLE_AGGREGATES: &[&str] = &[
+    "MEDIAN",
+    "PERCENTILE_CONT",
+    "PERCENTILE_DISC",
+    "MODE",
+    "QUANTILE",
+    "QUANTILE_CONT",
+    "QUANTILE_DISC",
+];
+
+/// Check if expression uses a non-decomposable aggregate
+/// Returns Some(reason) if non-decomposable, None if OK
+fn check_non_decomposable(expr: &str) -> Option<String> {
+    // Check for DISTINCT (e.g., COUNT(DISTINCT x))
+    if has_distinct_modifier(expr) {
+        return Some(format!(
+            "DISTINCT aggregates cannot be re-aggregated with AT modifiers. \
+             Expression '{}' uses DISTINCT which is not decomposable.",
+            expr
+        ));
+    }
+
+    // Check for non-decomposable functions
+    let expr_upper = expr.to_uppercase();
+    for agg in NON_DECOMPOSABLE_AGGREGATES {
+        if expr_upper.contains(&format!("{agg}(")) {
+            return Some(format!(
+                "{} cannot be re-aggregated with AT modifiers. \
+                 Use decomposable aggregates (SUM, COUNT, MIN, MAX, AVG) instead.",
+                agg
+            ));
+        }
+    }
+
+    None
+}
+
+/// Look up a measure's original expression
+fn get_measure_expression(measure_name: &str, default_table: &str) -> Option<String> {
+    let views = MEASURE_VIEWS.lock().unwrap();
+
+    // Check default table first
+    if let Some(v) = views.get(default_table) {
+        if let Some(m) = v
+            .measures
+            .iter()
+            .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
+        {
+            return Some(m.expression.clone());
+        }
+    }
+
+    // Search other views
+    views.values().find_map(|v| {
+        v.measures
+            .iter()
+            .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
+            .map(|m| m.expression.clone())
+    })
+}
+
 /// Find any aggregation function inside an expression
 /// "CASE WHEN SUM(x) > 100 THEN 1 ELSE 0 END" -> Some("sum")
 fn find_aggregation_in_expression(expr: &str) -> Option<String> {
+    // Look for any function call pattern: identifier followed by (
+    // This allows all DuckDB aggregate functions to work
     let expr_upper = expr.to_uppercase();
-    for agg in ["SUM", "COUNT", "AVG", "MIN", "MAX"] {
+
+    // Common aggregates to check first (for performance)
+    let common_aggs = [
+        "SUM", "COUNT", "AVG", "MIN", "MAX", "MEDIAN", "STDDEV", "STDDEV_POP",
+        "STDDEV_SAMP", "VARIANCE", "VAR_POP", "VAR_SAMP", "STRING_AGG",
+        "ARRAY_AGG", "LIST", "FIRST", "LAST", "MODE", "QUANTILE",
+    ];
+
+    for agg in common_aggs {
         if expr_upper.contains(&format!("{agg}(")) {
             return Some(agg.to_lowercase());
         }
     }
+
+    // Fallback: look for any identifier followed by ( that could be an aggregate
+    // This catches custom aggregates
+    let chars: Vec<char> = expr.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        // Look for start of identifier
+        if chars[i].is_alphabetic() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            // Check if followed by (
+            if i < chars.len() && chars[i] == '(' {
+                let name: String = chars[start..i].iter().collect();
+                // Skip known non-aggregates
+                let name_upper = name.to_uppercase();
+                if !["CASE", "WHEN", "THEN", "ELSE", "END", "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN", "CAST", "COALESCE", "NULLIF", "IF", "IIF"].contains(&name_upper.as_str()) {
+                    return Some(name.to_lowercase());
+                }
+            }
+        }
+        i += 1;
+    }
+
     None
 }
 
@@ -1127,6 +1230,7 @@ fn find_expression_start(sql: &str, end: usize) -> usize {
 // =============================================================================
 
 /// Expand AGGREGATE() function calls in a SELECT statement
+/// Uses position-based replacement with the C++ FFI parser
 pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
     if !has_aggregate_function(sql) {
         return AggregateExpandResult {
@@ -1136,9 +1240,9 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
         };
     }
 
-    let dialect = GenericDialect {};
-    let statements = match Parser::parse_sql(&dialect, sql) {
-        Ok(s) => s,
+    // Parse the SQL to get table info and GROUP BY columns
+    let select_info = match parser_ffi::parse_select(sql) {
+        Ok(info) => info,
         Err(e) => {
             return AggregateExpandResult {
                 had_aggregate: false,
@@ -1148,185 +1252,152 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
         }
     };
 
-    if statements.is_empty() {
+    // Get the primary table name
+    let table_name = select_info.primary_table.clone().unwrap_or_default();
+
+    // Get measure view if this table has one
+    let views = MEASURE_VIEWS.lock().unwrap();
+    let measure_view = views.get(&table_name);
+
+    // Extract all AGGREGATE() calls (without AT modifiers)
+    let mut aggregate_calls = extract_all_aggregate_calls(sql);
+
+    if aggregate_calls.is_empty() {
         return AggregateExpandResult {
             had_aggregate: false,
             expanded_sql: sql.to_string(),
-            error: Some("Empty SQL".to_string()),
-        };
-    }
-
-    match &statements[0] {
-        Statement::Query(query) => match expand_aggregate_in_query(query) {
-            Ok(expanded) => AggregateExpandResult {
-                had_aggregate: true,
-                expanded_sql: expanded.to_string(),
-                error: None,
-            },
-            Err(e) => AggregateExpandResult {
-                had_aggregate: false,
-                expanded_sql: sql.to_string(),
-                error: Some(e.to_string()),
-            },
-        },
-        _ => AggregateExpandResult {
-            had_aggregate: false,
-            expanded_sql: sql.to_string(),
             error: None,
-        },
-    }
-}
-
-fn expand_aggregate_in_query(query: &Query) -> Result<Query> {
-    let body = match &*query.body {
-        SetExpr::Select(select) => {
-            let expanded = expand_aggregate_in_select(select)?;
-            SetExpr::Select(Box::new(expanded))
-        }
-        other => other.clone(),
-    };
-
-    Ok(Query {
-        body: Box::new(body),
-        ..query.clone()
-    })
-}
-
-fn expand_aggregate_in_select(select: &Select) -> Result<Select> {
-    let table_name = extract_table_name(select);
-    let views = MEASURE_VIEWS.lock().unwrap();
-    let measure_view = table_name.as_ref().and_then(|name| views.get(name));
-
-    let mut dimension_columns: Vec<Expr> = Vec::new();
-    let mut has_aggregate = false;
-
-    for item in &select.projection {
-        let (expr, is_agg) = match item {
-            SelectItem::UnnamedExpr(expr) => (Some(expr.clone()), contains_aggregate(expr)),
-            SelectItem::ExprWithAlias { expr, .. } => {
-                (Some(expr.clone()), contains_aggregate(expr))
-            }
-            _ => (None, false),
         };
-        if is_agg {
-            has_aggregate = true;
-        } else if let Some(e) = expr {
-            dimension_columns.push(e);
-        }
     }
 
-    let projection: Vec<SelectItem> = select
-        .projection
-        .iter()
-        .map(|item| expand_aggregate_in_select_item(item, measure_view, Some(&views)))
-        .collect::<Result<Vec<_>>>()?;
+    // Sort by position descending for safe replacement
+    aggregate_calls.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let group_by = if has_aggregate
-        && select.group_by == sqlparser::ast::GroupByExpr::Expressions(vec![], vec![])
-    {
-        // Add GROUP BY with dimensions, or GROUP BY () for scalar aggregation
-        sqlparser::ast::GroupByExpr::Expressions(dimension_columns, vec![])
-    } else {
-        select.group_by.clone()
-    };
-
-    Ok(Select {
-        projection,
-        group_by,
-        ..select.clone()
-    })
-}
-
-fn contains_aggregate(expr: &Expr) -> bool {
-    match expr {
-        Expr::Function(func) => func.name.to_string().to_uppercase() == "AGGREGATE",
-        Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
-        Expr::Nested(inner) => contains_aggregate(inner),
-        // Scalar subqueries shouldn't go in GROUP BY - they're self-contained
-        Expr::Subquery(_) => true,
-        _ => false,
-    }
-}
-
-fn extract_table_name(select: &Select) -> Option<String> {
-    select.from.first().and_then(|table| {
-        if let sqlparser::ast::TableFactor::Table { name, .. } = &table.relation {
-            name.0.first().map(|i| i.value.clone())
-        } else {
-            None
-        }
-    })
-}
-
-// =============================================================================
-// AST-based FROM clause extraction (for JOIN support)
-// =============================================================================
-
-/// Extract table info from a TableFactor AST node
-#[allow(dead_code)] // Used in tests; useful for future full JOIN support
-fn extract_table_info_from_factor(factor: &TableFactor) -> Option<TableInfo> {
-    match factor {
-        TableFactor::Table { name, alias, .. } => {
-            let table_name = name.0.first()?.value.clone();
-            let (effective_name, has_alias) = match alias {
-                Some(a) => (a.name.value.clone(), true),
-                None => (table_name.clone(), false),
-            };
-            Some(TableInfo {
-                name: table_name,
-                effective_name,
-                has_alias,
-            })
-        }
-        TableFactor::Derived { alias, .. } => {
-            // Derived tables (subqueries) - use alias as both name and effective_name
-            alias.as_ref().map(|a| TableInfo {
-                name: a.name.value.clone(),
-                effective_name: a.name.value.clone(),
-                has_alias: true,
-            })
-        }
-        TableFactor::NestedJoin {
-            table_with_joins,
-            alias,
-        } => {
-            // For nested joins, prefer the alias if present
-            if let Some(a) = alias {
-                Some(TableInfo {
-                    name: a.name.value.clone(),
-                    effective_name: a.name.value.clone(),
-                    has_alias: true,
-                })
-            } else {
-                // Recursively get primary table from nested join
-                extract_table_info_from_factor(&table_with_joins.relation)
+    // Check for non-decomposable aggregates
+    if let Some(mv) = measure_view {
+        for (measure_name, _, _) in &aggregate_calls {
+            if let Some(m) = mv.measures.iter().find(|m| m.column_name.eq_ignore_ascii_case(measure_name)) {
+                if let Some(error_msg) = check_non_decomposable(&m.expression) {
+                    return AggregateExpandResult {
+                        had_aggregate: true,
+                        expanded_sql: sql.to_string(),
+                        error: Some(error_msg),
+                    };
+                }
             }
         }
-        _ => None,
+    }
+
+    // Build replacements
+    let mut result_sql = sql.to_string();
+
+    for (measure_name, start, end) in aggregate_calls {
+        // Look up measure definition
+        let expanded = if let Some(mv) = measure_view {
+            if let Some(m) = mv
+                .measures
+                .iter()
+                .find(|m| m.column_name.eq_ignore_ascii_case(&measure_name))
+            {
+                // Get aggregation function from measure expression
+                if let Some(agg_fn) = extract_aggregation_function(&m.expression) {
+                    format!("{agg_fn}({measure_name})")
+                } else if let Some(agg_fn) = find_aggregation_in_expression(&m.expression) {
+                    format!("{agg_fn}({measure_name})")
+                } else {
+                    // Check if derived measure
+                    let expanded_expr = expand_derived_measure_expr(&m.expression, mv);
+                    if expanded_expr != m.expression {
+                        expanded_expr
+                    } else {
+                        format!("SUM({measure_name})")
+                    }
+                }
+            } else {
+                format!("SUM({measure_name})")
+            }
+        } else {
+            format!("SUM({measure_name})")
+        };
+
+        result_sql = format!("{}{}{}", &result_sql[..start], expanded, &result_sql[end..]);
+    }
+
+    // Check if we need to add GROUP BY
+    let result_upper = result_sql.to_uppercase();
+    if !result_upper.contains("GROUP BY") {
+        // Extract dimension columns (non-aggregate items)
+        let dim_cols = extract_dimension_columns_from_select_info(&select_info);
+        if !dim_cols.is_empty() {
+            // Find insertion point
+            let insert_pos = ["ORDER BY", "LIMIT", "HAVING", ";"]
+                .iter()
+                .filter_map(|kw| result_upper.find(kw))
+                .min()
+                .unwrap_or(result_sql.len());
+
+            result_sql = format!(
+                "{} GROUP BY {}{}",
+                result_sql[..insert_pos].trim_end(),
+                dim_cols.join(", "),
+                if insert_pos < result_sql.len() {
+                    format!(" {}", result_sql[insert_pos..].trim_start())
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+
+    AggregateExpandResult {
+        had_aggregate: true,
+        expanded_sql: result_sql,
+        error: None,
     }
 }
 
-/// Extract all tables from a SELECT's FROM clause, including JOINs
-#[allow(dead_code)] // Used in tests; useful for future full JOIN support
-fn extract_from_clause_info(select: &Select) -> FromClauseInfo {
+/// Extract dimension (non-aggregate) columns from SelectInfo
+fn extract_dimension_columns_from_select_info(info: &SelectInfo) -> Vec<String> {
+    info.items
+        .iter()
+        .filter(|item| !item.is_aggregate && !item.is_star && !item.is_measure_ref)
+        .map(|item| {
+            // Use alias if present, otherwise expression
+            item.alias
+                .clone()
+                .unwrap_or_else(|| item.expression_sql.clone())
+        })
+        .collect()
+}
+
+// =============================================================================
+// FROM clause extraction (for JOIN support)
+// =============================================================================
+
+/// Extract all tables from a SELECT's FROM clause using the FFI parser
+/// Returns a FromClauseInfo with tables from the parsed SQL
+#[allow(dead_code)] // Used in tests (marked as ignore, require C++ library)
+fn extract_from_clause_info_ffi(sql: &str) -> FromClauseInfo {
     let mut info = FromClauseInfo::default();
 
-    for (i, table_with_joins) in select.from.iter().enumerate() {
-        // Extract the main relation
-        if let Some(table_info) = extract_table_info_from_factor(&table_with_joins.relation) {
+    if let Ok(select_info) = parser_ffi::parse_select(sql) {
+        for (i, table_ref) in select_info.tables.iter().enumerate() {
+            let effective_name = table_ref
+                .alias
+                .clone()
+                .unwrap_or_else(|| table_ref.table_name.clone());
+            let has_alias = table_ref.alias.is_some();
+
+            let table_info = TableInfo {
+                name: table_ref.table_name.clone(),
+                effective_name: effective_name.clone(),
+                has_alias,
+            };
+
             if i == 0 && info.primary_table.is_none() {
                 info.primary_table = Some(table_info.clone());
             }
-            info.tables
-                .insert(table_info.effective_name.clone(), table_info);
-        }
-
-        // Extract all JOINed tables
-        for join in &table_with_joins.joins {
-            if let Some(table_info) = extract_table_info_from_factor(&join.relation) {
-                info.tables
-                    .insert(table_info.effective_name.clone(), table_info);
-            }
+            info.tables.insert(effective_name, table_info);
         }
     }
 
@@ -1391,156 +1462,6 @@ fn find_alias_for_view<'a>(from_info: &'a FromClauseInfo, view_name: &str) -> Op
         .values()
         .find(|t| t.name.eq_ignore_ascii_case(view_name))
         .map(|t| t.effective_name.as_str())
-}
-
-fn expand_aggregate_in_select_item(
-    item: &SelectItem,
-    measure_view: Option<&MeasureView>,
-    all_views: Option<MeasureViewsRef>,
-) -> Result<SelectItem> {
-    match item {
-        SelectItem::UnnamedExpr(expr) => {
-            let expanded = expand_aggregate_in_expr(expr, measure_view, all_views)?;
-            Ok(SelectItem::UnnamedExpr(expanded))
-        }
-        SelectItem::ExprWithAlias { expr, alias } => {
-            let expanded = expand_aggregate_in_expr(expr, measure_view, all_views)?;
-            Ok(SelectItem::ExprWithAlias {
-                expr: expanded,
-                alias: alias.clone(),
-            })
-        }
-        other => Ok(other.clone()),
-    }
-}
-
-/// All measure views available for lookup (passed to avoid re-locking)
-type MeasureViewsRef<'a> = &'a HashMap<String, MeasureView>;
-
-fn expand_aggregate_in_expr(
-    expr: &Expr,
-    measure_view: Option<&MeasureView>,
-    all_views: Option<MeasureViewsRef>,
-) -> Result<Expr> {
-    match expr {
-        Expr::Function(func) => {
-            let func_name = func.name.to_string().to_uppercase();
-
-            if func_name == "AGGREGATE" {
-                let measure_name = extract_aggregate_arg(func)?;
-
-                // First try the primary measure view
-                let mut measure = measure_view
-                    .and_then(|mv| mv.measures.iter().find(|m| m.column_name == measure_name));
-
-                // For JOINs: if not found in primary view, search all registered views
-                let mut fallback_view: Option<&MeasureView> = None;
-                if measure.is_none() {
-                    if let Some(views) = all_views {
-                        for v in views.values() {
-                            if let Some(m) = v
-                                .measures
-                                .iter()
-                                .find(|m| m.column_name.eq_ignore_ascii_case(&measure_name))
-                            {
-                                measure = Some(m);
-                                fallback_view = Some(v);
-                                break;
-                            }
-                        }
-                    }
-                }
-                let effective_view = fallback_view.or(measure_view);
-
-                if let Some(m) = measure {
-                    let dialect = GenericDialect {};
-
-                    // Try to extract aggregation function (e.g., SUM, COUNT)
-                    // If that fails, look for aggregation inside the expression (e.g., CASE WHEN SUM(x)...)
-                    // Then use that aggregation on the measure column
-                    let expr_sql = if let Some(agg_fn) = extract_aggregation_function(&m.expression)
-                    {
-                        format!("SELECT {agg_fn}({measure_name})")
-                    } else if let Some(agg_fn) = find_aggregation_in_expression(&m.expression) {
-                        // CASE WHEN SUM(x) > 100... → use SUM(measure_column)
-                        format!("SELECT {agg_fn}({measure_name})")
-                    } else if let Some(mv) = effective_view {
-                        // Check if this is a derived measure (references other measures)
-                        let expanded = expand_derived_measure_expr(&m.expression, mv);
-                        if expanded != m.expression {
-                            // Successfully expanded derived measure
-                            format!("SELECT {expanded}")
-                        } else {
-                            // No aggregation found, default to SUM
-                            format!("SELECT SUM({measure_name})")
-                        }
-                    } else {
-                        // No aggregation found, default to SUM
-                        format!("SELECT SUM({measure_name})")
-                    };
-
-                    let stmts = Parser::parse_sql(&dialect, &expr_sql)
-                        .map_err(|e| YardstickError::SqlParse(e.to_string()))?;
-
-                    if let Some(Statement::Query(q)) = stmts.into_iter().next() {
-                        if let SetExpr::Select(s) = *q.body {
-                            if let Some(SelectItem::UnnamedExpr(e)) =
-                                s.projection.into_iter().next()
-                            {
-                                return Ok(e);
-                            }
-                        }
-                    }
-                }
-
-                return Err(YardstickError::Validation(format!(
-                    "Measure '{measure_name}' not found"
-                )));
-            }
-
-            Ok(Expr::Function(func.clone()))
-        }
-        Expr::BinaryOp { left, op, right } => {
-            let left = expand_aggregate_in_expr(left, measure_view, all_views)?;
-            let right = expand_aggregate_in_expr(right, measure_view, all_views)?;
-            Ok(Expr::BinaryOp {
-                left: Box::new(left),
-                op: op.clone(),
-                right: Box::new(right),
-            })
-        }
-        Expr::Nested(inner) => {
-            let inner = expand_aggregate_in_expr(inner, measure_view, all_views)?;
-            Ok(Expr::Nested(Box::new(inner)))
-        }
-        other => Ok(other.clone()),
-    }
-}
-
-fn extract_aggregate_arg(func: &Function) -> Result<String> {
-    match &func.args {
-        FunctionArguments::List(args) => {
-            if args.args.is_empty() {
-                return Err(YardstickError::Validation(
-                    "AGGREGATE() requires a measure name".to_string(),
-                ));
-            }
-            match &args.args[0] {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
-                    Ok(ident.value.clone())
-                }
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
-                    Ok(parts.last().map(|i| i.value.clone()).unwrap_or_default())
-                }
-                _ => Err(YardstickError::Validation(
-                    "AGGREGATE() argument must be a measure name".to_string(),
-                )),
-            }
-        }
-        _ => Err(YardstickError::Validation(
-            "AGGREGATE() requires arguments".to_string(),
-        )),
-    }
 }
 
 // =============================================================================
@@ -2112,9 +2033,24 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     }
 
     // Extract table info using string-based approach (works with AGGREGATE syntax)
-    // Note: sqlparser can't parse AGGREGATE() since it's not standard SQL
+    // Note: DuckDB's parser can't parse AGGREGATE() since it's our custom syntax
     let (primary_table_name, existing_alias) =
         extract_table_and_alias_from_sql(sql).unwrap_or_else(|| ("t".to_string(), None));
+
+    // Check for non-decomposable aggregates used with AT modifiers
+    for (measure_name, modifiers, _, _) in &at_patterns {
+        if !modifiers.is_empty() {
+            if let Some(expr) = get_measure_expression(measure_name, &primary_table_name) {
+                if let Some(error_msg) = check_non_decomposable(&expr) {
+                    return AggregateExpandResult {
+                        had_aggregate: true,
+                        expanded_sql: sql.to_string(),
+                        error: Some(error_msg),
+                    };
+                }
+            }
+        }
+    }
 
     // Build FromClauseInfo from string-based extraction for now
     // TODO: For proper JOIN support, we'd need to extract all tables from the FROM clause
@@ -3043,77 +2979,57 @@ GROUP BY s.year";
     }
 
     // =========================================================================
-    // JOIN Support Tests
+    // JOIN Support Tests (using FFI parser)
     // =========================================================================
 
     #[test]
+    #[ignore = "requires C++ library to be linked"]
     fn test_extract_from_clause_info_simple() {
-        let dialect = GenericDialect {};
         let sql = "SELECT * FROM orders";
-        let statements = Parser::parse_sql(&dialect, sql).unwrap();
-        if let Statement::Query(q) = &statements[0] {
-            if let SetExpr::Select(s) = &*q.body {
-                let info = extract_from_clause_info(s);
-                assert_eq!(info.tables.len(), 1);
-                assert!(info.tables.contains_key("orders"));
-                assert_eq!(info.primary_table.as_ref().unwrap().name, "orders");
-                assert!(!info.primary_table.as_ref().unwrap().has_alias);
-            }
-        }
+        let info = extract_from_clause_info_ffi(sql);
+        assert_eq!(info.tables.len(), 1);
+        assert!(info.tables.contains_key("orders"));
+        assert_eq!(info.primary_table.as_ref().unwrap().name, "orders");
+        assert!(!info.primary_table.as_ref().unwrap().has_alias);
     }
 
     #[test]
+    #[ignore = "requires C++ library to be linked"]
     fn test_extract_from_clause_info_with_alias() {
-        let dialect = GenericDialect {};
         let sql = "SELECT * FROM orders o";
-        let statements = Parser::parse_sql(&dialect, sql).unwrap();
-        if let Statement::Query(q) = &statements[0] {
-            if let SetExpr::Select(s) = &*q.body {
-                let info = extract_from_clause_info(s);
-                assert_eq!(info.tables.len(), 1);
-                assert!(info.tables.contains_key("o"));
-                let pt = info.primary_table.as_ref().unwrap();
-                assert_eq!(pt.name, "orders");
-                assert_eq!(pt.effective_name, "o");
-                assert!(pt.has_alias);
-            }
-        }
+        let info = extract_from_clause_info_ffi(sql);
+        assert_eq!(info.tables.len(), 1);
+        assert!(info.tables.contains_key("o"));
+        let pt = info.primary_table.as_ref().unwrap();
+        assert_eq!(pt.name, "orders");
+        assert_eq!(pt.effective_name, "o");
+        assert!(pt.has_alias);
     }
 
     #[test]
+    #[ignore = "requires C++ library to be linked"]
     fn test_extract_from_clause_info_join() {
-        let dialect = GenericDialect {};
         let sql = "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id";
-        let statements = Parser::parse_sql(&dialect, sql).unwrap();
-        if let Statement::Query(q) = &statements[0] {
-            if let SetExpr::Select(s) = &*q.body {
-                let info = extract_from_clause_info(s);
-                eprintln!("Tables: {:?}", info.tables);
-                assert_eq!(info.tables.len(), 2);
-                assert!(info.tables.contains_key("o"));
-                assert!(info.tables.contains_key("c"));
-                assert_eq!(info.tables.get("o").unwrap().name, "orders");
-                assert_eq!(info.tables.get("c").unwrap().name, "customers");
-            }
-        }
+        let info = extract_from_clause_info_ffi(sql);
+        eprintln!("Tables: {:?}", info.tables);
+        assert_eq!(info.tables.len(), 2);
+        assert!(info.tables.contains_key("o"));
+        assert!(info.tables.contains_key("c"));
+        assert_eq!(info.tables.get("o").unwrap().name, "orders");
+        assert_eq!(info.tables.get("c").unwrap().name, "customers");
     }
 
     #[test]
+    #[ignore = "requires C++ library to be linked"]
     fn test_extract_from_clause_info_multiple_joins() {
-        let dialect = GenericDialect {};
         let sql = "SELECT * FROM orders o \
                    JOIN customers c ON o.customer_id = c.id \
                    LEFT JOIN products p ON o.product_id = p.id";
-        let statements = Parser::parse_sql(&dialect, sql).unwrap();
-        if let Statement::Query(q) = &statements[0] {
-            if let SetExpr::Select(s) = &*q.body {
-                let info = extract_from_clause_info(s);
-                assert_eq!(info.tables.len(), 3);
-                assert!(info.tables.contains_key("o"));
-                assert!(info.tables.contains_key("c"));
-                assert!(info.tables.contains_key("p"));
-            }
-        }
+        let info = extract_from_clause_info_ffi(sql);
+        assert_eq!(info.tables.len(), 3);
+        assert!(info.tables.contains_key("o"));
+        assert!(info.tables.contains_key("c"));
+        assert!(info.tables.contains_key("p"));
     }
 
     #[test]
@@ -3143,24 +3059,19 @@ GROUP BY s.year";
     }
 
     #[test]
+    #[ignore = "requires C++ library to be linked"]
     fn test_find_alias_for_view() {
-        let dialect = GenericDialect {};
         let sql = "SELECT * FROM orders_v o JOIN customers c ON o.id = c.order_id";
-        let statements = Parser::parse_sql(&dialect, sql).unwrap();
-        if let Statement::Query(q) = &statements[0] {
-            if let SetExpr::Select(s) = &*q.body {
-                let info = extract_from_clause_info(s);
+        let info = extract_from_clause_info_ffi(sql);
 
-                // orders_v has alias "o"
-                assert_eq!(find_alias_for_view(&info, "orders_v"), Some("o"));
+        // orders_v has alias "o"
+        assert_eq!(find_alias_for_view(&info, "orders_v"), Some("o"));
 
-                // customers has alias "c"
-                assert_eq!(find_alias_for_view(&info, "customers"), Some("c"));
+        // customers has alias "c"
+        assert_eq!(find_alias_for_view(&info, "customers"), Some("c"));
 
-                // nonexistent table
-                assert_eq!(find_alias_for_view(&info, "nonexistent"), None);
-            }
-        }
+        // nonexistent table
+        assert_eq!(find_alias_for_view(&info, "nonexistent"), None);
     }
 
     #[test]

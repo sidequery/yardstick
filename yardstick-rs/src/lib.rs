@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod ffi;
+pub mod parser_ffi;
 pub mod sql;
 
 pub use error::{Result, YardstickError};

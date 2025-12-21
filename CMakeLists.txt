@@ -11,6 +11,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 include_directories(src/include)
+include_directories(include)
 
 # Detect Rust target based on platform
 execute_process(
@@ -82,7 +83,10 @@ corrosion_import_crate(MANIFEST_PATH "${CMAKE_CURRENT_SOURCE_DIR}/yardstick-rs/C
 # Include Rust library headers
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/yardstick-rs/include)
 
-set(EXTENSION_SOURCES src/yardstick_extension.cpp)
+set(EXTENSION_SOURCES
+    src/yardstick_extension.cpp
+    src/yardstick_parser_ffi.cpp
+)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
