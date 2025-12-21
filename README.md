@@ -1,6 +1,6 @@
 # Yardstick
 
-An experimental DuckDB extension implementing Julian Hyde's "Measures in SQL" paper ([arXiv:2406.00251](https://arxiv.org/abs/2406.00251)).
+A DuckDB extension implementing Julian Hyde's "Measures in SQL" paper ([arXiv:2406.00251](https://arxiv.org/abs/2406.00251)).
 
 ## What is this?
 
@@ -107,7 +107,7 @@ SELECT
 FROM table;
 ```
 
-Yardstick automatically handles the grouping. Supported aggregations: `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`
+Yardstick automatically handles the grouping. All DuckDB aggregate functions are supported.
 
 ### Querying Measures
 
@@ -152,6 +152,7 @@ The extension will be at `build/release/extension/yardstick/yardstick.duckdb_ext
 See [LIMITATIONS.md](LIMITATIONS.md) for known issues and workarounds.
 
 Key limitations:
+- Non-decomposable aggregates (COUNT DISTINCT, MEDIAN, PERCENTILE) cannot use AGGREGATE()
 - Window function measures not supported
 
 ## References
