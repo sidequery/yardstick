@@ -103,6 +103,12 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} pthread dl)
 endif()
 
+# On Windows, we need these system libraries for Rust
+if(WIN32)
+    target_link_libraries(${EXTENSION_NAME} ws2_32 userenv bcrypt ntdll)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 userenv bcrypt ntdll)
+endif()
+
 install(
   TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"

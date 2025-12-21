@@ -60,6 +60,9 @@ jobs:
             duckdb_arch: osx_arm64
             rust_target: aarch64-apple-darwin
             osx_build_arch: arm64
+          - os: windows-latest
+            duckdb_arch: windows_amd64
+            rust_target: x86_64-pc-windows-msvc
     env:
       OSX_BUILD_ARCH: ${{ matrix.osx_build_arch }}
 
@@ -74,11 +77,23 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - name: Build extension
+      - name: Build extension (Unix)
+        if: runner.os != 'Windows'
         run: make release
 
+      - name: Build extension (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd yardstick-rs && cargo build --release
+          cd ..
+          mkdir -p build/release
+          cd build/release
+          cmake -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release ../..
+          cmake --build . --config Release
+
       - name: Test extension
-        if: matrix.osx_build_arch != 'x86_64'
+        if: matrix.osx_build_arch != 'x86_64' && runner.os != 'Windows'
         run: make test
 
       - name: Upload artifact
