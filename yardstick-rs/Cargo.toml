@@ -8,7 +8,6 @@ description = "Measures in SQL - A DuckDB extension implementing Julian Hyde's p
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
-sqlparser = "0.52"
 thiserror = "2.0"
 lazy_static = "1.5"
 regex = "1.10"

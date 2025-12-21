@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:arxiv.org)"
+      "WebFetch(domain:arxiv.org)",
+      "WebSearch",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:pganalyze.com)"
     ],
     "deny": [],
     "ask": []
