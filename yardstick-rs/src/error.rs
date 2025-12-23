@@ -18,6 +18,9 @@ pub enum YardstickError {
 
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error("AT modifier '{modifier}' not supported for non-decomposable measure '{measure}' (COUNT DISTINCT cannot be re-aggregated)")]
+    NonDecomposableAtModifier { modifier: String, measure: String },
 }
 
 pub type Result<T> = std::result::Result<T, YardstickError>;
