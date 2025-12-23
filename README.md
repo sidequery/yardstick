@@ -155,6 +155,10 @@ Key limitations:
 - Non-decomposable aggregates (COUNT DISTINCT, MEDIAN, PERCENTILE) cannot use AGGREGATE()
 - Window function measures not supported
 
+## Testimonials
+
+"I used this to integrate into a copilotkit chat interface serving graphs, works really well for the llm." - [JFox, DuckDB Discord](https://discord.com/channels/909674491309850675/1009741727600484382/1452672154620530749)
+
 ## References
 
 - Julian Hyde, "Measures in SQL" (2024). [arXiv:2406.00251](https://arxiv.org/abs/2406.00251)
