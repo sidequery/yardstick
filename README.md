@@ -107,7 +107,7 @@ SELECT
 FROM table;
 ```
 
-Yardstick automatically handles the grouping. All DuckDB aggregate functions are supported.
+Yardstick automatically handles the grouping. All DuckDB aggregate functions are supported, including `COUNT(DISTINCT)` with some restrictions (see below).
 
 ### Querying Measures
 
@@ -133,6 +133,32 @@ FROM view_name;
 | `AT (WHERE cond)` | Pre-aggregation filter | `AGGREGATE(revenue) AT (WHERE region = 'US')` |
 | `AT (VISIBLE)` | Use query's WHERE clause | `AGGREGATE(revenue) AT (VISIBLE)` |
 
+### COUNT(DISTINCT) Measures
+
+`COUNT(DISTINCT)` is a non-decomposable aggregate: you can't sum distinct counts from subsets without double-counting. Yardstick handles this by deferring evaluation to query time via correlated subqueries.
+
+```sql
+-- Define a COUNT(DISTINCT) measure
+CREATE VIEW orders_v AS
+SELECT year, region, COUNT(DISTINCT customer_id) AS MEASURE unique_customers
+FROM orders;
+
+-- Basic query works
+SEMANTIC SELECT year, region, AGGREGATE(unique_customers) FROM orders_v;
+
+-- AT (WHERE) works (just adds a filter)
+SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (WHERE region = 'US') FROM orders_v;
+```
+
+**Restrictions**: AT modifiers that require re-aggregation will error:
+
+```sql
+-- These will return an error:
+AGGREGATE(unique_customers) AT (ALL)          -- can't compute grand total from subset totals
+AGGREGATE(unique_customers) AT (ALL region)   -- can't remove dimension and re-aggregate
+AGGREGATE(unique_customers) AT (SET year = year - 1)  -- can't compare across contexts
+```
+
 ## Building
 
 Prerequisites:
@@ -154,6 +180,7 @@ See [LIMITATIONS.md](LIMITATIONS.md) for known issues and workarounds.
 Key limitations:
 - Non-decomposable aggregates (COUNT DISTINCT, MEDIAN, PERCENTILE) cannot use AGGREGATE()
 - Window function measures not supported
+- `COUNT(DISTINCT)` works but cannot be used with `AT (ALL)`, `AT (ALL dim)`, or `AT (SET)` modifiers
 
 ## Testimonials
 

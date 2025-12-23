@@ -32,6 +32,8 @@ use crate::parser_ffi::{self, SelectInfo};
 pub struct ViewMeasure {
     pub column_name: String,
     pub expression: String,
+    /// Whether this measure can be re-aggregated (false for COUNT DISTINCT)
+    pub is_decomposable: bool,
 }
 
 /// Stored view with measures
@@ -40,6 +42,8 @@ pub struct MeasureView {
     pub view_name: String,
     pub measures: Vec<ViewMeasure>,
     pub base_query: String,
+    /// Base table name for deferred evaluation of non-decomposable measures
+    pub base_table: Option<String>,
 }
 
 /// Global storage for measure views (in-memory catalog)
@@ -835,6 +839,18 @@ fn find_aggregation_in_expression(expr: &str) -> Option<String> {
     None
 }
 
+/// Check if an expression contains COUNT(DISTINCT ...) which is non-decomposable
+/// "COUNT(DISTINCT user_id)" -> true
+/// "COUNT(user_id)" -> false
+/// "SUM(amount)" -> false
+pub fn is_count_distinct(expr: &str) -> bool {
+    let expr_upper = expr.to_uppercase();
+    // Match COUNT followed by optional whitespace, (, optional whitespace, DISTINCT
+    // This handles: COUNT(DISTINCT x), COUNT( DISTINCT x), COUNT (DISTINCT x)
+    let patterns = ["COUNT(DISTINCT", "COUNT( DISTINCT", "COUNT (DISTINCT"];
+    patterns.iter().any(|p| expr_upper.contains(p))
+}
+
 /// Expand derived measure expression by replacing measure references with their aggregations
 /// "revenue - cost" with measures [revenue=SUM(amount), cost=SUM(expense)]
 /// -> "SUM(revenue) - SUM(cost)"
@@ -988,13 +1004,14 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
     let result = extract_measures_from_sql(sql);
 
     match result {
-        Ok((clean_sql, measures, view_name)) => {
+        Ok((clean_sql, measures, view_name, base_table)) => {
             if !measures.is_empty() {
                 if let Some(ref vn) = view_name {
                     let measure_view = MeasureView {
                         view_name: vn.clone(),
                         measures: measures.clone(),
                         base_query: clean_sql.clone(),
+                        base_table,
                     };
 
                     let mut views = MEASURE_VIEWS.lock().unwrap();
@@ -1021,8 +1038,12 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
 }
 
 /// Extract measures from SQL using nom-based parsing
-fn extract_measures_from_sql(sql: &str) -> Result<(String, Vec<ViewMeasure>, Option<String>)> {
+/// Returns (clean_sql, measures, view_name, base_table)
+fn extract_measures_from_sql(
+    sql: &str,
+) -> Result<(String, Vec<ViewMeasure>, Option<String>, Option<String>)> {
     let view_name = extract_view_name(sql);
+    let base_table = extract_table_name_from_sql(sql);
     let sql_upper = sql.to_uppercase();
 
     // First pass: collect all measures with positions
@@ -1090,13 +1111,15 @@ fn extract_measures_from_sql(sql: &str) -> Result<(String, Vec<ViewMeasure>, Opt
         false
     };
 
-    // Generate replacements based on whether measure is base or derived
-    // (start, end, replacement) - for derived, we remove the whole column
+    // Generate replacements based on whether measure is base, derived, or non-decomposable
+    // (start, end, replacement) - for derived/non-decomposable, we remove the whole column
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
 
     for info in &measure_infos {
-        if is_derived(&info.expression) {
-            // Derived measure: remove entire column including preceding comma
+        let should_exclude = is_derived(&info.expression) || is_count_distinct(&info.expression);
+
+        if should_exclude {
+            // Derived or non-decomposable measure: remove entire column including preceding comma
             let mut remove_start = info.expr_start;
             // Look for preceding comma
             let before = &sql[..remove_start];
@@ -1123,6 +1146,7 @@ fn extract_measures_from_sql(sql: &str) -> Result<(String, Vec<ViewMeasure>, Opt
         .into_iter()
         .map(|m| ViewMeasure {
             column_name: m.name,
+            is_decomposable: !is_count_distinct(&m.expression),
             expression: m.expression,
         })
         .collect();
@@ -1167,7 +1191,7 @@ fn extract_measures_from_sql(sql: &str) -> Result<(String, Vec<ViewMeasure>, Opt
         );
     }
 
-    Ok((clean_sql, measures, view_name))
+    Ok((clean_sql, measures, view_name, base_table))
 }
 
 /// Find the start of an expression before AS MEASURE
@@ -1404,14 +1428,51 @@ fn extract_from_clause_info_ffi(sql: &str) -> FromClauseInfo {
     info
 }
 
-/// Look up which view contains a measure and return (agg_fn, source_view_name, derived_expr)
-/// derived_expr is Some if this is a derived measure (should use expanded expression instead of AGG(name))
+/// Information about a resolved measure
+#[derive(Debug, Clone)]
+pub struct ResolvedMeasure {
+    /// The aggregation function (SUM, COUNT, etc.)
+    pub agg_fn: String,
+    /// The source view name
+    pub source_view: String,
+    /// For derived measures: the expanded expression
+    pub derived_expr: Option<String>,
+    /// Whether this measure can be re-aggregated
+    pub is_decomposable: bool,
+    /// Base table for non-decomposable measures (for correlated subquery)
+    pub base_table: Option<String>,
+    /// The original measure expression (e.g., "COUNT(DISTINCT user_id)")
+    pub expression: String,
+}
+
+/// Look up which view contains a measure and return resolved measure info
 /// Prioritizes default_table (the query's FROM table), then searches other views for JOINs
-fn resolve_measure_source(
-    measure_name: &str,
-    default_table: &str,
-) -> (String, String, Option<String>) {
+fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMeasure {
     let views = MEASURE_VIEWS.lock().unwrap();
+
+    // Helper to build ResolvedMeasure from a found measure
+    let build_resolved = |m: &ViewMeasure, v: &MeasureView, source_view: &str| -> ResolvedMeasure {
+        let agg_fn = extract_agg_function(&m.expression);
+        let derived_expr = if extract_aggregation_function(&m.expression).is_none() {
+            let expanded = expand_derived_measure_expr(&m.expression, v);
+            if expanded != m.expression {
+                Some(expanded)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        ResolvedMeasure {
+            agg_fn,
+            source_view: source_view.to_string(),
+            derived_expr,
+            is_decomposable: m.is_decomposable,
+            base_table: v.base_table.clone(),
+            expression: m.expression.clone(),
+        }
+    };
 
     // First, check if the measure exists in the default table (query's primary table)
     if let Some(v) = views.get(default_table) {
@@ -1420,38 +1481,30 @@ fn resolve_measure_source(
             .iter()
             .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
         {
-            let agg_fn = extract_agg_function(&m.expression);
-            // Check if this is a derived measure (no aggregation, references other measures)
-            if extract_aggregation_function(&m.expression).is_none() {
-                let expanded = expand_derived_measure_expr(&m.expression, v);
-                if expanded != m.expression {
-                    return (agg_fn, default_table.to_string(), Some(expanded));
-                }
-            }
-            return (agg_fn, default_table.to_string(), None);
+            return build_resolved(m, v, default_table);
         }
     }
 
     // If not found in default table, search other views (for JOIN support)
-    views
-        .iter()
-        .find_map(|(view_name, v)| {
-            v.measures
-                .iter()
-                .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
-                .map(|m| {
-                    let agg_fn = extract_agg_function(&m.expression);
-                    // Check if this is a derived measure
-                    if extract_aggregation_function(&m.expression).is_none() {
-                        let expanded = expand_derived_measure_expr(&m.expression, v);
-                        if expanded != m.expression {
-                            return (agg_fn, view_name.clone(), Some(expanded));
-                        }
-                    }
-                    (agg_fn, view_name.clone(), None)
-                })
-        })
-        .unwrap_or_else(|| ("SUM".to_string(), default_table.to_string(), None))
+    for (view_name, v) in views.iter() {
+        if let Some(m) = v
+            .measures
+            .iter()
+            .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
+        {
+            return build_resolved(m, v, view_name);
+        }
+    }
+
+    // Fallback: measure not found, return defaults
+    ResolvedMeasure {
+        agg_fn: "SUM".to_string(),
+        source_view: default_table.to_string(),
+        derived_expr: None,
+        is_decomposable: true,
+        base_table: None,
+        expression: String::new(),
+    }
 }
 
 /// Find the alias used for a view in the FROM clause
@@ -1462,6 +1515,78 @@ fn find_alias_for_view<'a>(from_info: &'a FromClauseInfo, view_name: &str) -> Op
         .values()
         .find(|t| t.name.eq_ignore_ascii_case(view_name))
         .map(|t| t.effective_name.as_str())
+}
+
+// =============================================================================
+// Core Functions - Non-Decomposable Measure Expansion
+// =============================================================================
+
+/// Expand a non-decomposable measure (like COUNT DISTINCT) to a correlated subquery
+/// against the base table. This is used when the measure cannot be re-aggregated.
+///
+/// Example:
+/// - expression: "COUNT(DISTINCT user_id)"
+/// - base_table: "orders"
+/// - group_by_cols: ["year", "region"]
+/// - Result: (SELECT COUNT(DISTINCT user_id) FROM orders _inner WHERE _inner.year = _outer.year AND _inner.region = _outer.region)
+fn expand_non_decomposable_to_sql(
+    expression: &str,
+    base_table: &str,
+    outer_alias: Option<&str>,
+    outer_where: Option<&str>,
+    group_by_cols: &[String],
+    modifiers: &[ContextModifier],
+) -> String {
+    let outer_ref = outer_alias.unwrap_or("_outer");
+
+    // Build correlation conditions for the GROUP BY dimensions
+    let correlation_conditions: Vec<String> = group_by_cols
+        .iter()
+        .map(|col| {
+            let col_is_expr = col.contains('(');
+            if col_is_expr {
+                // For expression dimensions like MONTH(date), qualify column refs inside
+                let inner_expr = qualify_where_for_inner(col);
+                format!("{inner_expr} = {col}")
+            } else {
+                let col_name = col.split('.').next_back().unwrap_or(col);
+                format!("_inner.{col_name} = {outer_ref}.{col_name}")
+            }
+        })
+        .collect();
+
+    // Check for compatible AT modifiers (WHERE, VISIBLE) and add their conditions
+    let mut additional_conditions: Vec<String> = Vec::new();
+    for modifier in modifiers {
+        match modifier {
+            ContextModifier::Where(cond) => {
+                additional_conditions.push(qualify_where_for_inner(cond));
+            }
+            ContextModifier::Visible => {
+                if let Some(w) = outer_where {
+                    additional_conditions.push(qualify_where_for_inner(w));
+                }
+            }
+            // AllGlobal, All, Set should have been caught earlier as errors
+            _ => {}
+        }
+    }
+
+    let all_conditions: Vec<String> = correlation_conditions
+        .into_iter()
+        .chain(additional_conditions)
+        .collect();
+
+    if all_conditions.is_empty() {
+        format!("(SELECT {expression} FROM {base_table})")
+    } else {
+        format!(
+            "(SELECT {} FROM {} _inner WHERE {})",
+            expression,
+            base_table,
+            all_conditions.join(" AND ")
+        )
+    }
 }
 
 // =============================================================================
@@ -2023,12 +2148,41 @@ fn expand_modifiers_to_sql_derived(
 
 /// Expand AGGREGATE() with AT modifiers in SQL
 pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
-    if !has_at_syntax(sql) {
+    // Check if we need the full expansion path (AT modifiers or non-decomposable measures)
+    let has_at = has_at_syntax(sql);
+    let has_aggregate = has_aggregate_function(sql);
+
+    // If no AGGREGATE function at all, nothing to do
+    if !has_aggregate {
+        return AggregateExpandResult {
+            had_aggregate: false,
+            expanded_sql: sql.to_string(),
+            error: None,
+        };
+    }
+
+    // Check if any non-decomposable measures are referenced
+    // (we need the full expansion path for these even without AT modifiers)
+    let plain_calls = extract_all_aggregate_calls(sql);
+    let has_non_decomposable = {
+        let views = MEASURE_VIEWS.lock().unwrap();
+        plain_calls.iter().any(|(measure_name, _, _)| {
+            views.values().any(|v| {
+                v.measures
+                    .iter()
+                    .any(|m| m.column_name.eq_ignore_ascii_case(measure_name) && !m.is_decomposable)
+            })
+        })
+    };
+
+    // If no AT syntax and no non-decomposable measures, use simpler expansion
+    if !has_at && !has_non_decomposable {
         return expand_aggregate(sql);
     }
 
     let at_patterns = extract_aggregate_with_at_full(sql);
-    if at_patterns.is_empty() {
+    // Only fall back to simple expand if no AT patterns AND no non-decomposable measures
+    if at_patterns.is_empty() && !has_non_decomposable {
         return expand_aggregate(sql);
     }
 
@@ -2113,18 +2267,48 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     for (measure_name, modifiers, start, end) in patterns {
         // Look up which view contains this measure (for JOIN support)
-        let (agg_fn, source_view, derived_expr) =
-            resolve_measure_source(&measure_name, &primary_table_name);
+        let resolved = resolve_measure_source(&measure_name, &primary_table_name);
+
+        // Check for non-decomposable measures with incompatible AT modifiers
+        if !resolved.is_decomposable {
+            let has_incompatible_modifier = modifiers.iter().any(|m| {
+                matches!(
+                    m,
+                    ContextModifier::AllGlobal
+                        | ContextModifier::All(_)
+                        | ContextModifier::Set(_, _)
+                )
+            });
+            if has_incompatible_modifier {
+                let modifier_desc = modifiers
+                    .iter()
+                    .find_map(|m| match m {
+                        ContextModifier::AllGlobal => Some("AT (ALL)".to_string()),
+                        ContextModifier::All(dim) => Some(format!("AT (ALL {dim})")),
+                        ContextModifier::Set(dim, _) => Some(format!("AT (SET {dim} = ...)")),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "AT modifier".to_string());
+                return AggregateExpandResult {
+                    had_aggregate: false,
+                    expanded_sql: sql.to_string(),
+                    error: Some(format!(
+                        "{} not supported for non-decomposable measure '{}' (COUNT DISTINCT cannot be re-aggregated)",
+                        modifier_desc, measure_name
+                    )),
+                };
+            }
+        }
 
         // Find the alias for this measure's source view in the FROM clause
         // If the source view is the primary table and we added _outer, use _outer
         let outer_alias = if let Some(ref pt) = from_info.primary_table {
-            if pt.name.eq_ignore_ascii_case(&source_view) {
+            if pt.name.eq_ignore_ascii_case(&resolved.source_view) {
                 // Source view is the primary table, use primary_alias (which may be _outer)
                 primary_alias.clone()
             } else {
                 // Source view is not the primary table, look it up in from_info
-                find_alias_for_view(&from_info, &source_view)
+                find_alias_for_view(&from_info, &resolved.source_view)
                     .map(|s| s.to_string())
                     .or_else(|| primary_alias.clone())
             }
@@ -2134,29 +2318,39 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         let outer_alias_ref = outer_alias.as_deref();
 
         // For derived measures, use the expanded expression instead of measure_name
-        let (effective_measure, effective_agg) = if let Some(ref expr) = derived_expr {
+        let (effective_measure, effective_agg) = if let Some(ref expr) = resolved.derived_expr {
             // Derived measure: use expanded expression directly (no wrapping AGG)
             (expr.as_str(), "".to_string())
         } else {
-            (measure_name.as_str(), agg_fn)
+            (measure_name.as_str(), resolved.agg_fn.clone())
         };
 
-        let expanded = if derived_expr.is_some() {
+        let expanded = if resolved.derived_expr.is_some() {
             // For derived measures, build the subquery with the expanded expression
             expand_modifiers_to_sql_derived(
                 effective_measure,
                 &modifiers,
-                &source_view,
+                &resolved.source_view,
                 outer_alias_ref,
                 outer_where_ref,
                 &group_by_cols,
+            )
+        } else if !resolved.is_decomposable {
+            // Non-decomposable measure: expand against base table with correlation
+            expand_non_decomposable_to_sql(
+                &resolved.expression,
+                &resolved.base_table.clone().unwrap_or_else(|| resolved.source_view.clone()),
+                outer_alias_ref,
+                outer_where_ref,
+                &group_by_cols,
+                &modifiers,
             )
         } else {
             expand_modifiers_to_sql(
                 &measure_name,
                 &effective_agg,
                 &modifiers,
-                &source_view,
+                &resolved.source_view,
                 outer_alias_ref,
                 outer_where_ref,
                 &group_by_cols,
@@ -2170,14 +2364,23 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     plain_calls.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by position descending
 
     for (measure_name, start, end) in plain_calls {
-        let (agg_fn, _source_view, derived_expr) =
-            resolve_measure_source(&measure_name, &primary_table_name);
+        let resolved = resolve_measure_source(&measure_name, &primary_table_name);
 
         // For derived measures, use the expanded expression; otherwise use AGG(measure_name)
-        let expanded = if let Some(expr) = derived_expr {
+        let expanded = if let Some(expr) = resolved.derived_expr {
             expr
+        } else if !resolved.is_decomposable {
+            // Non-decomposable measure: expand against base table with correlation
+            expand_non_decomposable_to_sql(
+                &resolved.expression,
+                &resolved.base_table.unwrap_or_else(|| resolved.source_view.clone()),
+                primary_alias.as_deref(),
+                outer_where_ref,
+                &group_by_cols,
+                &[], // No modifiers for plain AGGREGATE()
+            )
         } else {
-            format!("{agg_fn}({measure_name})")
+            format!("{}({measure_name})", resolved.agg_fn)
         };
         result_sql = format!("{}{}{}", &result_sql[..start], expanded, &result_sql[end..]);
     }
@@ -2221,11 +2424,17 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 // Catalog Functions
 // =============================================================================
 
-pub fn store_measure_view(view_name: &str, measures: Vec<ViewMeasure>, base_query: &str) {
+pub fn store_measure_view(
+    view_name: &str,
+    measures: Vec<ViewMeasure>,
+    base_query: &str,
+    base_table: Option<String>,
+) {
     let measure_view = MeasureView {
         view_name: view_name.to_string(),
         measures,
         base_query: base_query.to_string(),
+        base_table,
     };
 
     let mut views = MEASURE_VIEWS.lock().unwrap();
@@ -2653,8 +2862,10 @@ FROM orders"#;
             vec![ViewMeasure {
                 column_name: "revenue".to_string(),
                 expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
             }],
             "SELECT year, SUM(amount) AS revenue FROM sales GROUP BY year",
+            Some("sales".to_string()),
         );
 
         // Test AT (SET) expansion
@@ -2677,8 +2888,10 @@ FROM orders"#;
             vec![ViewMeasure {
                 column_name: "revenue".to_string(),
                 expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
             }],
             "SELECT year, region, SUM(amount) AS revenue FROM sales GROUP BY ALL",
+            Some("sales".to_string()),
         );
 
         let sql = r#"SELECT year, region, AGGREGATE(revenue) AS revenue, AGGREGATE(revenue) AT (ALL region) AS year_total, AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct FROM sales_v"#;
@@ -2884,13 +3097,16 @@ FROM orders"#;
                 ViewMeasure {
                     column_name: "revenue".to_string(),
                     expression: "SUM(amount)".to_string(),
+                    is_decomposable: true,
                 },
                 ViewMeasure {
                     column_name: "cost".to_string(),
                     expression: "SUM(expense)".to_string(),
+                    is_decomposable: true,
                 },
             ],
             base_query: "".to_string(),
+            base_table: Some("sales".to_string()),
         };
 
         // Simple subtraction
@@ -2949,8 +3165,10 @@ FROM orders"#;
             vec![ViewMeasure {
                 column_name: "revenue".to_string(),
                 expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
             }],
             "SELECT year, SUM(amount) AS revenue FROM sales GROUP BY year",
+            Some("sales".to_string()),
         );
 
         // Test with user-provided alias "s"
@@ -3041,21 +3259,26 @@ GROUP BY s.year";
             vec![ViewMeasure {
                 column_name: "revenue".to_string(),
                 expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
             }],
             "SELECT year, SUM(amount) AS revenue FROM orders GROUP BY year",
+            Some("orders".to_string()),
         );
 
         // Should find revenue in orders_v
-        let (agg_fn, source, derived) = resolve_measure_source("revenue", "fallback");
-        assert_eq!(agg_fn, "SUM");
-        assert_eq!(source, "orders_v");
-        assert!(derived.is_none()); // Not a derived measure
+        let resolved = resolve_measure_source("revenue", "fallback");
+        assert_eq!(resolved.agg_fn, "SUM");
+        assert_eq!(resolved.source_view, "orders_v");
+        assert!(resolved.derived_expr.is_none()); // Not a derived measure
+        assert!(resolved.is_decomposable);
+        assert_eq!(resolved.base_table, Some("orders".to_string()));
 
         // Unknown measure should fallback
-        let (agg_fn2, source2, derived2) = resolve_measure_source("unknown", "fallback");
-        assert_eq!(agg_fn2, "SUM");
-        assert_eq!(source2, "fallback");
-        assert!(derived2.is_none());
+        let resolved2 = resolve_measure_source("unknown", "fallback");
+        assert_eq!(resolved2.agg_fn, "SUM");
+        assert_eq!(resolved2.source_view, "fallback");
+        assert!(resolved2.derived_expr.is_none());
+        assert!(resolved2.is_decomposable); // Fallback assumes decomposable
     }
 
     #[test]
@@ -3083,8 +3306,10 @@ GROUP BY s.year";
             vec![ViewMeasure {
                 column_name: "revenue".to_string(),
                 expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
             }],
             "SELECT year, SUM(amount) AS revenue FROM orders GROUP BY year",
+            Some("orders".to_string()),
         );
 
         // Query with JOIN - measure should expand using orders_v
@@ -3107,8 +3332,10 @@ GROUP BY s.year";
             vec![ViewMeasure {
                 column_name: "revenue".to_string(),
                 expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
             }],
             "SELECT year, SUM(amount) AS revenue FROM orders GROUP BY year",
+            Some("orders".to_string()),
         );
 
         // Query with measure's source table as SECOND table in JOIN
@@ -3163,5 +3390,198 @@ GROUP BY s.year";
             qualify_where_for_inner("year = 2023 AND MONTH(date) = 6"),
             "_inner.year = 2023 AND MONTH(_inner.date) = 6"
         );
+    }
+
+    // =========================================================================
+    // COUNT(DISTINCT) / Non-Decomposable Measure Tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_count_distinct() {
+        // Should detect COUNT(DISTINCT ...)
+        assert!(is_count_distinct("COUNT(DISTINCT user_id)"));
+        assert!(is_count_distinct("COUNT( DISTINCT customer_id)"));
+        assert!(is_count_distinct("count(distinct name)"));
+
+        // Should NOT detect regular COUNT or other aggregates
+        assert!(!is_count_distinct("COUNT(user_id)"));
+        assert!(!is_count_distinct("COUNT(*)"));
+        assert!(!is_count_distinct("SUM(amount)"));
+        assert!(!is_count_distinct("AVG(price)"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_process_create_view_count_distinct() {
+        clear_measure_views();
+
+        let sql = "CREATE VIEW orders_v AS \
+                   SELECT year, region, COUNT(DISTINCT customer_id) AS MEASURE unique_customers \
+                   FROM orders";
+        let result = process_create_view(sql);
+
+        eprintln!("Result: {result:?}");
+        eprintln!("Clean SQL: {}", result.clean_sql);
+
+        assert!(result.is_measure_view);
+        assert_eq!(result.measures.len(), 1);
+        assert_eq!(result.measures[0].column_name, "unique_customers");
+        assert_eq!(
+            result.measures[0].expression,
+            "COUNT(DISTINCT customer_id)"
+        );
+
+        // Verify the view gets the measure registered
+        let mv = get_measure_view("orders_v").unwrap();
+        assert!(!mv.measures[0].is_decomposable); // COUNT DISTINCT is non-decomposable
+        assert_eq!(mv.base_table, Some("orders".to_string()));
+
+        // The clean SQL should NOT contain the COUNT(DISTINCT) column
+        // (non-decomposable measures are excluded from the view)
+        assert!(!result.clean_sql.contains("COUNT(DISTINCT"));
+        assert!(!result.clean_sql.contains("unique_customers"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_expand_count_distinct_plain_aggregate() {
+        clear_measure_views();
+
+        // Register a view with COUNT(DISTINCT) measure
+        store_measure_view(
+            "orders_v",
+            vec![ViewMeasure {
+                column_name: "unique_customers".to_string(),
+                expression: "COUNT(DISTINCT customer_id)".to_string(),
+                is_decomposable: false,
+            }],
+            "SELECT year, region FROM orders GROUP BY year, region",
+            Some("orders".to_string()),
+        );
+
+        // Plain AGGREGATE should expand to correlated subquery
+        let sql = "SELECT year, region, AGGREGATE(unique_customers) FROM orders_v GROUP BY year, region";
+        let result = expand_aggregate_with_at(sql);
+
+        eprintln!("Expanded SQL: {}", result.expanded_sql);
+        assert!(result.had_aggregate);
+        assert!(result.error.is_none());
+        // Should contain correlated subquery against base table
+        assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
+        assert!(result.expanded_sql.contains("FROM orders"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_expand_count_distinct_at_where() {
+        clear_measure_views();
+
+        store_measure_view(
+            "orders_v",
+            vec![ViewMeasure {
+                column_name: "unique_customers".to_string(),
+                expression: "COUNT(DISTINCT customer_id)".to_string(),
+                is_decomposable: false,
+            }],
+            "SELECT year, region FROM orders GROUP BY year, region",
+            Some("orders".to_string()),
+        );
+
+        // AT (WHERE) should work with COUNT(DISTINCT)
+        let sql = "SELECT year, AGGREGATE(unique_customers) AT (WHERE region = 'US') \
+                   FROM orders_v GROUP BY year";
+        let result = expand_aggregate_with_at(sql);
+
+        eprintln!("Expanded SQL: {}", result.expanded_sql);
+        assert!(result.had_aggregate);
+        assert!(result.error.is_none());
+        // Should contain the WHERE condition in the subquery
+        assert!(
+            result.expanded_sql.contains("region = 'US'")
+                || result.expanded_sql.contains("_inner.region = 'US'")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_expand_count_distinct_at_all_error() {
+        clear_measure_views();
+
+        store_measure_view(
+            "orders_v",
+            vec![ViewMeasure {
+                column_name: "unique_customers".to_string(),
+                expression: "COUNT(DISTINCT customer_id)".to_string(),
+                is_decomposable: false,
+            }],
+            "SELECT year, region FROM orders GROUP BY year, region",
+            Some("orders".to_string()),
+        );
+
+        // AT (ALL region) should ERROR for COUNT(DISTINCT)
+        let sql = "SELECT year, AGGREGATE(unique_customers) AT (ALL region) \
+                   FROM orders_v GROUP BY year";
+        let result = expand_aggregate_with_at(sql);
+
+        eprintln!("Result: {result:?}");
+        assert!(result.error.is_some());
+        let error = result.error.unwrap();
+        assert!(error.contains("not supported"));
+        assert!(error.contains("non-decomposable"));
+        assert!(error.contains("unique_customers"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_expand_count_distinct_at_all_global_error() {
+        clear_measure_views();
+
+        store_measure_view(
+            "orders_v",
+            vec![ViewMeasure {
+                column_name: "unique_customers".to_string(),
+                expression: "COUNT(DISTINCT customer_id)".to_string(),
+                is_decomposable: false,
+            }],
+            "SELECT year, region FROM orders GROUP BY year, region",
+            Some("orders".to_string()),
+        );
+
+        // AT (ALL) - grand total should ERROR for COUNT(DISTINCT)
+        let sql = "SELECT year, AGGREGATE(unique_customers) AT (ALL) \
+                   FROM orders_v GROUP BY year";
+        let result = expand_aggregate_with_at(sql);
+
+        assert!(result.error.is_some());
+        let error = result.error.unwrap();
+        assert!(error.contains("AT (ALL)"));
+        assert!(error.contains("non-decomposable"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_expand_count_distinct_at_set_error() {
+        clear_measure_views();
+
+        store_measure_view(
+            "orders_v",
+            vec![ViewMeasure {
+                column_name: "unique_customers".to_string(),
+                expression: "COUNT(DISTINCT customer_id)".to_string(),
+                is_decomposable: false,
+            }],
+            "SELECT year, region FROM orders GROUP BY year, region",
+            Some("orders".to_string()),
+        );
+
+        // AT (SET year = year - 1) should ERROR for COUNT(DISTINCT)
+        let sql = "SELECT year, AGGREGATE(unique_customers) AT (SET year = year - 1) \
+                   FROM orders_v GROUP BY year";
+        let result = expand_aggregate_with_at(sql);
+
+        assert!(result.error.is_some());
+        let error = result.error.unwrap();
+        assert!(error.contains("AT (SET"));
+        assert!(error.contains("non-decomposable"));
     }
 }
