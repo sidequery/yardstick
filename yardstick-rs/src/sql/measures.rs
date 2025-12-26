@@ -44,6 +44,10 @@ pub struct MeasureView {
     pub base_query: String,
     /// Base table name for deferred evaluation of non-decomposable measures
     pub base_table: Option<String>,
+    /// Base relation SQL used to recompute non-decomposable measures
+    pub base_relation_sql: Option<String>,
+    /// Map of dimension aliases to their expressions (from view SELECT)
+    pub dimension_exprs: HashMap<String, String>,
 }
 
 /// Global storage for measure views (in-memory catalog)
@@ -631,123 +635,315 @@ pub fn extract_table_and_alias_from_sql(sql: &str) -> Option<(String, Option<Str
     }
 }
 
-/// Extract WHERE clause from SQL query
-pub fn extract_where_clause(sql: &str) -> Option<String> {
-    // Normalize whitespace
-    let normalized: String = sql
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .collect();
-    let normalized_upper = normalized.to_uppercase();
+/// Extract the SELECT/WITH query from a CREATE VIEW statement
+fn extract_view_query(sql: &str) -> Option<String> {
+    let trimmed = sql.trim();
+    let upper = trimmed.to_uppercase();
+    if upper.starts_with("SELECT ") || upper.starts_with("WITH ") {
+        return Some(trimmed.to_string());
+    }
 
-    // Find WHERE keyword (not inside a subquery)
-    let mut depth = 0;
-    let mut where_start = None;
-    let chars: Vec<char> = normalized.chars().collect();
+    let (rest, _) = create_view_header(trimmed).ok()?;
+    let rest_trimmed = rest.trim_start();
+    let rest_upper = rest_trimmed.to_uppercase();
 
-    for i in 0..chars.len() {
-        match chars[i] {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            _ => {
-                if depth == 0 && i + 6 <= chars.len() {
-                    let word = &normalized_upper[i..i + 6];
-                    if word == "WHERE " {
-                        where_start = Some(i + 6);
+    if rest_upper.starts_with("AS ") {
+        return Some(rest_trimmed[2..].trim_start().to_string());
+    }
+
+    if rest_upper.starts_with("AS") && rest_trimmed.len() > 2 {
+        let after_as = &rest_trimmed[2..];
+        if after_as
+            .chars()
+            .next()
+            .map_or(false, |ch| ch.is_whitespace())
+        {
+            return Some(after_as.trim_start().to_string());
+        }
+    }
+
+    if rest_upper.starts_with("SELECT") || rest_upper.starts_with("WITH") {
+        return Some(rest_trimmed.to_string());
+    }
+
+    None
+}
+
+fn is_boundary_char(ch: Option<char>) -> bool {
+    ch.map_or(true, |c| !c.is_alphanumeric() && c != '_')
+}
+
+fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usize> {
+    let upper = sql.to_uppercase();
+    let upper_bytes = upper.as_bytes();
+    let keyword_upper = keyword.to_uppercase();
+    let keyword_parts: Vec<&str> = keyword_upper.split_whitespace().collect();
+    if keyword_parts.is_empty() {
+        return None;
+    }
+    let keyword_bytes = keyword_upper.as_bytes();
+    let is_multi_word = keyword_parts.len() > 1;
+
+    let bytes = sql.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut in_bracket = false;
+
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+
+        if in_single {
+            if c == '\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] as char == '\'' {
+                    i += 1;
+                } else {
+                    in_single = false;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            if c == '"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_backtick {
+            if c == '`' {
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_bracket {
+            if c == ']' {
+                in_bracket = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match c {
+            '\'' => {
+                in_single = true;
+                i += 1;
+                continue;
+            }
+            '"' => {
+                in_double = true;
+                i += 1;
+                continue;
+            }
+            '`' => {
+                in_backtick = true;
+                i += 1;
+                continue;
+            }
+            '[' => {
+                in_bracket = true;
+                i += 1;
+                continue;
+            }
+            '(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            ')' => {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if depth == 0 {
+            if is_multi_word {
+                let mut idx = i;
+                let mut matched = true;
+                for (part_idx, part) in keyword_parts.iter().enumerate() {
+                    let part_bytes = part.as_bytes();
+                    if idx + part_bytes.len() > upper_bytes.len()
+                        || upper_bytes[idx..idx + part_bytes.len()] != *part_bytes
+                    {
+                        matched = false;
                         break;
                     }
+                    idx += part_bytes.len();
+                    if part_idx < keyword_parts.len() - 1 {
+                        if idx >= upper_bytes.len()
+                            || !upper_bytes[idx].is_ascii_whitespace()
+                        {
+                            matched = false;
+                            break;
+                        }
+                        while idx < upper_bytes.len() && upper_bytes[idx].is_ascii_whitespace() {
+                            idx += 1;
+                        }
+                    }
+                }
+
+                if matched {
+                    let prev = if i == 0 {
+                        None
+                    } else {
+                        Some(upper_bytes[i - 1] as char)
+                    };
+                    let next = if idx >= upper_bytes.len() {
+                        None
+                    } else {
+                        Some(upper_bytes[idx] as char)
+                    };
+                    if is_boundary_char(prev) && is_boundary_char(next) {
+                        return Some(i);
+                    }
+                }
+            } else if i + keyword_bytes.len() <= upper_bytes.len()
+                && upper_bytes[i..i + keyword_bytes.len()] == *keyword_bytes
+            {
+                let prev = if i == 0 {
+                    None
+                } else {
+                    Some(upper_bytes[i - 1] as char)
+                };
+                let next = if i + keyword_bytes.len() >= upper_bytes.len() {
+                    None
+                } else {
+                    Some(upper_bytes[i + keyword_bytes.len()] as char)
+                };
+                if is_boundary_char(prev) && is_boundary_char(next) {
+                    return Some(i);
                 }
             }
         }
+
+        i += 1;
     }
 
-    let start = where_start?;
+    None
+}
 
-    // Find end of WHERE clause (GROUP BY, ORDER BY, LIMIT, HAVING, or end)
-    let rest_upper = &normalized_upper[start..];
-    let end_keywords = [" GROUP BY", " ORDER BY", " LIMIT ", " HAVING ", ";"];
-    let mut end_pos = normalized.len();
+fn find_first_top_level_keyword(sql: &str, start: usize, keywords: &[&str]) -> Option<usize> {
+    keywords
+        .iter()
+        .filter_map(|kw| find_top_level_keyword(sql, kw, start))
+        .min()
+}
 
-    for kw in end_keywords {
-        if let Some(pos) = rest_upper.find(kw) {
-            if start + pos < end_pos {
-                end_pos = start + pos;
-            }
+fn extract_base_relation_sql(view_query: &str) -> Option<String> {
+    let query = view_query.trim().trim_end_matches(';').trim();
+    if query.is_empty() {
+        return None;
+    }
+
+    let has_set_op = ["UNION", "INTERSECT", "EXCEPT"]
+        .iter()
+        .any(|kw| find_top_level_keyword(query, kw, 0).is_some());
+    if has_set_op {
+        return Some(format!("SELECT * FROM ({query})"));
+    }
+
+    let select_pos = find_top_level_keyword(query, "SELECT", 0)?;
+    let from_pos = find_top_level_keyword(query, "FROM", select_pos)?;
+    let from_start = from_pos + 4;
+    let from_end = find_first_top_level_keyword(
+        query,
+        from_start,
+        &[
+            "WHERE",
+            "GROUP BY",
+            "HAVING",
+            "QUALIFY",
+            "ORDER BY",
+            "LIMIT",
+            "WINDOW",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+        ],
+    )
+    .unwrap_or(query.len());
+
+    let from_clause = query[from_start..from_end].trim();
+    if from_clause.is_empty() {
+        return None;
+    }
+
+    let where_clause = find_top_level_keyword(query, "WHERE", from_pos).map(|pos| {
+        let where_start = pos + 5;
+        let where_end = find_first_top_level_keyword(
+            query,
+            where_start,
+            &[
+                "GROUP BY",
+                "HAVING",
+                "QUALIFY",
+                "ORDER BY",
+                "LIMIT",
+                "WINDOW",
+                "UNION",
+                "INTERSECT",
+                "EXCEPT",
+            ],
+        )
+        .unwrap_or(query.len());
+        query[where_start..where_end].trim().to_string()
+    });
+
+    let cte_prefix = query[..select_pos].trim();
+    let mut base_sql = String::new();
+    if !cte_prefix.is_empty() {
+        base_sql.push_str(cte_prefix);
+        base_sql.push(' ');
+    }
+    base_sql.push_str("SELECT * FROM ");
+    base_sql.push_str(from_clause);
+    if let Some(w) = where_clause {
+        if !w.is_empty() {
+            base_sql.push_str(" WHERE ");
+            base_sql.push_str(&w);
         }
     }
 
-    let where_content = normalized[start..end_pos].trim().to_string();
+    Some(base_sql)
+}
+
+/// Extract WHERE clause from SQL query
+pub fn extract_where_clause(sql: &str) -> Option<String> {
+    let query = sql.trim().trim_end_matches(';').trim();
+    let where_pos = find_top_level_keyword(query, "WHERE", 0)?;
+    let start = where_pos + 5;
+    let end = find_first_top_level_keyword(
+        query,
+        start,
+        &[
+            "GROUP BY",
+            "HAVING",
+            "QUALIFY",
+            "ORDER BY",
+            "LIMIT",
+            "WINDOW",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+        ],
+    )
+    .unwrap_or(query.len());
+
+    let where_content = query[start..end].trim().to_string();
     if where_content.is_empty() {
         None
     } else {
         Some(where_content)
     }
-}
-
-/// Check if a CREATE VIEW / SELECT query is a simple single-table source
-/// (no JOIN, WHERE, HAVING, QUALIFY, WINDOW, UNION/INTERSECT/EXCEPT, or subquery)
-fn is_simple_base_query(sql: &str) -> bool {
-    // Normalize whitespace
-    let normalized: String = sql
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .collect();
-    let normalized_upper = normalized.to_uppercase();
-
-    // Disallow common constructs that change the base row set
-    let disallowed = [
-        " JOIN ",
-        " WHERE ",
-        " HAVING ",
-        " QUALIFY ",
-        " WINDOW ",
-        " UNION ",
-        " INTERSECT ",
-        " EXCEPT ",
-        " WITH ",
-    ];
-    if disallowed
-        .iter()
-        .any(|kw| normalized_upper.contains(kw))
-    {
-        return false;
-    }
-
-    // Require a simple FROM clause with a single table
-    let from_pos = match normalized_upper.find(" FROM ") {
-        Some(pos) => pos + " FROM ".len(),
-        None => return false,
-    };
-
-    let end_keywords = [
-        " WHERE ",
-        " GROUP BY",
-        " ORDER BY",
-        " LIMIT ",
-        " HAVING ",
-        " QUALIFY ",
-        " WINDOW ",
-        " UNION ",
-        " INTERSECT ",
-        " EXCEPT ",
-        ";",
-    ];
-    let mut end_pos = normalized.len();
-    for kw in end_keywords {
-        if let Some(pos) = normalized_upper[from_pos..].find(kw) {
-            end_pos = end_pos.min(from_pos + pos);
-        }
-    }
-
-    let from_clause = normalized[from_pos..end_pos].trim();
-    if from_clause.is_empty() {
-        return false;
-    }
-    if from_clause.contains(',') || from_clause.contains('(') {
-        return false;
-    }
-
-    extract_table_and_alias_from_sql(sql).is_some()
 }
 
 // =============================================================================
@@ -1039,6 +1235,114 @@ fn qualify_where_for_inner(where_clause: &str) -> String {
     result
 }
 
+fn qualify_where_for_outer(where_clause: &str, outer_alias: &str) -> String {
+    let mut result = String::new();
+    let mut chars = where_clause.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c.is_alphabetic() || c == '_' {
+            let mut ident = String::from(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' {
+                    ident.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+
+            let already_qualified = chars.peek() == Some(&'.');
+            let is_function = chars.peek() == Some(&'(');
+
+            let keywords = [
+                "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
+                "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
+            ];
+            let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
+
+            if !already_qualified && !is_keyword && !is_function {
+                result.push_str(outer_alias);
+                result.push('.');
+            }
+            result.push_str(&ident);
+        } else if c == '\'' {
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+fn qualify_where_for_inner_with_dimensions(
+    where_clause: &str,
+    dimension_exprs: &HashMap<String, String>,
+) -> String {
+    let mut result = String::new();
+    let mut chars = where_clause.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c.is_alphabetic() || c == '_' {
+            let mut ident = String::from(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' {
+                    ident.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+
+            let already_qualified = chars.peek() == Some(&'.');
+            let is_function = chars.peek() == Some(&'(');
+
+            let keywords = [
+                "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
+                "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
+            ];
+            let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
+
+            if !already_qualified && !is_keyword && !is_function {
+                let key = normalize_dimension_key(&ident);
+                if let Some(expr) = dimension_exprs.get(&key) {
+                    let inner_expr = qualify_where_for_inner(expr);
+                    result.push('(');
+                    result.push_str(&inner_expr);
+                    result.push(')');
+                    continue;
+                }
+                result.push_str("_inner.");
+            }
+            result.push_str(&ident);
+        } else if c == '\'' {
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 // =============================================================================
 // Core Functions - Process CREATE VIEW
 // =============================================================================
@@ -1061,11 +1365,17 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
         Ok((clean_sql, measures, view_name, base_table)) => {
             if !measures.is_empty() {
                 if let Some(ref vn) = view_name {
+                    let view_query =
+                        extract_view_query(&clean_sql).unwrap_or_else(|| clean_sql.clone());
+                    let base_relation_sql = extract_base_relation_sql(&view_query);
+                    let dimension_exprs = extract_dimension_exprs_from_query(&view_query);
                     let measure_view = MeasureView {
                         view_name: vn.clone(),
                         measures: measures.clone(),
                         base_query: clean_sql.clone(),
                         base_table,
+                        base_relation_sql,
+                        dimension_exprs,
                     };
 
                     let mut views = MEASURE_VIEWS.lock().unwrap();
@@ -1448,6 +1758,34 @@ fn extract_dimension_columns_from_select_info(info: &SelectInfo) -> Vec<String> 
         .collect()
 }
 
+fn normalize_dimension_key(ident: &str) -> String {
+    let trimmed = ident.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    unquoted.to_lowercase()
+}
+
+fn extract_dimension_exprs_from_query(sql: &str) -> HashMap<String, String> {
+    let mut exprs = HashMap::new();
+    let info = std::panic::catch_unwind(|| parser_ffi::parse_select(sql))
+        .ok()
+        .and_then(|result| result.ok());
+    if let Some(info) = info {
+        for item in info
+            .items
+            .iter()
+            .filter(|item| !item.is_aggregate && !item.is_star && !item.is_measure_ref)
+        {
+            if let Some(alias) = &item.alias {
+                exprs.insert(normalize_dimension_key(alias), item.expression_sql.clone());
+            }
+        }
+    }
+    exprs
+}
+
 // =============================================================================
 // FROM clause extraction (for JOIN support)
 // =============================================================================
@@ -1489,14 +1827,16 @@ pub struct ResolvedMeasure {
     pub agg_fn: String,
     /// The source view name
     pub source_view: String,
-    /// Whether the source view is a simple single-table query
-    pub is_simple_source: bool,
     /// For derived measures: the expanded expression
     pub derived_expr: Option<String>,
     /// Whether this measure can be re-aggregated
     pub is_decomposable: bool,
     /// Base table for non-decomposable measures (for correlated subquery)
     pub base_table: Option<String>,
+    /// Base relation SQL for non-decomposable recomputation
+    pub base_relation_sql: Option<String>,
+    /// Dimension alias -> expression mapping from the source view
+    pub dimension_exprs: HashMap<String, String>,
     /// The original measure expression (e.g., "COUNT(DISTINCT user_id)")
     pub expression: String,
 }
@@ -1523,10 +1863,11 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMe
         ResolvedMeasure {
             agg_fn,
             source_view: source_view.to_string(),
-            is_simple_source: v.base_table.is_some() && is_simple_base_query(&v.base_query),
             derived_expr,
             is_decomposable: m.is_decomposable,
             base_table: v.base_table.clone(),
+            base_relation_sql: v.base_relation_sql.clone(),
+            dimension_exprs: v.dimension_exprs.clone(),
             expression: m.expression.clone(),
         }
     };
@@ -1557,10 +1898,11 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMe
     ResolvedMeasure {
         agg_fn: "SUM".to_string(),
         source_view: default_table.to_string(),
-        is_simple_source: false,
         derived_expr: None,
         is_decomposable: true,
         base_table: None,
+        base_relation_sql: None,
+        dimension_exprs: HashMap::new(),
         expression: String::new(),
     }
 }
@@ -1579,31 +1921,80 @@ fn find_alias_for_view<'a>(from_info: &'a FromClauseInfo, view_name: &str) -> Op
 // Core Functions - Non-Decomposable Measure Expansion
 // =============================================================================
 
+fn base_relation_for_subquery(base_relation_sql: &str) -> String {
+    let trimmed = base_relation_sql.trim().trim_end_matches(';').trim();
+    format!("({trimmed})")
+}
+
+fn correlation_exprs_for_dim(
+    dim: &str,
+    dimension_exprs: &HashMap<String, String>,
+    outer_alias: Option<&str>,
+) -> (String, String) {
+    let dim_trim = dim.trim();
+    let dim_name = dim_trim.split('.').next_back().unwrap_or(dim_trim).trim();
+    let dim_key = normalize_dimension_key(dim_name);
+    if let Some(expr) = dimension_exprs.get(&dim_key) {
+        let inner_expr = qualify_where_for_inner(expr);
+        let outer_expr = outer_alias
+            .map(|alias| format!("{alias}.{dim_name}"))
+            .unwrap_or_else(|| dim_name.to_string());
+        return (inner_expr, outer_expr);
+    }
+
+    if dim_trim.contains('(') {
+        let inner_expr = qualify_where_for_inner(dim_trim);
+        let outer_expr = outer_alias
+            .map(|alias| qualify_where_for_outer(dim_trim, alias))
+            .unwrap_or_else(|| dim_trim.to_string());
+        return (inner_expr, outer_expr);
+    }
+
+    let inner_expr = format!("_inner.{dim_name}");
+    let outer_expr = outer_alias
+        .map(|alias| format!("{alias}.{dim_name}"))
+        .unwrap_or_else(|| dim_name.to_string());
+    (inner_expr, outer_expr)
+}
+
+fn correlation_condition_for_dim(
+    dim: &str,
+    dimension_exprs: &HashMap<String, String>,
+    outer_alias: Option<&str>,
+) -> String {
+    let (inner_expr, outer_expr) = correlation_exprs_for_dim(dim, dimension_exprs, outer_alias);
+    format!("{inner_expr} = {outer_expr}")
+}
+
 /// Expand a non-decomposable measure (like COUNT DISTINCT) to a correlated subquery
 /// against the base table. This is used when the measure cannot be re-aggregated.
 ///
 /// Example:
 /// - expression: "COUNT(DISTINCT user_id)"
-/// - base_table: "orders"
+/// - base_relation_sql: "SELECT * FROM orders"
 /// - group_by_cols: ["year", "region"]
-/// - Result: (SELECT COUNT(DISTINCT user_id) FROM orders _inner WHERE _inner.year = _outer.year AND _inner.region = _outer.region)
+/// - Result: (SELECT COUNT(DISTINCT user_id) FROM (SELECT * FROM orders) _inner WHERE _inner.year = _outer.year AND _inner.region = _outer.region)
 fn expand_non_decomposable_to_sql(
     expression: &str,
-    base_table: &str,
+    base_relation_sql: &str,
     outer_alias: Option<&str>,
     outer_where: Option<&str>,
     group_by_cols: &[String],
     modifiers: &[ContextModifier],
+    dimension_exprs: &HashMap<String, String>,
 ) -> String {
+    let base_relation = base_relation_for_subquery(base_relation_sql);
+
     if modifiers.is_empty() {
         // No modifiers = default VISIBLE behavior (respect outer WHERE)
         return expand_non_decomposable_at_to_sql(
             expression,
             &ContextModifier::Visible,
-            base_table,
+            base_relation_sql,
             outer_alias,
             outer_where,
             group_by_cols,
+            dimension_exprs,
         );
     }
 
@@ -1611,10 +2002,11 @@ fn expand_non_decomposable_to_sql(
         return expand_non_decomposable_at_to_sql(
             expression,
             &modifiers[0],
-            base_table,
+            base_relation_sql,
             outer_alias,
             outer_where,
             group_by_cols,
+            dimension_exprs,
         );
     }
 
@@ -1631,10 +2023,11 @@ fn expand_non_decomposable_to_sql(
             return expand_non_decomposable_at_to_sql(
                 expression,
                 &ContextModifier::AllGlobal,
-                base_table,
+                base_relation_sql,
                 outer_alias,
                 outer_where,
                 group_by_cols,
+                dimension_exprs,
             );
         }
 
@@ -1664,32 +2057,23 @@ fn expand_non_decomposable_to_sql(
             return expand_non_decomposable_at_to_sql(
                 expression,
                 &ContextModifier::AllGlobal,
-                base_table,
+                base_relation_sql,
                 outer_alias,
                 outer_where,
                 group_by_cols,
+                dimension_exprs,
             );
         }
 
         // Generate correlation on remaining dimensions only
-        let outer_ref = outer_alias.unwrap_or(base_table);
         let where_clauses: Vec<_> = remaining_cols
             .iter()
-            .map(|col| {
-                let col_is_expr = col.contains('(');
-                if col_is_expr {
-                    let inner_expr = qualify_where_for_inner(col);
-                    format!("{inner_expr} = {col}")
-                } else {
-                    let col_name = col.split('.').next_back().unwrap_or(col);
-                    format!("_inner.{col_name} = {outer_ref}.{col_name}")
-                }
-            })
+            .map(|col| correlation_condition_for_dim(col, dimension_exprs, outer_alias))
             .collect();
         return format!(
             "(SELECT {} FROM {} _inner WHERE {})",
             expression,
-            base_table,
+            base_relation,
             where_clauses.join(" AND ")
         );
     }
@@ -1722,24 +2106,34 @@ fn expand_non_decomposable_to_sql(
             ContextModifier::Visible => {
                 if !has_set && !has_all_global {
                     if let Some(w) = outer_where {
-                        effective_where = Some(qualify_where_for_inner(w));
+                        effective_where =
+                            Some(qualify_where_for_inner_with_dimensions(w, dimension_exprs));
                     }
                 }
             }
             ContextModifier::Where(cond) => {
                 if !has_all_global {
-                    effective_where = Some(qualify_where_for_inner(cond));
+                    effective_where =
+                        Some(qualify_where_for_inner_with_dimensions(cond, dimension_exprs));
                 }
             }
             ContextModifier::Set(dim, expr) => {
                 let dim_lower = dim.to_lowercase();
                 if !has_all_global && !removed_dims.contains(&dim_lower) {
-                    let outer_ref = outer_alias.unwrap_or(base_table);
-                    let qualified_expr = qualify_outer_reference(expr, outer_ref, dim);
-                    let inner_dim = if dim.contains('(') {
+                    let outer_ref = outer_alias.unwrap_or("_outer");
+                    let dim_name = dim.split('.').next_back().unwrap_or(dim).trim();
+                    let dim_key = normalize_dimension_key(dim_name);
+                    let qualified_expr = if dim.contains('(') {
+                        qualify_where_for_outer(expr, outer_ref)
+                    } else {
+                        qualify_outer_reference(expr, outer_ref, dim_name)
+                    };
+                    let inner_dim = if let Some(expr) = dimension_exprs.get(&dim_key) {
+                        qualify_where_for_inner(expr)
+                    } else if dim.contains('(') {
                         qualify_where_for_inner(dim)
                     } else {
-                        format!("_inner.{dim}")
+                        format!("_inner.{dim_name}")
                     };
                     set_conditions.push(format!("{inner_dim} = {qualified_expr}"));
                 }
@@ -1748,7 +2142,7 @@ fn expand_non_decomposable_to_sql(
     }
 
     if has_all_global && set_conditions.is_empty() {
-        return format!("(SELECT {expression} FROM {base_table})");
+        return format!("(SELECT {expression} FROM {base_relation})");
     }
 
     // Filter group_by_cols to exclude removed dimensions
@@ -1764,19 +2158,9 @@ fn expand_non_decomposable_to_sql(
         .collect();
 
     // Build correlation conditions for remaining dimensions
-    let outer_ref = outer_alias.unwrap_or(base_table);
     let correlation_conditions: Vec<String> = remaining_cols
         .iter()
-        .map(|col| {
-            let col_is_expr = col.contains('(');
-            if col_is_expr {
-                let inner_expr = qualify_where_for_inner(col);
-                format!("{inner_expr} = {col}")
-            } else {
-                let col_name = col.split('.').next_back().unwrap_or(col);
-                format!("_inner.{col_name} = {outer_ref}.{col_name}")
-            }
-        })
+        .map(|col| correlation_condition_for_dim(col, dimension_exprs, outer_alias))
         .collect();
 
     // Combine all conditions: correlation + SET conditions + WHERE
@@ -1787,12 +2171,12 @@ fn expand_non_decomposable_to_sql(
     }
 
     if all_conditions.is_empty() {
-        format!("(SELECT {expression} FROM {base_table})")
+        format!("(SELECT {expression} FROM {base_relation})")
     } else {
         format!(
             "(SELECT {} FROM {} _inner WHERE {})",
             expression,
-            base_table,
+            base_relation,
             all_conditions.join(" AND ")
         )
     }
@@ -1802,17 +2186,19 @@ fn expand_non_decomposable_to_sql(
 fn expand_non_decomposable_at_to_sql(
     expression: &str,
     modifier: &ContextModifier,
-    table_name: &str,
+    base_relation_sql: &str,
     outer_alias: Option<&str>,
     outer_where: Option<&str>,
     group_by_cols: &[String],
+    dimension_exprs: &HashMap<String, String>,
 ) -> String {
+    let base_relation = base_relation_for_subquery(base_relation_sql);
+
     match modifier {
         ContextModifier::AllGlobal => {
-            format!("(SELECT {expression} FROM {table_name})")
+            format!("(SELECT {expression} FROM {base_relation})")
         }
         ContextModifier::All(dim) => {
-            let outer_ref = outer_alias.unwrap_or(table_name);
             let dim_lower = dim.to_lowercase();
             let is_expression = dim.contains('(');
             let correlating_dims: Vec<_> = group_by_cols
@@ -1828,36 +2214,35 @@ fn expand_non_decomposable_at_to_sql(
                 .collect();
 
             if correlating_dims.is_empty() {
-                format!("(SELECT {expression} FROM {table_name})")
+                format!("(SELECT {expression} FROM {base_relation})")
             } else {
                 let where_clauses: Vec<_> = correlating_dims
                     .iter()
-                    .map(|col| {
-                        let col_is_expr = col.contains('(');
-                        if col_is_expr {
-                            let inner_expr = qualify_where_for_inner(col);
-                            format!("{inner_expr} = {col}")
-                        } else {
-                            let col_name = col.split('.').next_back().unwrap_or(col);
-                            format!("_inner.{col_name} = {outer_ref}.{col_name}")
-                        }
-                    })
+                    .map(|col| correlation_condition_for_dim(col, dimension_exprs, outer_alias))
                     .collect();
                 format!(
                     "(SELECT {} FROM {} _inner WHERE {})",
                     expression,
-                    table_name,
+                    base_relation,
                     where_clauses.join(" AND ")
                 )
             }
         }
         ContextModifier::Set(dim, expr) => {
-            let outer_ref = outer_alias.unwrap_or(table_name);
-            let qualified_expr = qualify_outer_reference(expr, outer_ref, dim);
-            let inner_dim = if dim.contains('(') {
+            let outer_ref = outer_alias.unwrap_or("_outer");
+            let dim_name = dim.split('.').next_back().unwrap_or(dim).trim();
+            let dim_key = normalize_dimension_key(dim_name);
+            let qualified_expr = if dim.contains('(') {
+                qualify_where_for_outer(expr, outer_ref)
+            } else {
+                qualify_outer_reference(expr, outer_ref, dim_name)
+            };
+            let inner_dim = if let Some(expr) = dimension_exprs.get(&dim_key) {
+                qualify_where_for_inner(expr)
+            } else if dim.contains('(') {
                 qualify_where_for_inner(dim)
             } else {
-                format!("_inner.{dim}")
+                format!("_inner.{dim_name}")
             };
             let set_condition = format!("{inner_dim} = {qualified_expr}");
 
@@ -1873,16 +2258,7 @@ fn expand_non_decomposable_at_to_sql(
                         col_name.to_lowercase() != dim_lower
                     }
                 })
-                .map(|col| {
-                    let col_is_expr = col.contains('(');
-                    if col_is_expr {
-                        let inner_expr = qualify_where_for_inner(col);
-                        format!("{inner_expr} = {col}")
-                    } else {
-                        let col_name = col.split('.').next_back().unwrap_or(col);
-                        format!("_inner.{col_name} = {outer_ref}.{col_name}")
-                    }
-                })
+                .map(|col| correlation_condition_for_dim(col, dimension_exprs, outer_alias))
                 .collect();
 
             let mut all_conditions = vec![set_condition];
@@ -1891,35 +2267,45 @@ fn expand_non_decomposable_at_to_sql(
             format!(
                 "(SELECT {} FROM {} _inner WHERE {})",
                 expression,
-                table_name,
+                base_relation,
                 all_conditions.join(" AND ")
             )
         }
         ContextModifier::Where(condition) => {
-            format!("(SELECT {expression} FROM {table_name} WHERE {condition})")
+            let qualified =
+                qualify_where_for_inner_with_dimensions(condition, dimension_exprs);
+            format!(
+                "(SELECT {expression} FROM {base_relation} _inner WHERE {qualified})"
+            )
         }
         ContextModifier::Visible => {
-            let outer_ref = outer_alias.unwrap_or(table_name);
             if group_by_cols.is_empty() {
                 match outer_where {
-                    Some(w) => format!("(SELECT {expression} FROM {table_name} WHERE {w})"),
-                    None => format!("(SELECT {expression} FROM {table_name})"),
+                    Some(w) => {
+                        let qualified =
+                            qualify_where_for_inner_with_dimensions(w, dimension_exprs);
+                        format!(
+                            "(SELECT {expression} FROM {base_relation} _inner WHERE {qualified})"
+                        )
+                    }
+                    None => format!("(SELECT {expression} FROM {base_relation})"),
                 }
             } else {
                 let where_clauses: Vec<_> = group_by_cols
                     .iter()
-                    .map(|col| {
-                        let col_name = col.split('.').next_back().unwrap_or(col);
-                        format!("_inner.{col_name} = {outer_ref}.{col_name}")
-                    })
+                    .map(|col| correlation_condition_for_dim(col, dimension_exprs, outer_alias))
                     .collect();
                 let full_where = match outer_where {
-                    Some(w) => format!("{} AND {}", where_clauses.join(" AND "), w),
+                    Some(w) => {
+                        let qualified =
+                            qualify_where_for_inner_with_dimensions(w, dimension_exprs);
+                        format!("{} AND {}", where_clauses.join(" AND "), qualified)
+                    }
                     None => where_clauses.join(" AND "),
                 };
                 format!(
                     "(SELECT {} FROM {} _inner WHERE {full_where})",
-                    expression, table_name
+                    expression, base_relation
                 )
             }
         }
@@ -2579,18 +2965,6 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
             }
         }
 
-        // COUNT DISTINCT requires a simple base view to recompute at altered contexts
-        if !resolved.is_decomposable && !resolved.is_simple_source {
-            return AggregateExpandResult {
-                had_aggregate: false,
-                expanded_sql: sql.to_string(),
-                error: Some(format!(
-                    "AGGREGATE on non-decomposable measure '{}' requires a simple base view (single table, no WHERE/JOIN)",
-                    measure_name
-                )),
-            };
-        }
-
         // Find the alias for this measure's source view in the FROM clause
         // If the source view is the primary table and we added _outer, use _outer
         let outer_alias = if let Some(ref pt) = from_info.primary_table {
@@ -2629,14 +3003,25 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         } else if !resolved.is_decomposable {
             let outer_ref_for_non_decomp =
                 outer_alias_ref.or(Some(resolved.source_view.as_str()));
+            let base_relation_sql = resolved
+                .base_relation_sql
+                .clone()
+                .or_else(|| {
+                    resolved
+                        .base_table
+                        .clone()
+                        .map(|table| format!("SELECT * FROM {table}"))
+                })
+                .unwrap_or_else(|| format!("SELECT * FROM {}", resolved.source_view));
             // Non-decomposable measure: expand against base table with correlation
             expand_non_decomposable_to_sql(
                 &resolved.expression,
-                &resolved.base_table.clone().unwrap_or_else(|| resolved.source_view.clone()),
+                &base_relation_sql,
                 outer_ref_for_non_decomp,
                 outer_where_ref,
                 &group_by_cols,
                 &modifiers,
+                &resolved.dimension_exprs,
             )
         } else {
             expand_modifiers_to_sql(
@@ -2667,31 +3052,31 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
             };
         }
 
-        if !resolved.is_decomposable && !resolved.is_simple_source {
-            return AggregateExpandResult {
-                had_aggregate: false,
-                expanded_sql: sql.to_string(),
-                error: Some(format!(
-                    "AGGREGATE on non-decomposable measure '{}' requires a simple base view (single table, no WHERE/JOIN)",
-                    measure_name
-                )),
-            };
-        }
-
         // For derived measures, use the expanded expression; otherwise use AGG(measure_name)
         let expanded = if let Some(expr) = resolved.derived_expr {
             expr
         } else if !resolved.is_decomposable {
             let outer_ref_for_non_decomp =
                 primary_alias.as_deref().or(Some(resolved.source_view.as_str()));
+            let base_relation_sql = resolved
+                .base_relation_sql
+                .clone()
+                .or_else(|| {
+                    resolved
+                        .base_table
+                        .clone()
+                        .map(|table| format!("SELECT * FROM {table}"))
+                })
+                .unwrap_or_else(|| format!("SELECT * FROM {}", resolved.source_view));
             // Non-decomposable measure: expand against base table with correlation
             expand_non_decomposable_to_sql(
                 &resolved.expression,
-                &resolved.base_table.unwrap_or_else(|| resolved.source_view.clone()),
+                &base_relation_sql,
                 outer_ref_for_non_decomp,
                 outer_where_ref,
                 &group_by_cols,
                 &[], // No modifiers for plain AGGREGATE()
+                &resolved.dimension_exprs,
             )
         } else {
             format!("{}({measure_name})", resolved.agg_fn)
@@ -2744,11 +3129,16 @@ pub fn store_measure_view(
     base_query: &str,
     base_table: Option<String>,
 ) {
+    let view_query = extract_view_query(base_query).unwrap_or_else(|| base_query.to_string());
+    let base_relation_sql = extract_base_relation_sql(&view_query);
+    let dimension_exprs = extract_dimension_exprs_from_query(&view_query);
     let measure_view = MeasureView {
         view_name: view_name.to_string(),
         measures,
         base_query: base_query.to_string(),
         base_table,
+        base_relation_sql,
+        dimension_exprs,
     };
 
     let mut views = MEASURE_VIEWS.lock().unwrap();
@@ -2935,7 +3325,8 @@ mod tests {
 
         // Now test that AGGREGATE(flag) works
         let query_sql = "SELECT year, AGGREGATE(flag) FROM v GROUP BY year";
-        let expand_result = expand_aggregate(query_sql);
+        let expand_result = std::panic::catch_unwind(|| expand_aggregate(query_sql))
+            .unwrap_or_else(|_| expand_aggregate_with_at(query_sql));
         eprintln!("Expand result: {expand_result:?}");
         // This should have expanded AGGREGATE(flag) to something
         assert!(expand_result.had_aggregate);
@@ -3421,6 +3812,8 @@ FROM orders"#;
             ],
             base_query: "".to_string(),
             base_table: Some("sales".to_string()),
+            base_relation_sql: None,
+            dimension_exprs: HashMap::new(),
         };
 
         // Simple subtraction
@@ -3896,5 +4289,109 @@ GROUP BY s.year";
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
         assert!(result.expanded_sql.contains("_inner.year = _outer.year - 1"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_expand_count_distinct_uses_base_relation_join_where() {
+        clear_measure_views();
+
+        let mut views = MEASURE_VIEWS.lock().unwrap();
+        views.insert(
+            "orders_v".to_string(),
+            MeasureView {
+                view_name: "orders_v".to_string(),
+                measures: vec![ViewMeasure {
+                    column_name: "unique_customers".to_string(),
+                    expression: "COUNT(DISTINCT customer_id)".to_string(),
+                    is_decomposable: false,
+                }],
+                base_query: "SELECT year, region FROM orders".to_string(),
+                base_table: None,
+                base_relation_sql: Some(
+                    "SELECT * FROM orders o JOIN regions r ON o.region_id = r.id WHERE o.status = 'paid'"
+                        .to_string(),
+                ),
+                dimension_exprs: HashMap::new(),
+            },
+        );
+        drop(views);
+
+        let sql =
+            "SELECT year, AGGREGATE(unique_customers) FROM orders_v GROUP BY year";
+        let result = expand_aggregate_with_at(sql);
+
+        assert!(result.had_aggregate);
+        assert!(result.error.is_none());
+        assert!(result.expanded_sql.contains(
+            "FROM (SELECT * FROM orders o JOIN regions r ON o.region_id = r.id WHERE o.status = 'paid') _inner"
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn test_expand_count_distinct_alias_dimension_expr() {
+        clear_measure_views();
+
+        let mut dimension_exprs = HashMap::new();
+        dimension_exprs.insert(
+            "year".to_string(),
+            "date_trunc('year', order_date)".to_string(),
+        );
+
+        let mut views = MEASURE_VIEWS.lock().unwrap();
+        views.insert(
+            "orders_v".to_string(),
+            MeasureView {
+                view_name: "orders_v".to_string(),
+                measures: vec![ViewMeasure {
+                    column_name: "unique_customers".to_string(),
+                    expression: "COUNT(DISTINCT customer_id)".to_string(),
+                    is_decomposable: false,
+                }],
+                base_query: "SELECT year FROM orders".to_string(),
+                base_table: None,
+                base_relation_sql: Some("SELECT * FROM orders".to_string()),
+                dimension_exprs,
+            },
+        );
+        drop(views);
+
+        let sql = "SELECT year, region, AGGREGATE(unique_customers) AT (ALL region) \
+                   FROM orders_v GROUP BY year, region";
+        let result = expand_aggregate_with_at(sql);
+
+        assert!(result.had_aggregate);
+        assert!(result.error.is_none());
+        assert!(result
+            .expanded_sql
+            .contains("date_trunc('year', _inner.order_date) = _outer.year"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_expand_count_distinct_set_op_base_relation() {
+        clear_measure_views();
+
+        store_measure_view(
+            "orders_v",
+            vec![ViewMeasure {
+                column_name: "unique_customers".to_string(),
+                expression: "COUNT(DISTINCT customer_id)".to_string(),
+                is_decomposable: false,
+            }],
+            "SELECT year, region FROM a UNION ALL SELECT year, region FROM b",
+            None,
+        );
+
+        let sql =
+            "SELECT year, AGGREGATE(unique_customers) FROM orders_v GROUP BY year";
+        let result = expand_aggregate_with_at(sql);
+
+        assert!(result.had_aggregate);
+        assert!(result.error.is_none());
+        assert!(result
+            .expanded_sql
+            .contains("FROM (SELECT * FROM (SELECT year, region FROM a UNION ALL SELECT year, region FROM b)) _inner"));
     }
 }
