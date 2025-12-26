@@ -48,6 +48,8 @@ pub struct MeasureView {
     pub base_relation_sql: Option<String>,
     /// Map of dimension aliases to their expressions (from view SELECT)
     pub dimension_exprs: HashMap<String, String>,
+    /// GROUP BY columns from the view definition (if present)
+    pub group_by_cols: Vec<String>,
 }
 
 /// Global storage for measure views (in-memory catalog)
@@ -916,6 +918,140 @@ fn extract_base_relation_sql(view_query: &str) -> Option<String> {
     Some(base_sql)
 }
 
+fn normalize_group_by_col(col: &str) -> String {
+    let trimmed = col.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    if unquoted.contains('(') {
+        let mut result = String::new();
+        let mut last_space = false;
+        for ch in unquoted.chars() {
+            if ch.is_whitespace() {
+                if !last_space {
+                    result.push(' ');
+                    last_space = true;
+                }
+            } else {
+                result.push(ch.to_ascii_lowercase());
+                last_space = false;
+            }
+        }
+        result.trim().to_string()
+    } else {
+        let base = unquoted.split('.').next_back().unwrap_or(unquoted);
+        base.to_lowercase()
+    }
+}
+
+fn extract_view_group_by_cols(view_query: &str) -> Vec<String> {
+    let query = view_query.trim().trim_end_matches(';').trim();
+    let group_pos = match find_top_level_keyword(query, "GROUP BY", 0) {
+        Some(pos) => pos,
+        None => return Vec::new(),
+    };
+
+    let start = group_pos + "GROUP BY".len();
+    let end = find_first_top_level_keyword(
+        query,
+        start,
+        &[
+            "HAVING",
+            "QUALIFY",
+            "ORDER BY",
+            "LIMIT",
+            "WINDOW",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+        ],
+    )
+    .unwrap_or(query.len());
+
+    let group_content = query[start..end].trim();
+    if group_content.is_empty() {
+        return Vec::new();
+    }
+
+    let group_upper = group_content.to_uppercase();
+    if group_upper == "ALL" || group_upper.starts_with("ALL ") {
+        return extract_dimension_columns_from_select(query);
+    }
+
+    let mut columns = Vec::new();
+    let mut depth = 0;
+    let mut current = String::new();
+    for c in group_content.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                let col = current.trim();
+                if !col.is_empty() && !col.chars().all(|ch| ch.is_ascii_digit()) {
+                    columns.push(col.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    let col = current.trim();
+    if !col.is_empty() && !col.chars().all(|ch| ch.is_ascii_digit()) {
+        columns.push(col.to_string());
+    }
+
+    columns
+}
+
+fn find_from_clause_end(sql: &str) -> Option<usize> {
+    let query = sql.trim().trim_end_matches(';');
+    let from_pos = find_top_level_keyword(query, "FROM", 0)?;
+    let start = from_pos + 4;
+    Some(
+        find_first_top_level_keyword(
+            query,
+            start,
+            &[
+                "WHERE",
+                "GROUP BY",
+                "HAVING",
+                "QUALIFY",
+                "ORDER BY",
+                "LIMIT",
+                "WINDOW",
+                "UNION",
+                "INTERSECT",
+                "EXCEPT",
+            ],
+        )
+        .unwrap_or(query.len()),
+    )
+}
+
+fn group_by_matches_view(outer_cols: &[String], view_cols: &[String]) -> bool {
+    if view_cols.is_empty() || outer_cols.is_empty() {
+        return false;
+    }
+
+    let outer_set: std::collections::HashSet<String> =
+        outer_cols.iter().map(|c| normalize_group_by_col(c)).collect();
+    let view_set: std::collections::HashSet<String> =
+        view_cols.iter().map(|c| normalize_group_by_col(c)).collect();
+
+    !outer_set.is_empty() && outer_set == view_set
+}
+
+fn can_use_view_measure_directly(resolved: &ResolvedMeasure, outer_group_by: &[String]) -> bool {
+    group_by_matches_view(outer_group_by, &resolved.view_group_by_cols)
+}
+
 /// Extract WHERE clause from SQL query
 pub fn extract_where_clause(sql: &str) -> Option<String> {
     let query = sql.trim().trim_end_matches(';').trim();
@@ -1369,6 +1505,7 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
                         extract_view_query(&clean_sql).unwrap_or_else(|| clean_sql.clone());
                     let base_relation_sql = extract_base_relation_sql(&view_query);
                     let dimension_exprs = extract_dimension_exprs_from_query(&view_query);
+                    let group_by_cols = extract_view_group_by_cols(&view_query);
                     let measure_view = MeasureView {
                         view_name: vn.clone(),
                         measures: measures.clone(),
@@ -1376,6 +1513,7 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
                         base_table,
                         base_relation_sql,
                         dimension_exprs,
+                        group_by_cols,
                     };
 
                     let mut views = MEASURE_VIEWS.lock().unwrap();
@@ -1837,6 +1975,8 @@ pub struct ResolvedMeasure {
     pub base_relation_sql: Option<String>,
     /// Dimension alias -> expression mapping from the source view
     pub dimension_exprs: HashMap<String, String>,
+    /// GROUP BY columns from the source view definition
+    pub view_group_by_cols: Vec<String>,
     /// The original measure expression (e.g., "COUNT(DISTINCT user_id)")
     pub expression: String,
 }
@@ -1868,6 +2008,7 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMe
             base_table: v.base_table.clone(),
             base_relation_sql: v.base_relation_sql.clone(),
             dimension_exprs: v.dimension_exprs.clone(),
+            view_group_by_cols: v.group_by_cols.clone(),
             expression: m.expression.clone(),
         }
     };
@@ -1903,6 +2044,7 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMe
         base_table: None,
         base_relation_sql: None,
         dimension_exprs: HashMap::new(),
+        view_group_by_cols: Vec::new(),
         expression: String::new(),
     }
 }
@@ -1964,6 +2106,163 @@ fn correlation_condition_for_dim(
 ) -> String {
     let (inner_expr, outer_expr) = correlation_exprs_for_dim(dim, dimension_exprs, outer_alias);
     format!("{inner_expr} = {outer_expr}")
+}
+
+struct NonDecompJoinPlan {
+    join_sql: String,
+    replacement: String,
+}
+
+fn build_non_decomposable_join_plan(
+    expression: &str,
+    base_relation_sql: &str,
+    outer_alias: Option<&str>,
+    outer_where: Option<&str>,
+    group_by_cols: &[String],
+    modifiers: &[ContextModifier],
+    dimension_exprs: &HashMap<String, String>,
+    join_alias: &str,
+) -> Option<NonDecompJoinPlan> {
+    let base_relation = base_relation_for_subquery(base_relation_sql);
+    let mut removed_dims: Vec<String> = Vec::new();
+    let mut effective_where: Option<String> = None;
+    let mut set_overrides: HashMap<String, String> = HashMap::new();
+    let mut has_all_global = false;
+
+    let has_set = modifiers
+        .iter()
+        .any(|m| matches!(m, ContextModifier::Set(_, _)));
+
+    if modifiers.is_empty() {
+        if let Some(w) = outer_where {
+            effective_where = Some(qualify_where_for_inner_with_dimensions(w, dimension_exprs));
+        }
+    } else {
+        let all_are_all = modifiers
+            .iter()
+            .all(|m| matches!(m, ContextModifier::All(_) | ContextModifier::AllGlobal));
+        if all_are_all {
+            if modifiers
+                .iter()
+                .any(|m| matches!(m, ContextModifier::AllGlobal))
+            {
+                return None;
+            }
+            for modifier in modifiers {
+                if let ContextModifier::All(dim) = modifier {
+                    removed_dims.push(dim.to_lowercase());
+                }
+            }
+        } else {
+            for modifier in modifiers.iter().rev() {
+                match modifier {
+                    ContextModifier::AllGlobal => {
+                        has_all_global = true;
+                        effective_where = None;
+                        set_overrides.clear();
+                        removed_dims.clear();
+                    }
+                    ContextModifier::All(dim) => {
+                        removed_dims.push(dim.to_lowercase());
+                    }
+                    ContextModifier::Visible => {
+                        if !has_set && !has_all_global {
+                            if let Some(w) = outer_where {
+                                effective_where = Some(qualify_where_for_inner_with_dimensions(
+                                    w,
+                                    dimension_exprs,
+                                ));
+                            }
+                        }
+                    }
+                    ContextModifier::Where(cond) => {
+                        if !has_all_global {
+                            effective_where =
+                                Some(qualify_where_for_inner_with_dimensions(
+                                    cond,
+                                    dimension_exprs,
+                                ));
+                        }
+                    }
+                    ContextModifier::Set(dim, expr) => {
+                        let dim_name = dim.split('.').next_back().unwrap_or(dim).trim();
+                        let dim_key = normalize_dimension_key(dim_name);
+                        if !has_all_global && !removed_dims.contains(&dim_key) {
+                            let outer_expr = if let Some(alias) = outer_alias {
+                                if dim.contains('(') {
+                                    qualify_where_for_outer(expr, alias)
+                                } else {
+                                    qualify_outer_reference(expr, alias, dim_name)
+                                }
+                            } else {
+                                expr.to_string()
+                            };
+                            set_overrides.insert(dim_key, outer_expr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if has_all_global && set_overrides.is_empty() {
+        return None;
+    }
+
+    let remaining_cols: Vec<&String> = group_by_cols
+        .iter()
+        .filter(|col| {
+            let col_lower = col.to_lowercase();
+            let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
+            !removed_dims
+                .iter()
+                .any(|d| *d == col_lower || *d == col_name)
+        })
+        .collect();
+
+    if remaining_cols.is_empty() {
+        return None;
+    }
+
+    let mut select_parts = Vec::new();
+    let mut group_parts = Vec::new();
+    let mut join_conditions = Vec::new();
+
+    for (idx, col) in remaining_cols.iter().enumerate() {
+        let alias = format!("dim_{idx}");
+        let (inner_expr, default_outer_expr) =
+            correlation_exprs_for_dim(col, dimension_exprs, outer_alias);
+        let dim_name = col.split('.').next_back().unwrap_or(col).trim();
+        let dim_key = normalize_dimension_key(dim_name);
+        let outer_expr = set_overrides
+            .get(&dim_key)
+            .cloned()
+            .unwrap_or(default_outer_expr);
+
+        select_parts.push(format!("{inner_expr} AS {alias}"));
+        group_parts.push(alias.clone());
+        join_conditions.push(format!("{join_alias}.{alias} = {outer_expr}"));
+    }
+
+    let mut agg_query = format!(
+        "SELECT {}, {} AS value FROM {} _inner",
+        select_parts.join(", "),
+        expression,
+        base_relation
+    );
+    if let Some(w) = effective_where {
+        agg_query.push_str(" WHERE ");
+        agg_query.push_str(&w);
+    }
+    if !group_parts.is_empty() {
+        agg_query.push_str(" GROUP BY ");
+        agg_query.push_str(&group_parts.join(", "));
+    }
+
+    Some(NonDecompJoinPlan {
+        join_sql: format!(" LEFT JOIN ({agg_query}) {join_alias} ON {}", join_conditions.join(" AND ")),
+        replacement: format!("{join_alias}.value"),
+    })
 }
 
 /// Expand a non-decomposable measure (like COUNT DISTINCT) to a correlated subquery
@@ -2947,6 +3246,9 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         None
     };
 
+    let mut join_clauses: Vec<String> = Vec::new();
+    let mut join_counter = 0;
+
     let mut patterns = at_patterns;
     patterns.sort_by(|a, b| b.2.cmp(&a.2));
 
@@ -3013,8 +3315,13 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                         .map(|table| format!("SELECT * FROM {table}"))
                 })
                 .unwrap_or_else(|| format!("SELECT * FROM {}", resolved.source_view));
-            // Non-decomposable measure: expand against base table with correlation
-            expand_non_decomposable_to_sql(
+
+            if modifiers.is_empty() && can_use_view_measure_directly(&resolved, &group_by_cols) {
+                let measure_ref = outer_ref_for_non_decomp
+                    .map(|alias| format!("{alias}.{measure_name}"))
+                    .unwrap_or_else(|| measure_name.to_string());
+                format!("MAX({measure_ref})")
+            } else if let Some(plan) = build_non_decomposable_join_plan(
                 &resolved.expression,
                 &base_relation_sql,
                 outer_ref_for_non_decomp,
@@ -3022,7 +3329,23 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 &group_by_cols,
                 &modifiers,
                 &resolved.dimension_exprs,
-            )
+                &format!("_nd_{join_counter}"),
+            ) {
+                join_clauses.push(plan.join_sql);
+                join_counter += 1;
+                plan.replacement
+            } else {
+                // Non-decomposable measure: expand against base table with correlation
+                expand_non_decomposable_to_sql(
+                    &resolved.expression,
+                    &base_relation_sql,
+                    outer_ref_for_non_decomp,
+                    outer_where_ref,
+                    &group_by_cols,
+                    &modifiers,
+                    &resolved.dimension_exprs,
+                )
+            }
         } else {
             expand_modifiers_to_sql(
                 &measure_name,
@@ -3068,8 +3391,12 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                         .map(|table| format!("SELECT * FROM {table}"))
                 })
                 .unwrap_or_else(|| format!("SELECT * FROM {}", resolved.source_view));
-            // Non-decomposable measure: expand against base table with correlation
-            expand_non_decomposable_to_sql(
+            if can_use_view_measure_directly(&resolved, &group_by_cols) {
+                let measure_ref = outer_ref_for_non_decomp
+                    .map(|alias| format!("{alias}.{measure_name}"))
+                    .unwrap_or_else(|| measure_name.to_string());
+                format!("MAX({measure_ref})")
+            } else if let Some(plan) = build_non_decomposable_join_plan(
                 &resolved.expression,
                 &base_relation_sql,
                 outer_ref_for_non_decomp,
@@ -3077,11 +3404,39 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 &group_by_cols,
                 &[], // No modifiers for plain AGGREGATE()
                 &resolved.dimension_exprs,
-            )
+                &format!("_nd_{join_counter}"),
+            ) {
+                join_clauses.push(plan.join_sql);
+                join_counter += 1;
+                plan.replacement
+            } else {
+                // Non-decomposable measure: expand against base table with correlation
+                expand_non_decomposable_to_sql(
+                    &resolved.expression,
+                    &base_relation_sql,
+                    outer_ref_for_non_decomp,
+                    outer_where_ref,
+                    &group_by_cols,
+                    &[], // No modifiers for plain AGGREGATE()
+                    &resolved.dimension_exprs,
+                )
+            }
         } else {
             format!("{}({measure_name})", resolved.agg_fn)
         };
         result_sql = format!("{}{}{}", &result_sql[..start], expanded, &result_sql[end..]);
+    }
+
+    if !join_clauses.is_empty() {
+        if let Some(insert_pos) = find_from_clause_end(&result_sql) {
+            let joins = join_clauses.join("");
+            result_sql = format!(
+                "{}{}{}",
+                &result_sql[..insert_pos],
+                joins,
+                &result_sql[insert_pos..]
+            );
+        }
     }
 
     // Check if there are still any remaining AGGREGATE calls (shouldn't be, but just in case)
@@ -3132,6 +3487,7 @@ pub fn store_measure_view(
     let view_query = extract_view_query(base_query).unwrap_or_else(|| base_query.to_string());
     let base_relation_sql = extract_base_relation_sql(&view_query);
     let dimension_exprs = extract_dimension_exprs_from_query(&view_query);
+    let group_by_cols = extract_view_group_by_cols(&view_query);
     let measure_view = MeasureView {
         view_name: view_name.to_string(),
         measures,
@@ -3139,6 +3495,7 @@ pub fn store_measure_view(
         base_table,
         base_relation_sql,
         dimension_exprs,
+        group_by_cols,
     };
 
     let mut views = MEASURE_VIEWS.lock().unwrap();
@@ -3814,6 +4171,7 @@ FROM orders"#;
             base_table: Some("sales".to_string()),
             base_relation_sql: None,
             dimension_exprs: HashMap::new(),
+            group_by_cols: Vec::new(),
         };
 
         // Simple subtraction
@@ -4166,16 +4524,16 @@ GROUP BY s.year";
             Some("orders".to_string()),
         );
 
-        // Plain AGGREGATE should expand to correlated subquery
+        // Plain AGGREGATE should fast-path to the view's measure column
         let sql = "SELECT year, region, AGGREGATE(unique_customers) FROM orders_v GROUP BY year, region";
         let result = expand_aggregate_with_at(sql);
 
         eprintln!("Expanded SQL: {}", result.expanded_sql);
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
-        // Should contain correlated subquery against base table
-        assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
-        assert!(result.expanded_sql.contains("FROM orders"));
+        assert!(result.expanded_sql.contains("MAX("));
+        assert!(result.expanded_sql.contains("unique_customers"));
+        assert!(!result.expanded_sql.contains("COUNT(DISTINCT"));
     }
 
     #[test]
@@ -4234,7 +4592,8 @@ GROUP BY s.year";
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
         assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
-        assert!(result.expanded_sql.contains("_inner.year = _outer.year"));
+        assert!(result.expanded_sql.contains("LEFT JOIN"));
+        assert!(result.expanded_sql.contains("= _outer.year"));
     }
 
     #[test]
@@ -4261,7 +4620,7 @@ GROUP BY s.year";
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
         assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
-        assert!(result.expanded_sql.contains("FROM orders"));
+        assert!(result.expanded_sql.contains("FROM (SELECT * FROM orders"));
         assert!(!result.expanded_sql.contains("_inner."));
     }
 
@@ -4288,7 +4647,8 @@ GROUP BY s.year";
 
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
-        assert!(result.expanded_sql.contains("_inner.year = _outer.year - 1"));
+        assert!(result.expanded_sql.contains("LEFT JOIN"));
+        assert!(result.expanded_sql.contains("year - 1"));
     }
 
     #[test]
@@ -4313,6 +4673,7 @@ GROUP BY s.year";
                         .to_string(),
                 ),
                 dimension_exprs: HashMap::new(),
+                group_by_cols: Vec::new(),
             },
         );
         drop(views);
@@ -4323,9 +4684,9 @@ GROUP BY s.year";
 
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
-        assert!(result.expanded_sql.contains(
-            "FROM (SELECT * FROM orders o JOIN regions r ON o.region_id = r.id WHERE o.status = 'paid') _inner"
-        ));
+        assert!(result.expanded_sql.contains("LEFT JOIN (SELECT"));
+        assert!(result.expanded_sql.contains("JOIN regions r ON o.region_id = r.id"));
+        assert!(result.expanded_sql.contains("o.status = 'paid'"));
     }
 
     #[test]
@@ -4353,6 +4714,7 @@ GROUP BY s.year";
                 base_table: None,
                 base_relation_sql: Some("SELECT * FROM orders".to_string()),
                 dimension_exprs,
+                group_by_cols: Vec::new(),
             },
         );
         drop(views);
@@ -4363,9 +4725,11 @@ GROUP BY s.year";
 
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
+        assert!(result.expanded_sql.contains("LEFT JOIN"));
         assert!(result
             .expanded_sql
-            .contains("date_trunc('year', _inner.order_date) = _outer.year"));
+            .contains("date_trunc('year', _inner.order_date) AS dim_0"));
+        assert!(result.expanded_sql.contains("= _outer.year"));
     }
 
     #[test]
@@ -4390,8 +4754,9 @@ GROUP BY s.year";
 
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
-        assert!(result
-            .expanded_sql
-            .contains("FROM (SELECT * FROM (SELECT year, region FROM a UNION ALL SELECT year, region FROM b)) _inner"));
+        assert!(result.expanded_sql.contains("LEFT JOIN"));
+        assert!(result.expanded_sql.contains(
+            "FROM (SELECT * FROM (SELECT year, region FROM a UNION ALL SELECT year, region FROM b)) _inner"
+        ));
     }
 }
