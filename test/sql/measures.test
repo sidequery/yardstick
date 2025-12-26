@@ -985,8 +985,8 @@ FROM filtered_agg_v;
 
 # =============================================================================
 # Test: DuckDB DISTINCT in aggregate
-# Note: COUNT(DISTINCT) is not re-aggregatable, so AGGREGATE() wraps it
-# but the result is COUNT(DISTINCT value) of the pre-computed column
+# Note: COUNT(DISTINCT) is non-additive, so we recompute from base rows
+# when the view is a simple single-table source.
 # =============================================================================
 
 statement ok
@@ -1007,17 +1007,17 @@ SELECT year, unique_regions FROM distinct_count_v;
 ----
 2023	2
 
-# AGGREGATE() fails for non-decomposable measures (can't re-aggregate COUNT DISTINCT)
-statement error
+# AGGREGATE() recomputes COUNT(DISTINCT) for simple base views
+query II rowsort
 SEMANTIC SELECT year, AGGREGATE(unique_regions) FROM distinct_count_v;
 ----
-DISTINCT aggregates cannot be re-aggregated
+2023	2
 
-# AT modifiers also fail
-statement error
+# AT (ALL) also recomputes for simple base views
+query II rowsort
 SEMANTIC SELECT year, AGGREGATE(unique_regions) AT (ALL) FROM distinct_count_v;
 ----
-DISTINCT aggregates cannot be re-aggregated
+2023	2
 
 # =============================================================================
 # Test: MEDIAN also fails (non-decomposable)
