@@ -12,6 +12,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 include_directories(include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include)
 
 # Detect Rust target based on platform
 execute_process(
@@ -98,6 +99,44 @@ set(EXTENSION_SOURCES
     src/yardstick_extension.cpp
     src/yardstick_parser_ffi.cpp
 )
+
+if(NOT COMMAND build_static_extension)
+    function(build_static_extension NAME)
+        set(FILES "${ARGV}")
+        list(REMOVE_AT FILES 0)
+        add_library(${NAME}_extension STATIC ${FILES})
+    endfunction()
+
+    function(build_loadable_extension NAME PARAMETERS)
+        set(FILES "${ARGV}")
+        list(REMOVE_AT FILES 0 1)
+        set(TARGET_NAME ${NAME}_loadable_extension)
+        add_library(${TARGET_NAME} SHARED ${FILES})
+        set_target_properties(${TARGET_NAME} PROPERTIES DEFINE_SYMBOL "")
+        set_target_properties(${TARGET_NAME} PROPERTIES OUTPUT_NAME ${NAME})
+        set_target_properties(${TARGET_NAME} PROPERTIES PREFIX "")
+        set_target_properties(${TARGET_NAME} PROPERTIES SUFFIX ".duckdb_extension")
+        target_compile_definitions(${TARGET_NAME} PUBLIC -DDUCKDB_BUILD_LOADABLE_EXTENSION)
+
+        if(APPLE)
+            set_target_properties(${TARGET_NAME} PROPERTIES LINK_FLAGS "-undefined dynamic_lookup")
+        elseif(MSVC)
+            target_link_options(${TARGET_NAME} PRIVATE "/FORCE:UNRESOLVED")
+            set_target_properties(
+                ${TARGET_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY_DEBUG
+                "${CMAKE_BINARY_DIR}")
+            set_target_properties(
+                ${TARGET_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE
+                "${CMAKE_BINARY_DIR}")
+            set_target_properties(
+                ${TARGET_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY_DEBUG
+                "${CMAKE_BINARY_DIR}")
+            set_target_properties(
+                ${TARGET_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY_RELEASE
+                "${CMAKE_BINARY_DIR}")
+        endif()
+    endfunction()
+endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
