@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use nom::{
     branch::alt,
-    bytes::complete::{tag_no_case, take_until, take_while, take_while1},
+    bytes::complete::{tag_no_case, take_while, take_while1},
     character::complete::{char, multispace0, multispace1},
     combinator::{opt, recognize},
     sequence::{delimited, pair, tuple},
@@ -197,23 +197,19 @@ pub fn has_as_measure(sql: &str) -> bool {
 
 /// Check if SQL contains AGGREGATE( function
 pub fn has_aggregate_function(sql: &str) -> bool {
-    let mut remaining = sql;
-    while !remaining.is_empty() {
-        if let Ok((rest, _)) = take_until::<_, _, nom::error::Error<&str>>("AGGREGATE(")(remaining)
-        {
-            // Verify it's actually AGGREGATE( not part of another word
-            if rest.len() >= 10 {
-                return true;
-            }
+    let sql_upper = sql.to_uppercase();
+    let mut search_pos = 0;
+
+    while let Some(offset) = sql_upper[search_pos..].find("AGGREGATE") {
+        let start = search_pos + offset;
+        let after = &sql_upper[start + "AGGREGATE".len()..];
+        if after.trim_start().starts_with('(') {
+            return true;
         }
-        if remaining.len() > 1 {
-            remaining = &remaining[1..];
-        } else {
-            break;
-        }
+        search_pos = start + 1;
     }
-    // Also check case-insensitive
-    sql.to_uppercase().contains("AGGREGATE(")
+
+    false
 }
 
 /// Check if SQL contains curly brace measure syntax: `{column}`
@@ -477,7 +473,7 @@ pub fn extract_aggregate_with_at_full(
     let sql_upper = sql.to_uppercase();
     let mut search_pos = 0;
 
-    while let Some(agg_offset) = sql_upper[search_pos..].find("AGGREGATE(") {
+    while let Some(agg_offset) = sql_upper[search_pos..].find("AGGREGATE") {
         let start = search_pos + agg_offset;
 
         if let Ok((remaining, (measure, modifiers))) = aggregate_with_at(&sql[start..]) {
@@ -523,7 +519,7 @@ pub fn extract_all_aggregate_calls(sql: &str) -> Vec<(String, usize, usize)> {
     let sql_upper = sql.to_uppercase();
     let mut search_pos = 0;
 
-    while let Some(agg_offset) = sql_upper[search_pos..].find("AGGREGATE(") {
+    while let Some(agg_offset) = sql_upper[search_pos..].find("AGGREGATE") {
         let start = search_pos + agg_offset;
 
         if let Ok((remaining, (measure, modifiers))) = aggregate_with_at(&sql[start..]) {
@@ -688,6 +684,72 @@ pub fn extract_where_clause(sql: &str) -> Option<String> {
     }
 }
 
+/// Check if a CREATE VIEW / SELECT query is a simple single-table source
+/// (no JOIN, WHERE, HAVING, QUALIFY, WINDOW, UNION/INTERSECT/EXCEPT, or subquery)
+fn is_simple_base_query(sql: &str) -> bool {
+    // Normalize whitespace
+    let normalized: String = sql
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let normalized_upper = normalized.to_uppercase();
+
+    // Disallow common constructs that change the base row set
+    let disallowed = [
+        " JOIN ",
+        " WHERE ",
+        " HAVING ",
+        " QUALIFY ",
+        " WINDOW ",
+        " UNION ",
+        " INTERSECT ",
+        " EXCEPT ",
+        " WITH ",
+    ];
+    if disallowed
+        .iter()
+        .any(|kw| normalized_upper.contains(kw))
+    {
+        return false;
+    }
+
+    // Require a simple FROM clause with a single table
+    let from_pos = match normalized_upper.find(" FROM ") {
+        Some(pos) => pos + " FROM ".len(),
+        None => return false,
+    };
+
+    let end_keywords = [
+        " WHERE ",
+        " GROUP BY",
+        " ORDER BY",
+        " LIMIT ",
+        " HAVING ",
+        " QUALIFY ",
+        " WINDOW ",
+        " UNION ",
+        " INTERSECT ",
+        " EXCEPT ",
+        ";",
+    ];
+    let mut end_pos = normalized.len();
+    for kw in end_keywords {
+        if let Some(pos) = normalized_upper[from_pos..].find(kw) {
+            end_pos = end_pos.min(from_pos + pos);
+        }
+    }
+
+    let from_clause = normalized[from_pos..end_pos].trim();
+    if from_clause.is_empty() {
+        return false;
+    }
+    if from_clause.contains(',') || from_clause.contains('(') {
+        return false;
+    }
+
+    extract_table_and_alias_from_sql(sql).is_some()
+}
+
 // =============================================================================
 // Nom Parsers - Expression Helpers
 // =============================================================================
@@ -768,28 +830,20 @@ fn check_non_decomposable(expr: &str) -> Option<String> {
     None
 }
 
-/// Look up a measure's original expression
-fn get_measure_expression(measure_name: &str, default_table: &str) -> Option<String> {
-    let views = MEASURE_VIEWS.lock().unwrap();
-
-    // Check default table first
-    if let Some(v) = views.get(default_table) {
-        if let Some(m) = v
-            .measures
-            .iter()
-            .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
-        {
-            return Some(m.expression.clone());
+/// Check for non-decomposable aggregates excluding DISTINCT
+/// (used to allow COUNT(DISTINCT) in limited contexts)
+fn check_non_decomposable_non_distinct(expr: &str) -> Option<String> {
+    let expr_upper = expr.to_uppercase();
+    for agg in NON_DECOMPOSABLE_AGGREGATES {
+        if expr_upper.contains(&format!("{agg}(")) {
+            return Some(format!(
+                "{} cannot be re-aggregated with AT modifiers. \
+                 Use decomposable aggregates (SUM, COUNT, MIN, MAX, AVG) instead.",
+                agg
+            ));
         }
     }
-
-    // Search other views
-    views.values().find_map(|v| {
-        v.measures
-            .iter()
-            .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
-            .map(|m| m.expression.clone())
-    })
+    None
 }
 
 /// Find any aggregation function inside an expression
@@ -1111,15 +1165,15 @@ fn extract_measures_from_sql(
         false
     };
 
-    // Generate replacements based on whether measure is base, derived, or non-decomposable
-    // (start, end, replacement) - for derived/non-decomposable, we remove the whole column
+    // Generate replacements based on whether measure is derived
+    // (start, end, replacement) - for derived measures, we remove the whole column
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
 
     for info in &measure_infos {
-        let should_exclude = is_derived(&info.expression) || is_count_distinct(&info.expression);
+        let should_exclude = is_derived(&info.expression);
 
         if should_exclude {
-            // Derived or non-decomposable measure: remove entire column including preceding comma
+            // Derived measure: remove entire column including preceding comma
             let mut remove_start = info.expr_start;
             // Look for preceding comma
             let before = &sql[..remove_start];
@@ -1435,6 +1489,8 @@ pub struct ResolvedMeasure {
     pub agg_fn: String,
     /// The source view name
     pub source_view: String,
+    /// Whether the source view is a simple single-table query
+    pub is_simple_source: bool,
     /// For derived measures: the expanded expression
     pub derived_expr: Option<String>,
     /// Whether this measure can be re-aggregated
@@ -1467,6 +1523,7 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMe
         ResolvedMeasure {
             agg_fn,
             source_view: source_view.to_string(),
+            is_simple_source: v.base_table.is_some() && is_simple_base_query(&v.base_query),
             derived_expr,
             is_decomposable: m.is_decomposable,
             base_table: v.base_table.clone(),
@@ -1500,6 +1557,7 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMe
     ResolvedMeasure {
         agg_fn: "SUM".to_string(),
         source_view: default_table.to_string(),
+        is_simple_source: false,
         derived_expr: None,
         is_decomposable: true,
         base_table: None,
@@ -1537,15 +1595,181 @@ fn expand_non_decomposable_to_sql(
     group_by_cols: &[String],
     modifiers: &[ContextModifier],
 ) -> String {
-    let outer_ref = outer_alias.unwrap_or("_outer");
+    if modifiers.is_empty() {
+        // No modifiers = default VISIBLE behavior (respect outer WHERE)
+        return expand_non_decomposable_at_to_sql(
+            expression,
+            &ContextModifier::Visible,
+            base_table,
+            outer_alias,
+            outer_where,
+            group_by_cols,
+        );
+    }
 
-    // Build correlation conditions for the GROUP BY dimensions
-    let correlation_conditions: Vec<String> = group_by_cols
+    if modifiers.len() == 1 {
+        return expand_non_decomposable_at_to_sql(
+            expression,
+            &modifiers[0],
+            base_table,
+            outer_alias,
+            outer_where,
+            group_by_cols,
+        );
+    }
+
+    // Check if all modifiers are ALL (dimension or global)
+    let all_are_all = modifiers
+        .iter()
+        .all(|m| matches!(m, ContextModifier::All(_) | ContextModifier::AllGlobal));
+    if all_are_all {
+        // Check for explicit AllGlobal - that means grand total
+        if modifiers
+            .iter()
+            .any(|m| matches!(m, ContextModifier::AllGlobal))
+        {
+            return expand_non_decomposable_at_to_sql(
+                expression,
+                &ContextModifier::AllGlobal,
+                base_table,
+                outer_alias,
+                outer_where,
+                group_by_cols,
+            );
+        }
+
+        // Accumulate all dimensions to remove
+        let removed_dims: Vec<&str> = modifiers
+            .iter()
+            .filter_map(|m| match m {
+                ContextModifier::All(dim) => Some(dim.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // Filter group_by_cols to get remaining dimensions
+        let remaining_cols: Vec<&String> = group_by_cols
+            .iter()
+            .filter(|col| {
+                let col_lower = col.to_lowercase();
+                let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
+                !removed_dims
+                    .iter()
+                    .any(|d| d.to_lowercase() == col_lower || d.to_lowercase() == col_name)
+            })
+            .collect();
+
+        if remaining_cols.is_empty() {
+            // All dimensions removed = grand total
+            return expand_non_decomposable_at_to_sql(
+                expression,
+                &ContextModifier::AllGlobal,
+                base_table,
+                outer_alias,
+                outer_where,
+                group_by_cols,
+            );
+        }
+
+        // Generate correlation on remaining dimensions only
+        let outer_ref = outer_alias.unwrap_or(base_table);
+        let where_clauses: Vec<_> = remaining_cols
+            .iter()
+            .map(|col| {
+                let col_is_expr = col.contains('(');
+                if col_is_expr {
+                    let inner_expr = qualify_where_for_inner(col);
+                    format!("{inner_expr} = {col}")
+                } else {
+                    let col_name = col.split('.').next_back().unwrap_or(col);
+                    format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                }
+            })
+            .collect();
+        return format!(
+            "(SELECT {} FROM {} _inner WHERE {})",
+            expression,
+            base_table,
+            where_clauses.join(" AND ")
+        );
+    }
+
+    // Apply modifiers right-to-left
+    // - VISIBLE adds outer WHERE (but SET bypasses it per paper)
+    // - ALL removes dimensions from correlation
+    // - SET changes a dimension and bypasses outer WHERE
+    // - WHERE adds a filter
+
+    let has_set = modifiers
+        .iter()
+        .any(|m| matches!(m, ContextModifier::Set(_, _)));
+
+    let mut effective_where: Option<String> = None;
+    let mut has_all_global = false;
+    let mut set_conditions: Vec<String> = Vec::new();
+    let mut removed_dims: Vec<String> = Vec::new();
+
+    for modifier in modifiers.iter().rev() {
+        match modifier {
+            ContextModifier::AllGlobal => {
+                has_all_global = true;
+                effective_where = None;
+                set_conditions.clear();
+            }
+            ContextModifier::All(dim) => {
+                removed_dims.push(dim.to_lowercase());
+            }
+            ContextModifier::Visible => {
+                if !has_set && !has_all_global {
+                    if let Some(w) = outer_where {
+                        effective_where = Some(qualify_where_for_inner(w));
+                    }
+                }
+            }
+            ContextModifier::Where(cond) => {
+                if !has_all_global {
+                    effective_where = Some(qualify_where_for_inner(cond));
+                }
+            }
+            ContextModifier::Set(dim, expr) => {
+                let dim_lower = dim.to_lowercase();
+                if !has_all_global && !removed_dims.contains(&dim_lower) {
+                    let outer_ref = outer_alias.unwrap_or(base_table);
+                    let qualified_expr = qualify_outer_reference(expr, outer_ref, dim);
+                    let inner_dim = if dim.contains('(') {
+                        qualify_where_for_inner(dim)
+                    } else {
+                        format!("_inner.{dim}")
+                    };
+                    set_conditions.push(format!("{inner_dim} = {qualified_expr}"));
+                }
+            }
+        }
+    }
+
+    if has_all_global && set_conditions.is_empty() {
+        return format!("(SELECT {expression} FROM {base_table})");
+    }
+
+    // Filter group_by_cols to exclude removed dimensions
+    let remaining_cols: Vec<&String> = group_by_cols
+        .iter()
+        .filter(|col| {
+            let col_lower = col.to_lowercase();
+            let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
+            !removed_dims
+                .iter()
+                .any(|d| *d == col_lower || *d == col_name)
+        })
+        .collect();
+
+    // Build correlation conditions for remaining dimensions
+    let outer_ref = outer_alias.unwrap_or(base_table);
+    let correlation_conditions: Vec<String> = remaining_cols
         .iter()
         .map(|col| {
             let col_is_expr = col.contains('(');
             if col_is_expr {
-                // For expression dimensions like MONTH(date), qualify column refs inside
                 let inner_expr = qualify_where_for_inner(col);
                 format!("{inner_expr} = {col}")
             } else {
@@ -1555,27 +1779,12 @@ fn expand_non_decomposable_to_sql(
         })
         .collect();
 
-    // Check for compatible AT modifiers (WHERE, VISIBLE) and add their conditions
-    let mut additional_conditions: Vec<String> = Vec::new();
-    for modifier in modifiers {
-        match modifier {
-            ContextModifier::Where(cond) => {
-                additional_conditions.push(qualify_where_for_inner(cond));
-            }
-            ContextModifier::Visible => {
-                if let Some(w) = outer_where {
-                    additional_conditions.push(qualify_where_for_inner(w));
-                }
-            }
-            // AllGlobal, All, Set should have been caught earlier as errors
-            _ => {}
-        }
+    // Combine all conditions: correlation + SET conditions + WHERE
+    let mut all_conditions: Vec<String> = correlation_conditions;
+    all_conditions.extend(set_conditions);
+    if let Some(w) = effective_where {
+        all_conditions.push(w);
     }
-
-    let all_conditions: Vec<String> = correlation_conditions
-        .into_iter()
-        .chain(additional_conditions)
-        .collect();
 
     if all_conditions.is_empty() {
         format!("(SELECT {expression} FROM {base_table})")
@@ -1586,6 +1795,134 @@ fn expand_non_decomposable_to_sql(
             base_table,
             all_conditions.join(" AND ")
         )
+    }
+}
+
+/// Expand a single AT modifier for non-decomposable measures
+fn expand_non_decomposable_at_to_sql(
+    expression: &str,
+    modifier: &ContextModifier,
+    table_name: &str,
+    outer_alias: Option<&str>,
+    outer_where: Option<&str>,
+    group_by_cols: &[String],
+) -> String {
+    match modifier {
+        ContextModifier::AllGlobal => {
+            format!("(SELECT {expression} FROM {table_name})")
+        }
+        ContextModifier::All(dim) => {
+            let outer_ref = outer_alias.unwrap_or(table_name);
+            let dim_lower = dim.to_lowercase();
+            let is_expression = dim.contains('(');
+            let correlating_dims: Vec<_> = group_by_cols
+                .iter()
+                .filter(|col| {
+                    if is_expression {
+                        col.to_lowercase() != dim_lower
+                    } else {
+                        let col_name = col.split('.').next_back().unwrap_or(col);
+                        col_name.to_lowercase() != dim_lower
+                    }
+                })
+                .collect();
+
+            if correlating_dims.is_empty() {
+                format!("(SELECT {expression} FROM {table_name})")
+            } else {
+                let where_clauses: Vec<_> = correlating_dims
+                    .iter()
+                    .map(|col| {
+                        let col_is_expr = col.contains('(');
+                        if col_is_expr {
+                            let inner_expr = qualify_where_for_inner(col);
+                            format!("{inner_expr} = {col}")
+                        } else {
+                            let col_name = col.split('.').next_back().unwrap_or(col);
+                            format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                        }
+                    })
+                    .collect();
+                format!(
+                    "(SELECT {} FROM {} _inner WHERE {})",
+                    expression,
+                    table_name,
+                    where_clauses.join(" AND ")
+                )
+            }
+        }
+        ContextModifier::Set(dim, expr) => {
+            let outer_ref = outer_alias.unwrap_or(table_name);
+            let qualified_expr = qualify_outer_reference(expr, outer_ref, dim);
+            let inner_dim = if dim.contains('(') {
+                qualify_where_for_inner(dim)
+            } else {
+                format!("_inner.{dim}")
+            };
+            let set_condition = format!("{inner_dim} = {qualified_expr}");
+
+            let dim_lower = dim.to_lowercase();
+            let is_expression = dim.contains('(');
+            let correlation_conditions: Vec<String> = group_by_cols
+                .iter()
+                .filter(|col| {
+                    if is_expression {
+                        col.to_lowercase() != dim_lower
+                    } else {
+                        let col_name = col.split('.').next_back().unwrap_or(col);
+                        col_name.to_lowercase() != dim_lower
+                    }
+                })
+                .map(|col| {
+                    let col_is_expr = col.contains('(');
+                    if col_is_expr {
+                        let inner_expr = qualify_where_for_inner(col);
+                        format!("{inner_expr} = {col}")
+                    } else {
+                        let col_name = col.split('.').next_back().unwrap_or(col);
+                        format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                    }
+                })
+                .collect();
+
+            let mut all_conditions = vec![set_condition];
+            all_conditions.extend(correlation_conditions);
+
+            format!(
+                "(SELECT {} FROM {} _inner WHERE {})",
+                expression,
+                table_name,
+                all_conditions.join(" AND ")
+            )
+        }
+        ContextModifier::Where(condition) => {
+            format!("(SELECT {expression} FROM {table_name} WHERE {condition})")
+        }
+        ContextModifier::Visible => {
+            let outer_ref = outer_alias.unwrap_or(table_name);
+            if group_by_cols.is_empty() {
+                match outer_where {
+                    Some(w) => format!("(SELECT {expression} FROM {table_name} WHERE {w})"),
+                    None => format!("(SELECT {expression} FROM {table_name})"),
+                }
+            } else {
+                let where_clauses: Vec<_> = group_by_cols
+                    .iter()
+                    .map(|col| {
+                        let col_name = col.split('.').next_back().unwrap_or(col);
+                        format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                    })
+                    .collect();
+                let full_where = match outer_where {
+                    Some(w) => format!("{} AND {}", where_clauses.join(" AND "), w),
+                    None => where_clauses.join(" AND "),
+                };
+                format!(
+                    "(SELECT {} FROM {} _inner WHERE {full_where})",
+                    expression, table_name
+                )
+            }
+        }
     }
 }
 
@@ -2149,7 +2486,6 @@ fn expand_modifiers_to_sql_derived(
 /// Expand AGGREGATE() with AT modifiers in SQL
 pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     // Check if we need the full expansion path (AT modifiers or non-decomposable measures)
-    let has_at = has_at_syntax(sql);
     let has_aggregate = has_aggregate_function(sql);
 
     // If no AGGREGATE function at all, nothing to do
@@ -2161,50 +2497,13 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         };
     }
 
-    // Check if any non-decomposable measures are referenced
-    // (we need the full expansion path for these even without AT modifiers)
-    let plain_calls = extract_all_aggregate_calls(sql);
-    let has_non_decomposable = {
-        let views = MEASURE_VIEWS.lock().unwrap();
-        plain_calls.iter().any(|(measure_name, _, _)| {
-            views.values().any(|v| {
-                v.measures
-                    .iter()
-                    .any(|m| m.column_name.eq_ignore_ascii_case(measure_name) && !m.is_decomposable)
-            })
-        })
-    };
-
-    // If no AT syntax and no non-decomposable measures, use simpler expansion
-    if !has_at && !has_non_decomposable {
-        return expand_aggregate(sql);
-    }
-
     let at_patterns = extract_aggregate_with_at_full(sql);
-    // Only fall back to simple expand if no AT patterns AND no non-decomposable measures
-    if at_patterns.is_empty() && !has_non_decomposable {
-        return expand_aggregate(sql);
-    }
+    // Keep full expansion path even without AT to handle non-decomposable measures safely
 
     // Extract table info using string-based approach (works with AGGREGATE syntax)
     // Note: DuckDB's parser can't parse AGGREGATE() since it's our custom syntax
     let (primary_table_name, existing_alias) =
         extract_table_and_alias_from_sql(sql).unwrap_or_else(|| ("t".to_string(), None));
-
-    // Check for non-decomposable aggregates used with AT modifiers
-    for (measure_name, modifiers, _, _) in &at_patterns {
-        if !modifiers.is_empty() {
-            if let Some(expr) = get_measure_expression(measure_name, &primary_table_name) {
-                if let Some(error_msg) = check_non_decomposable(&expr) {
-                    return AggregateExpandResult {
-                        had_aggregate: true,
-                        expanded_sql: sql.to_string(),
-                        error: Some(error_msg),
-                    };
-                }
-            }
-        }
-    }
 
     // Build FromClauseInfo from string-based extraction for now
     // TODO: For proper JOIN support, we'd need to extract all tables from the FROM clause
@@ -2269,35 +2568,27 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         // Look up which view contains this measure (for JOIN support)
         let resolved = resolve_measure_source(&measure_name, &primary_table_name);
 
-        // Check for non-decomposable measures with incompatible AT modifiers
-        if !resolved.is_decomposable {
-            let has_incompatible_modifier = modifiers.iter().any(|m| {
-                matches!(
-                    m,
-                    ContextModifier::AllGlobal
-                        | ContextModifier::All(_)
-                        | ContextModifier::Set(_, _)
-                )
-            });
-            if has_incompatible_modifier {
-                let modifier_desc = modifiers
-                    .iter()
-                    .find_map(|m| match m {
-                        ContextModifier::AllGlobal => Some("AT (ALL)".to_string()),
-                        ContextModifier::All(dim) => Some(format!("AT (ALL {dim})")),
-                        ContextModifier::Set(dim, _) => Some(format!("AT (SET {dim} = ...)")),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "AT modifier".to_string());
+        // Non-decomposable (non-DISTINCT) aggregates always error with AT modifiers
+        if !modifiers.is_empty() {
+            if let Some(error_msg) = check_non_decomposable_non_distinct(&resolved.expression) {
                 return AggregateExpandResult {
-                    had_aggregate: false,
+                    had_aggregate: true,
                     expanded_sql: sql.to_string(),
-                    error: Some(format!(
-                        "{} not supported for non-decomposable measure '{}' (COUNT DISTINCT cannot be re-aggregated)",
-                        modifier_desc, measure_name
-                    )),
+                    error: Some(error_msg),
                 };
             }
+        }
+
+        // COUNT DISTINCT requires a simple base view to recompute at altered contexts
+        if !resolved.is_decomposable && !resolved.is_simple_source {
+            return AggregateExpandResult {
+                had_aggregate: false,
+                expanded_sql: sql.to_string(),
+                error: Some(format!(
+                    "AGGREGATE on non-decomposable measure '{}' requires a simple base view (single table, no WHERE/JOIN)",
+                    measure_name
+                )),
+            };
         }
 
         // Find the alias for this measure's source view in the FROM clause
@@ -2336,11 +2627,13 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 &group_by_cols,
             )
         } else if !resolved.is_decomposable {
+            let outer_ref_for_non_decomp =
+                outer_alias_ref.or(Some(resolved.source_view.as_str()));
             // Non-decomposable measure: expand against base table with correlation
             expand_non_decomposable_to_sql(
                 &resolved.expression,
                 &resolved.base_table.clone().unwrap_or_else(|| resolved.source_view.clone()),
-                outer_alias_ref,
+                outer_ref_for_non_decomp,
                 outer_where_ref,
                 &group_by_cols,
                 &modifiers,
@@ -2366,15 +2659,36 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     for (measure_name, start, end) in plain_calls {
         let resolved = resolve_measure_source(&measure_name, &primary_table_name);
 
+        if let Some(error_msg) = check_non_decomposable_non_distinct(&resolved.expression) {
+            return AggregateExpandResult {
+                had_aggregate: true,
+                expanded_sql: sql.to_string(),
+                error: Some(error_msg),
+            };
+        }
+
+        if !resolved.is_decomposable && !resolved.is_simple_source {
+            return AggregateExpandResult {
+                had_aggregate: false,
+                expanded_sql: sql.to_string(),
+                error: Some(format!(
+                    "AGGREGATE on non-decomposable measure '{}' requires a simple base view (single table, no WHERE/JOIN)",
+                    measure_name
+                )),
+            };
+        }
+
         // For derived measures, use the expanded expression; otherwise use AGG(measure_name)
         let expanded = if let Some(expr) = resolved.derived_expr {
             expr
         } else if !resolved.is_decomposable {
+            let outer_ref_for_non_decomp =
+                primary_alias.as_deref().or(Some(resolved.source_view.as_str()));
             // Non-decomposable measure: expand against base table with correlation
             expand_non_decomposable_to_sql(
                 &resolved.expression,
                 &resolved.base_table.unwrap_or_else(|| resolved.source_view.clone()),
-                primary_alias.as_deref(),
+                outer_ref_for_non_decomp,
                 outer_where_ref,
                 &group_by_cols,
                 &[], // No modifiers for plain AGGREGATE()
@@ -3436,10 +3750,10 @@ GROUP BY s.year";
         assert!(!mv.measures[0].is_decomposable); // COUNT DISTINCT is non-decomposable
         assert_eq!(mv.base_table, Some("orders".to_string()));
 
-        // The clean SQL should NOT contain the COUNT(DISTINCT) column
-        // (non-decomposable measures are excluded from the view)
-        assert!(!result.clean_sql.contains("COUNT(DISTINCT"));
-        assert!(!result.clean_sql.contains("unique_customers"));
+        // The clean SQL should keep the COUNT(DISTINCT) column for base queries
+        assert!(result.clean_sql.contains("COUNT(DISTINCT"));
+        assert!(result.clean_sql.contains("unique_customers"));
+        assert!(!result.clean_sql.contains("AS MEASURE"));
     }
 
     #[test]
@@ -3504,7 +3818,7 @@ GROUP BY s.year";
 
     #[test]
     #[serial]
-    fn test_expand_count_distinct_at_all_error() {
+    fn test_expand_count_distinct_at_all() {
         clear_measure_views();
 
         store_measure_view(
@@ -3518,22 +3832,21 @@ GROUP BY s.year";
             Some("orders".to_string()),
         );
 
-        // AT (ALL region) should ERROR for COUNT(DISTINCT)
+        // AT (ALL region) should recompute COUNT(DISTINCT) with remaining context
         let sql = "SELECT year, AGGREGATE(unique_customers) AT (ALL region) \
                    FROM orders_v GROUP BY year";
         let result = expand_aggregate_with_at(sql);
 
-        eprintln!("Result: {result:?}");
-        assert!(result.error.is_some());
-        let error = result.error.unwrap();
-        assert!(error.contains("not supported"));
-        assert!(error.contains("non-decomposable"));
-        assert!(error.contains("unique_customers"));
+        eprintln!("Expanded SQL: {}", result.expanded_sql);
+        assert!(result.had_aggregate);
+        assert!(result.error.is_none());
+        assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
+        assert!(result.expanded_sql.contains("_inner.year = _outer.year"));
     }
 
     #[test]
     #[serial]
-    fn test_expand_count_distinct_at_all_global_error() {
+    fn test_expand_count_distinct_at_all_global() {
         clear_measure_views();
 
         store_measure_view(
@@ -3547,20 +3860,21 @@ GROUP BY s.year";
             Some("orders".to_string()),
         );
 
-        // AT (ALL) - grand total should ERROR for COUNT(DISTINCT)
+        // AT (ALL) - grand total should recompute COUNT(DISTINCT)
         let sql = "SELECT year, AGGREGATE(unique_customers) AT (ALL) \
                    FROM orders_v GROUP BY year";
         let result = expand_aggregate_with_at(sql);
 
-        assert!(result.error.is_some());
-        let error = result.error.unwrap();
-        assert!(error.contains("AT (ALL)"));
-        assert!(error.contains("non-decomposable"));
+        assert!(result.had_aggregate);
+        assert!(result.error.is_none());
+        assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
+        assert!(result.expanded_sql.contains("FROM orders"));
+        assert!(!result.expanded_sql.contains("_inner."));
     }
 
     #[test]
     #[serial]
-    fn test_expand_count_distinct_at_set_error() {
+    fn test_expand_count_distinct_at_set() {
         clear_measure_views();
 
         store_measure_view(
@@ -3574,14 +3888,13 @@ GROUP BY s.year";
             Some("orders".to_string()),
         );
 
-        // AT (SET year = year - 1) should ERROR for COUNT(DISTINCT)
+        // AT (SET year = year - 1) should recompute COUNT(DISTINCT)
         let sql = "SELECT year, AGGREGATE(unique_customers) AT (SET year = year - 1) \
                    FROM orders_v GROUP BY year";
         let result = expand_aggregate_with_at(sql);
 
-        assert!(result.error.is_some());
-        let error = result.error.unwrap();
-        assert!(error.contains("AT (SET"));
-        assert!(error.contains("non-decomposable"));
+        assert!(result.had_aggregate);
+        assert!(result.error.is_none());
+        assert!(result.expanded_sql.contains("_inner.year = _outer.year - 1"));
     }
 }
