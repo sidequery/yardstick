@@ -12,6 +12,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 include_directories(include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include)
 
 # Detect Rust target based on platform
 execute_process(
@@ -49,13 +50,24 @@ elseif("${OS_NAME}" STREQUAL "osx" OR APPLE)
         set(Rust_CARGO_TARGET "x86_64-apple-darwin")
     endif()
 elseif(WIN32)
-   if (MINGW AND "${OS_ARCH}" STREQUAL "arm64")
+   # Determine Windows architecture - OS_ARCH may not be set when running CMake directly
+   set(_WIN_ARCH "${OS_ARCH}")
+   if("${_WIN_ARCH}" STREQUAL "")
+       # Fallback: CMAKE_HOST_SYSTEM_PROCESSOR is "AMD64" on 64-bit Windows
+       if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "AMD64")
+           set(_WIN_ARCH "amd64")
+       elseif(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "ARM64")
+           set(_WIN_ARCH "arm64")
+       endif()
+   endif()
+
+   if (MINGW AND "${_WIN_ARCH}" STREQUAL "arm64")
        set(Rust_CARGO_TARGET "aarch64-pc-windows-gnu")
-   elseif (MINGW AND "${OS_ARCH}" STREQUAL "amd64")
+   elseif (MINGW AND "${_WIN_ARCH}" STREQUAL "amd64")
        set(Rust_CARGO_TARGET "x86_64-pc-windows-gnu")
-   elseif (MSVC AND "${OS_ARCH}" STREQUAL "arm64")
+   elseif (MSVC AND "${_WIN_ARCH}" STREQUAL "arm64")
        set(Rust_CARGO_TARGET "aarch64-pc-windows-msvc")
-   elseif (MSVC AND "${OS_ARCH}" STREQUAL "amd64")
+   elseif (MSVC AND "${_WIN_ARCH}" STREQUAL "amd64")
        set(Rust_CARGO_TARGET "x86_64-pc-windows-msvc")
    endif()
 endif()
@@ -88,6 +100,44 @@ set(EXTENSION_SOURCES
     src/yardstick_parser_ffi.cpp
 )
 
+if(NOT COMMAND build_static_extension)
+    function(build_static_extension NAME)
+        set(FILES "${ARGV}")
+        list(REMOVE_AT FILES 0)
+        add_library(${NAME}_extension STATIC ${FILES})
+    endfunction()
+
+    function(build_loadable_extension NAME PARAMETERS)
+        set(FILES "${ARGV}")
+        list(REMOVE_AT FILES 0 1)
+        set(TARGET_NAME ${NAME}_loadable_extension)
+        add_library(${TARGET_NAME} SHARED ${FILES})
+        set_target_properties(${TARGET_NAME} PROPERTIES DEFINE_SYMBOL "")
+        set_target_properties(${TARGET_NAME} PROPERTIES OUTPUT_NAME ${NAME})
+        set_target_properties(${TARGET_NAME} PROPERTIES PREFIX "")
+        set_target_properties(${TARGET_NAME} PROPERTIES SUFFIX ".duckdb_extension")
+        target_compile_definitions(${TARGET_NAME} PUBLIC -DDUCKDB_BUILD_LOADABLE_EXTENSION)
+
+        if(APPLE)
+            set_target_properties(${TARGET_NAME} PROPERTIES LINK_FLAGS "-undefined dynamic_lookup")
+        elseif(MSVC)
+            target_link_options(${TARGET_NAME} PRIVATE "/FORCE:UNRESOLVED")
+            set_target_properties(
+                ${TARGET_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY_DEBUG
+                "${CMAKE_BINARY_DIR}")
+            set_target_properties(
+                ${TARGET_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE
+                "${CMAKE_BINARY_DIR}")
+            set_target_properties(
+                ${TARGET_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY_DEBUG
+                "${CMAKE_BINARY_DIR}")
+            set_target_properties(
+                ${TARGET_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY_RELEASE
+                "${CMAKE_BINARY_DIR}")
+        endif()
+    endfunction()
+endif()
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
@@ -105,6 +155,12 @@ endif()
 if(UNIX AND NOT APPLE)
     target_link_libraries(${EXTENSION_NAME} pthread dl)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} pthread dl)
+endif()
+
+# On Windows, we need these system libraries for Rust
+if(WIN32)
+    target_link_libraries(${EXTENSION_NAME} ws2_32 userenv bcrypt ntdll)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 userenv bcrypt ntdll)
 endif()
 
 install(
