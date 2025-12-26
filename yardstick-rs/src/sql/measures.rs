@@ -350,7 +350,8 @@ fn at_where(input: &str) -> IResult<&str, ContextModifier> {
     let (input, _) = multispace1(input)?;
     // Take rest as condition (until closing paren, handled by caller)
     let (input, cond) = take_while(|c: char| c != ')')(input)?;
-    Ok((input, ContextModifier::Where(cond.trim().to_string())))
+    let stripped = strip_at_where_qualifiers(cond.trim());
+    Ok((input, ContextModifier::Where(stripped)))
 }
 
 /// Parse any AT modifier content
@@ -1011,7 +1012,9 @@ fn extract_view_group_by_cols(view_query: &str) -> Vec<String> {
 }
 
 fn find_from_clause_end(sql: &str) -> Option<usize> {
-    let query = sql.trim().trim_end_matches(';');
+    // Preserve leading whitespace so returned indices match the original SQL.
+    let query = sql.trim_end();
+    let query = query.strip_suffix(';').unwrap_or(query);
     let from_pos = find_top_level_keyword(query, "FROM", 0)?;
     let start = from_pos + 4;
     Some(
@@ -1400,6 +1403,69 @@ fn qualify_where_for_outer(where_clause: &str, outer_alias: &str) -> String {
                 result.push('.');
             }
             result.push_str(&ident);
+        } else if c == '\'' {
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+fn strip_at_where_qualifiers(condition: &str) -> String {
+    let mut result = String::new();
+    let mut chars = condition.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c.is_alphabetic() || c == '_' {
+            let mut ident = String::from(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' {
+                    ident.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+
+            let mut last_ident = ident;
+            while chars.peek() == Some(&'.') {
+                chars.next(); // consume '.'
+                if let Some(&next) = chars.peek() {
+                    if next.is_alphabetic() || next == '_' {
+                        let mut next_ident = String::new();
+                        while let Some(&next_ch) = chars.peek() {
+                            if next_ch.is_alphanumeric() || next_ch == '_' {
+                                next_ident.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        }
+                        last_ident = next_ident;
+                        continue;
+                    } else {
+                        result.push_str(&last_ident);
+                        result.push('.');
+                        break;
+                    }
+                } else {
+                    result.push_str(&last_ident);
+                    result.push('.');
+                    break;
+                }
+            }
+
+            result.push_str(&last_ident);
         } else if c == '\'' {
             result.push(c);
             while let Some(next) = chars.next() {
@@ -2177,9 +2243,10 @@ fn build_non_decomposable_join_plan(
                     }
                     ContextModifier::Where(cond) => {
                         if !has_all_global {
+                            let stripped = strip_at_where_qualifiers(cond);
                             effective_where =
                                 Some(qualify_where_for_inner_with_dimensions(
-                                    cond,
+                                    &stripped,
                                     dimension_exprs,
                                 ));
                         }
@@ -2412,8 +2479,12 @@ fn expand_non_decomposable_to_sql(
             }
             ContextModifier::Where(cond) => {
                 if !has_all_global {
+                    let stripped = strip_at_where_qualifiers(cond);
                     effective_where =
-                        Some(qualify_where_for_inner_with_dimensions(cond, dimension_exprs));
+                        Some(qualify_where_for_inner_with_dimensions(
+                            &stripped,
+                            dimension_exprs,
+                        ));
                 }
             }
             ContextModifier::Set(dim, expr) => {
@@ -2571,8 +2642,9 @@ fn expand_non_decomposable_at_to_sql(
             )
         }
         ContextModifier::Where(condition) => {
+            let stripped = strip_at_where_qualifiers(condition);
             let qualified =
-                qualify_where_for_inner_with_dimensions(condition, dimension_exprs);
+                qualify_where_for_inner_with_dimensions(&stripped, dimension_exprs);
             format!(
                 "(SELECT {expression} FROM {base_relation} _inner WHERE {qualified})"
             )
@@ -2738,8 +2810,9 @@ pub fn expand_at_to_sql(
             )
         }
         ContextModifier::Where(condition) => {
+            let stripped = strip_at_where_qualifiers(condition);
             format!(
-                "(SELECT {measure_expr} FROM {table_name} WHERE {condition})"
+                "(SELECT {measure_expr} FROM {table_name} WHERE {stripped})"
             )
         }
         ContextModifier::Visible => {
@@ -2919,8 +2992,9 @@ pub fn expand_modifiers_to_sql(
             }
             ContextModifier::Where(cond) => {
                 if !has_all_global {
+                    let stripped = strip_at_where_qualifiers(cond);
                     // Qualify column references with _inner
-                    effective_where = Some(qualify_where_for_inner(cond));
+                    effective_where = Some(qualify_where_for_inner(&stripped));
                 }
             }
             ContextModifier::Set(dim, expr) => {
@@ -3108,7 +3182,8 @@ fn expand_modifiers_to_sql_derived(
             }
             ContextModifier::Where(cond) => {
                 if !has_all_global {
-                    effective_where = Some(qualify_where_for_inner(cond));
+                    let stripped = strip_at_where_qualifiers(cond);
+                    effective_where = Some(qualify_where_for_inner(&stripped));
                 }
             }
             ContextModifier::Set(_, _) => {
@@ -3778,6 +3853,12 @@ FROM orders"#;
     }
 
     #[test]
+    fn test_parse_at_modifier_where_strips_qualifier() {
+        let result = parse_at_modifier("WHERE sales.region = 'US'").unwrap();
+        assert_eq!(result, ContextModifier::Where("region = 'US'".to_string()));
+    }
+
+    #[test]
     fn test_extract_aggregate_with_at() {
         let sql = "SELECT status, AGGREGATE(revenue) AT (ALL status) FROM orders";
         let results = extract_aggregate_with_at(sql);
@@ -3822,7 +3903,7 @@ FROM orders"#;
         let expanded = expand_at_to_sql(
             "revenue",
             "SUM",
-            &ContextModifier::Where("region = 'US'".to_string()),
+            &ContextModifier::Where("orders.region = 'US'".to_string()),
             "orders",
             None,
             None,
@@ -3899,6 +3980,17 @@ FROM orders"#;
         assert_eq!(
             extract_view_name("CREATE OR REPLACE VIEW bar AS SELECT 1"),
             Some("bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_base_relation_sql_with_cte() {
+        let view_query = "WITH base AS (SELECT * FROM orders) \
+                          SELECT year, COUNT(*) AS cnt FROM base GROUP BY year";
+        let base_relation = extract_base_relation_sql(view_query).unwrap();
+        assert_eq!(
+            base_relation,
+            "WITH base AS (SELECT * FROM orders) SELECT * FROM base"
         );
     }
 

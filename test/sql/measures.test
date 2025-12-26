@@ -75,6 +75,16 @@ FROM sales_v;
 2023	EU	250.0
 2023	US	250.0
 
+# Qualified columns inside AT (WHERE)
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (WHERE sales_v.region = 'US') AS us_revenue
+FROM sales_v;
+----
+2022	EU	250.0
+2022	US	250.0
+2023	EU	250.0
+2023	US	250.0
+
 # =============================================================================
 # Test: AT (SET dimension = expression) - Year over Year
 # =============================================================================
@@ -1016,6 +1026,18 @@ SEMANTIC SELECT year, AGGREGATE(unique_regions) FROM distinct_count_v;
 # AT (ALL) also recomputes for simple base views
 query II rowsort
 SEMANTIC SELECT year, AGGREGATE(unique_regions) AT (ALL) FROM distinct_count_v;
+----
+2023	2
+
+# COUNT(DISTINCT) with CTE-based view
+statement ok
+CREATE VIEW distinct_count_cte_v AS
+WITH base AS (SELECT * FROM dup_regions)
+SELECT year, COUNT(DISTINCT region) AS MEASURE unique_regions
+FROM base;
+
+query II rowsort
+SEMANTIC SELECT year, AGGREGATE(unique_regions) FROM distinct_count_cte_v;
 ----
 2023	2
 
