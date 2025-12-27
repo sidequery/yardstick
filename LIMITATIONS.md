@@ -17,6 +17,7 @@ Implementation of Julian Hyde's "Measures in SQL" paper (arXiv:2406.00251).
 - Arithmetic with AGGREGATE results (ratios, percentages, differences)
 - All DuckDB aggregate functions (SUM, COUNT, AVG, MIN, MAX, STDDEV, MEDIAN, etc.)
 - COUNT(DISTINCT) aggregations via base-row recompute (supports AT modifiers)
+  - Recompute is correct but can be more expensive than decomposable measures
 - Derived measures: `revenue - cost AS MEASURE profit` expands to `SUM(revenue) - SUM(cost)`
 - Multi-fact JOINs: measures from different views can be queried together in a single JOIN
 
@@ -47,31 +48,4 @@ CREATE VIEW v AS
 SELECT year,
   SUM(revenue) OVER (ORDER BY year) AS MEASURE running_total
 FROM t;
-```
-
-### 3. COUNT(DISTINCT) Recompute
-
-COUNT(DISTINCT) is non-decomposable: you cannot re-aggregate distinct counts from subsets without double-counting. Yardstick recomputes distinct counts from the view's base relation at query time (the view's FROM/WHERE, including any CTEs). This is correct but can be more expensive than decomposable measures.
-
-**Works (recomputed):**
-```sql
--- Basic COUNT(DISTINCT) measure
-CREATE VIEW orders_v AS
-SELECT year, region, COUNT(DISTINCT customer_id) AS MEASURE unique_customers
-FROM orders;
-
--- Simple aggregation
-SEMANTIC SELECT year, region, AGGREGATE(unique_customers) FROM orders_v;
-
--- AT (WHERE) - just adds a filter
-SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (WHERE region = 'US') FROM orders_v;
-
--- AT (VISIBLE) - applies outer WHERE clause
-SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (VISIBLE) FROM orders_v WHERE region = 'US';
-
--- AT (ALL) - recompute on the full base relation
-SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (ALL) FROM orders_v;
-
--- AT (SET) - recompute in a different context
-SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (SET year = year - 1) FROM orders_v;
 ```
