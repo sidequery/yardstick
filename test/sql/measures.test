@@ -1049,7 +1049,7 @@ statement ok
 CREATE TABLE median_test (category VARCHAR, value DOUBLE);
 
 statement ok
-INSERT INTO median_test VALUES ('A', 10), ('A', 20), ('A', 30), ('B', 100);
+INSERT INTO median_test VALUES ('A', 10), ('A', 20), ('A', 30), ('B', 100), ('B', 100);
 
 statement ok
 CREATE VIEW median_v AS
@@ -1063,17 +1063,57 @@ SELECT category, med_value FROM median_v;
 A	20.0
 B	100.0
 
-# AGGREGATE() fails for non-decomposable
-statement error
+# AGGREGATE() recomputes for non-decomposable measures
+query II rowsort
 SEMANTIC SELECT category, AGGREGATE(med_value) FROM median_v;
 ----
-MEDIAN cannot be re-aggregated
+A	20.0
+B	100.0
 
-# AT modifier also fails
-statement error
-SEMANTIC SELECT category, AGGREGATE(med_value) AT (ALL) FROM median_v;
+# AT (ALL) recomputes from base rows
+query R
+SEMANTIC SELECT AGGREGATE(med_value) AT (ALL) FROM median_v;
 ----
-MEDIAN cannot be re-aggregated
+30.0
+
+# =============================================================================
+# Test: MODE / QUANTILE aggregates (non-decomposable)
+# =============================================================================
+
+statement ok
+CREATE TABLE ordered_set_test (category VARCHAR, value INT);
+
+statement ok
+INSERT INTO ordered_set_test VALUES
+    ('A', 1), ('A', 1), ('A', 2), ('A', 3), ('A', 4),
+    ('B', 10), ('B', 10), ('B', 20);
+
+statement ok
+CREATE VIEW ordered_set_v AS
+SELECT
+    category,
+    QUANTILE_CONT(value, 0.5) AS MEASURE q50,
+    QUANTILE_DISC(value, 0.5) AS MEASURE q50d,
+    MODE(value) AS MEASURE mode_value
+FROM ordered_set_test;
+
+query II rowsort
+SEMANTIC SELECT category, AGGREGATE(q50) FROM ordered_set_v;
+----
+A	2.0
+B	10.0
+
+query II rowsort
+SEMANTIC SELECT category, AGGREGATE(q50d) FROM ordered_set_v;
+----
+A	2
+B	10
+
+query II rowsort
+SEMANTIC SELECT category, AGGREGATE(mode_value) FROM ordered_set_v;
+----
+A	1
+B	10
 
 # =============================================================================
 # Test: DuckDB generate_series / UNNEST

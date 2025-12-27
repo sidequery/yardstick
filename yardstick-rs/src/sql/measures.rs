@@ -1127,7 +1127,7 @@ fn has_distinct_modifier(expr: &str) -> bool {
     }
 }
 
-/// Non-decomposable aggregate functions that cannot be re-aggregated
+/// Non-decomposable aggregate functions that require recompute from base rows
 const NON_DECOMPOSABLE_AGGREGATES: &[&str] = &[
     "MEDIAN",
     "PERCENTILE_CONT",
@@ -1138,47 +1138,17 @@ const NON_DECOMPOSABLE_AGGREGATES: &[&str] = &[
     "QUANTILE_DISC",
 ];
 
-/// Check if expression uses a non-decomposable aggregate
-/// Returns Some(reason) if non-decomposable, None if OK
-fn check_non_decomposable(expr: &str) -> Option<String> {
-    // Check for DISTINCT (e.g., COUNT(DISTINCT x))
+/// Returns true if expression uses a non-decomposable aggregate
+/// (including COUNT DISTINCT and ordered-set aggregates)
+fn is_non_decomposable(expr: &str) -> bool {
     if has_distinct_modifier(expr) {
-        return Some(format!(
-            "DISTINCT aggregates cannot be re-aggregated with AT modifiers. \
-             Expression '{}' uses DISTINCT which is not decomposable.",
-            expr
-        ));
+        return true;
     }
 
-    // Check for non-decomposable functions
     let expr_upper = expr.to_uppercase();
-    for agg in NON_DECOMPOSABLE_AGGREGATES {
-        if expr_upper.contains(&format!("{agg}(")) {
-            return Some(format!(
-                "{} cannot be re-aggregated with AT modifiers. \
-                 Use decomposable aggregates (SUM, COUNT, MIN, MAX, AVG) instead.",
-                agg
-            ));
-        }
-    }
-
-    None
-}
-
-/// Check for non-decomposable aggregates excluding DISTINCT
-/// (used to allow COUNT(DISTINCT) in limited contexts)
-fn check_non_decomposable_non_distinct(expr: &str) -> Option<String> {
-    let expr_upper = expr.to_uppercase();
-    for agg in NON_DECOMPOSABLE_AGGREGATES {
-        if expr_upper.contains(&format!("{agg}(")) {
-            return Some(format!(
-                "{} cannot be re-aggregated with AT modifiers. \
-                 Use decomposable aggregates (SUM, COUNT, MIN, MAX, AVG) instead.",
-                agg
-            ));
-        }
-    }
-    None
+    NON_DECOMPOSABLE_AGGREGATES
+        .iter()
+        .any(|agg| expr_upper.contains(&format!("{agg}(")))
 }
 
 /// Find any aggregation function inside an expression
@@ -1714,7 +1684,7 @@ fn extract_measures_from_sql(
         .into_iter()
         .map(|m| ViewMeasure {
             column_name: m.name,
-            is_decomposable: !is_count_distinct(&m.expression),
+            is_decomposable: !is_non_decomposable(&m.expression),
             expression: m.expression,
         })
         .collect();
@@ -1865,18 +1835,17 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
     // Sort by position descending for safe replacement
     aggregate_calls.sort_by(|a, b| b.1.cmp(&a.1));
 
-    // Check for non-decomposable aggregates
+    // Non-decomposable measures require the recompute path
     if let Some(mv) = measure_view {
-        for (measure_name, _, _) in &aggregate_calls {
-            if let Some(m) = mv.measures.iter().find(|m| m.column_name.eq_ignore_ascii_case(measure_name)) {
-                if let Some(error_msg) = check_non_decomposable(&m.expression) {
-                    return AggregateExpandResult {
-                        had_aggregate: true,
-                        expanded_sql: sql.to_string(),
-                        error: Some(error_msg),
-                    };
-                }
-            }
+        let uses_non_decomposable = aggregate_calls.iter().any(|(measure_name, _, _)| {
+            mv.measures
+                .iter()
+                .find(|m| m.column_name.eq_ignore_ascii_case(measure_name))
+                .map(|m| is_non_decomposable(&m.expression))
+                .unwrap_or(false)
+        });
+        if uses_non_decomposable {
+            return expand_aggregate_with_at(sql);
         }
     }
 
@@ -3331,16 +3300,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         // Look up which view contains this measure (for JOIN support)
         let resolved = resolve_measure_source(&measure_name, &primary_table_name);
 
-        // Non-decomposable (non-DISTINCT) aggregates always error with AT modifiers
-        if !modifiers.is_empty() {
-            if let Some(error_msg) = check_non_decomposable_non_distinct(&resolved.expression) {
-                return AggregateExpandResult {
-                    had_aggregate: true,
-                    expanded_sql: sql.to_string(),
-                    error: Some(error_msg),
-                };
-            }
-        }
+        // Non-decomposable measures are recomputed from base rows (including AT modifiers)
 
         // Find the alias for this measure's source view in the FROM clause
         // If the source view is the primary table and we added _outer, use _outer
@@ -3391,27 +3351,14 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 })
                 .unwrap_or_else(|| format!("SELECT * FROM {}", resolved.source_view));
 
-            if modifiers.is_empty() && can_use_view_measure_directly(&resolved, &group_by_cols) {
-                let measure_ref = outer_ref_for_non_decomp
-                    .map(|alias| format!("{alias}.{measure_name}"))
-                    .unwrap_or_else(|| measure_name.to_string());
-                format!("MAX({measure_ref})")
-            } else if let Some(plan) = build_non_decomposable_join_plan(
-                &resolved.expression,
-                &base_relation_sql,
-                outer_ref_for_non_decomp,
-                outer_where_ref,
-                &group_by_cols,
-                &modifiers,
-                &resolved.dimension_exprs,
-                &format!("_nd_{join_counter}"),
-            ) {
-                join_clauses.push(plan.join_sql);
-                join_counter += 1;
-                plan.replacement
-            } else {
-                // Non-decomposable measure: expand against base table with correlation
-                expand_non_decomposable_to_sql(
+            let (expanded, already_aggregated) =
+                if modifiers.is_empty() && can_use_view_measure_directly(&resolved, &group_by_cols)
+                {
+                    let measure_ref = outer_ref_for_non_decomp
+                        .map(|alias| format!("{alias}.{measure_name}"))
+                        .unwrap_or_else(|| measure_name.to_string());
+                    (format!("MAX({measure_ref})"), true)
+                } else if let Some(plan) = build_non_decomposable_join_plan(
                     &resolved.expression,
                     &base_relation_sql,
                     outer_ref_for_non_decomp,
@@ -3419,7 +3366,31 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                     &group_by_cols,
                     &modifiers,
                     &resolved.dimension_exprs,
-                )
+                    &format!("_nd_{join_counter}"),
+                ) {
+                    join_clauses.push(plan.join_sql);
+                    join_counter += 1;
+                    (plan.replacement, false)
+                } else {
+                    // Non-decomposable measure: expand against base table with correlation
+                    (
+                        expand_non_decomposable_to_sql(
+                            &resolved.expression,
+                            &base_relation_sql,
+                            outer_ref_for_non_decomp,
+                            outer_where_ref,
+                            &group_by_cols,
+                            &modifiers,
+                            &resolved.dimension_exprs,
+                        ),
+                        false,
+                    )
+                };
+
+            if original_dim_cols.is_empty() && !already_aggregated {
+                format!("MAX({expanded})")
+            } else {
+                expanded
             }
         } else {
             expand_modifiers_to_sql(
@@ -3442,13 +3413,6 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     for (measure_name, start, end) in plain_calls {
         let resolved = resolve_measure_source(&measure_name, &primary_table_name);
 
-        if let Some(error_msg) = check_non_decomposable_non_distinct(&resolved.expression) {
-            return AggregateExpandResult {
-                had_aggregate: true,
-                expanded_sql: sql.to_string(),
-                error: Some(error_msg),
-            };
-        }
 
         // For derived measures, use the expanded expression; otherwise use AGG(measure_name)
         let expanded = if let Some(expr) = resolved.derived_expr {
@@ -3466,27 +3430,13 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                         .map(|table| format!("SELECT * FROM {table}"))
                 })
                 .unwrap_or_else(|| format!("SELECT * FROM {}", resolved.source_view));
-            if can_use_view_measure_directly(&resolved, &group_by_cols) {
-                let measure_ref = outer_ref_for_non_decomp
-                    .map(|alias| format!("{alias}.{measure_name}"))
-                    .unwrap_or_else(|| measure_name.to_string());
-                format!("MAX({measure_ref})")
-            } else if let Some(plan) = build_non_decomposable_join_plan(
-                &resolved.expression,
-                &base_relation_sql,
-                outer_ref_for_non_decomp,
-                outer_where_ref,
-                &group_by_cols,
-                &[], // No modifiers for plain AGGREGATE()
-                &resolved.dimension_exprs,
-                &format!("_nd_{join_counter}"),
-            ) {
-                join_clauses.push(plan.join_sql);
-                join_counter += 1;
-                plan.replacement
-            } else {
-                // Non-decomposable measure: expand against base table with correlation
-                expand_non_decomposable_to_sql(
+            let (expanded, already_aggregated) =
+                if can_use_view_measure_directly(&resolved, &group_by_cols) {
+                    let measure_ref = outer_ref_for_non_decomp
+                        .map(|alias| format!("{alias}.{measure_name}"))
+                        .unwrap_or_else(|| measure_name.to_string());
+                    (format!("MAX({measure_ref})"), true)
+                } else if let Some(plan) = build_non_decomposable_join_plan(
                     &resolved.expression,
                     &base_relation_sql,
                     outer_ref_for_non_decomp,
@@ -3494,7 +3444,31 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                     &group_by_cols,
                     &[], // No modifiers for plain AGGREGATE()
                     &resolved.dimension_exprs,
-                )
+                    &format!("_nd_{join_counter}"),
+                ) {
+                    join_clauses.push(plan.join_sql);
+                    join_counter += 1;
+                    (plan.replacement, false)
+                } else {
+                    // Non-decomposable measure: expand against base table with correlation
+                    (
+                        expand_non_decomposable_to_sql(
+                            &resolved.expression,
+                            &base_relation_sql,
+                            outer_ref_for_non_decomp,
+                            outer_where_ref,
+                            &group_by_cols,
+                            &[], // No modifiers for plain AGGREGATE()
+                            &resolved.dimension_exprs,
+                        ),
+                        false,
+                    )
+                };
+
+            if original_dim_cols.is_empty() && !already_aggregated {
+                format!("MAX({expanded})")
+            } else {
+                expanded
             }
         } else {
             format!("{}({measure_name})", resolved.agg_fn)
@@ -4565,6 +4539,19 @@ GROUP BY s.year";
         assert!(!is_count_distinct("COUNT(*)"));
         assert!(!is_count_distinct("SUM(amount)"));
         assert!(!is_count_distinct("AVG(price)"));
+    }
+
+    #[test]
+    fn test_is_non_decomposable() {
+        assert!(is_non_decomposable("COUNT(DISTINCT user_id)"));
+        assert!(is_non_decomposable("median(value)"));
+        assert!(is_non_decomposable("percentile_cont(0.5) within group (order by value)"));
+        assert!(is_non_decomposable("quantile_cont(value, 0.5)"));
+        assert!(is_non_decomposable("quantile_disc(value, 0.5)"));
+        assert!(is_non_decomposable("mode(value)"));
+
+        assert!(!is_non_decomposable("SUM(value)"));
+        assert!(!is_non_decomposable("AVG(value)"));
     }
 
     #[test]
