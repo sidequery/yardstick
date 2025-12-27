@@ -1097,6 +1097,9 @@ SELECT
     MODE(value) AS MEASURE mode_value
 FROM ordered_set_test;
 
+# DuckDB percentile syntax uses WITHIN GROUP, which doesn't parse with AS MEASURE.
+# QUANTILE_* is the equivalent in DuckDB.
+
 query II rowsort
 SEMANTIC SELECT category, AGGREGATE(q50) FROM ordered_set_v;
 ----

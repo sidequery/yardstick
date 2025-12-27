@@ -1456,6 +1456,121 @@ fn strip_at_where_qualifiers(condition: &str) -> String {
     result
 }
 
+fn rewrite_percentile_within_group(sql: &str) -> String {
+    let upper = sql.to_uppercase();
+    let upper_bytes = upper.as_bytes();
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let (func_name, quantile_name) = if upper_bytes[i..].starts_with(b"PERCENTILE_CONT") {
+            ("PERCENTILE_CONT", "QUANTILE_CONT")
+        } else if upper_bytes[i..].starts_with(b"PERCENTILE_DISC") {
+            ("PERCENTILE_DISC", "QUANTILE_DISC")
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        };
+
+        let name_len = func_name.len();
+        let mut j = i + name_len;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        let args_start = j + 1;
+        let (after_args, args) = match balanced_parens(&sql[args_start..]) {
+            Ok(res) => res,
+            Err(_) => {
+                out.push(bytes[i] as char);
+                i += 1;
+                continue;
+            }
+        };
+        let args_len = args.len();
+        let args_end = args_start + args_len;
+        if args_end >= sql.len() || !after_args.starts_with(')') {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        let mut k = args_end + 1;
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= bytes.len() || !upper_bytes[k..].starts_with(b"WITHIN") {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        k += "WITHIN".len();
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= bytes.len() || !upper_bytes[k..].starts_with(b"GROUP") {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        k += "GROUP".len();
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= bytes.len() || bytes[k] != b'(' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        let inner_start = k + 1;
+        let (after_inner, inner) = match balanced_parens(&sql[inner_start..]) {
+            Ok(res) => res,
+            Err(_) => {
+                out.push(bytes[i] as char);
+                i += 1;
+                continue;
+            }
+        };
+        let inner_len = inner.len();
+        let inner_end = inner_start + inner_len;
+        if inner_end >= sql.len() || !after_inner.starts_with(')') {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        let inner_trim = inner.trim();
+        let inner_upper = inner_trim.to_uppercase();
+        if !inner_upper.starts_with("ORDER BY") {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let order_expr = inner_trim["ORDER BY".len()..].trim();
+        if order_expr.is_empty() {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        out.push_str(&format!(
+            "{quantile_name}({order_expr}, {})",
+            args.trim()
+        ));
+        i = inner_end + 1;
+    }
+
+    out
+}
+
 fn qualify_where_for_inner_with_dimensions(
     where_clause: &str,
     dimension_exprs: &HashMap<String, String>,
@@ -1728,6 +1843,8 @@ fn extract_measures_from_sql(
             }
         );
     }
+
+    clean_sql = rewrite_percentile_within_group(&clean_sql);
 
     Ok((clean_sql, measures, view_name, base_table))
 }
@@ -4555,6 +4672,13 @@ GROUP BY s.year";
     }
 
     #[test]
+    fn test_rewrite_percentile_within_group() {
+        let sql = "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY value) AS p50";
+        let rewritten = rewrite_percentile_within_group(sql);
+        assert!(rewritten.contains("QUANTILE_CONT(value, 0.5)"));
+    }
+
+    #[test]
     #[serial]
     fn test_process_create_view_count_distinct() {
         clear_measure_views();
@@ -4585,6 +4709,7 @@ GROUP BY s.year";
         assert!(result.clean_sql.contains("unique_customers"));
         assert!(!result.clean_sql.contains("AS MEASURE"));
     }
+
 
     #[test]
     #[serial]
