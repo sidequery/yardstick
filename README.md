@@ -107,7 +107,7 @@ SELECT
 FROM table;
 ```
 
-Yardstick automatically handles the grouping. All DuckDB aggregate functions are supported; `COUNT(DISTINCT)` is recomputed from base rows at query time (see below).
+Yardstick automatically handles the grouping. All DuckDB aggregate functions are supported; non-decomposable aggregates (COUNT(DISTINCT), MEDIAN, PERCENTILE_*, QUANTILE_*, MODE) are recomputed from base rows at query time and support AT modifiers, but can be more expensive.
 
 ### Querying Measures
 
@@ -133,27 +133,6 @@ FROM view_name;
 | `AT (WHERE cond)` | Pre-aggregation filter | `AGGREGATE(revenue) AT (WHERE region = 'US')` |
 | `AT (VISIBLE)` | Use query's WHERE clause | `AGGREGATE(revenue) AT (VISIBLE)` |
 
-### COUNT(DISTINCT) Measures
-
-`COUNT(DISTINCT)` is a non-decomposable aggregate: you can't sum distinct counts from subsets without double-counting. Yardstick handles this by recomputing distinct counts from the view's base relation at query time (the view's FROM/WHERE, including CTEs). This supports AT modifiers but is typically more expensive than decomposable measures.
-
-```sql
--- Define a COUNT(DISTINCT) measure
-CREATE VIEW orders_v AS
-SELECT year, region, COUNT(DISTINCT customer_id) AS MEASURE unique_customers
-FROM orders;
-
--- Basic query works
-SEMANTIC SELECT year, region, AGGREGATE(unique_customers) FROM orders_v;
-
--- AT (WHERE) works (just adds a filter)
-SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (WHERE region = 'US') FROM orders_v;
-
--- AT modifiers are supported via recompute
-SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (ALL) FROM orders_v;
-SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (SET year = year - 1) FROM orders_v;
-```
-
 ## Building
 
 Prerequisites:
@@ -173,7 +152,6 @@ The extension will be at `build/release/extension/yardstick/yardstick.duckdb_ext
 See [LIMITATIONS.md](LIMITATIONS.md) for known issues and workarounds.
 
 Key limitations:
-- Non-decomposable aggregates like MEDIAN/PERCENTILE/MODE cannot use AGGREGATE() (COUNT DISTINCT is supported via recompute)
 - Window function measures not supported
 
 ## Testimonials

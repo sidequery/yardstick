@@ -1092,13 +1092,24 @@ statement ok
 CREATE VIEW ordered_set_v AS
 SELECT
     category,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY value) AS MEASURE p50,
+    PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY value) AS MEASURE p50d,
     QUANTILE_CONT(value, 0.5) AS MEASURE q50,
     QUANTILE_DISC(value, 0.5) AS MEASURE q50d,
     MODE(value) AS MEASURE mode_value
 FROM ordered_set_test;
 
-# DuckDB percentile syntax uses WITHIN GROUP, which doesn't parse with AS MEASURE.
-# QUANTILE_* is the equivalent in DuckDB.
+query II rowsort
+SEMANTIC SELECT category, AGGREGATE(p50) FROM ordered_set_v;
+----
+A	2.0
+B	10.0
+
+query II rowsort
+SEMANTIC SELECT category, AGGREGATE(p50d) FROM ordered_set_v;
+----
+A	2
+B	10
 
 query II rowsort
 SEMANTIC SELECT category, AGGREGATE(q50) FROM ordered_set_v;

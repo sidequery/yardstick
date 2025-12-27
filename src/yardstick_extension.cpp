@@ -66,6 +66,153 @@ extern "C" {
 
 namespace duckdb {
 
+static std::string RewritePercentileWithinGroup(const std::string &sql) {
+    std::string out;
+    out.reserve(sql.size());
+    const auto upper = StringUtil::Upper(sql);
+
+    size_t i = 0;
+    while (i < sql.size()) {
+        auto at = [&](const char *keyword) {
+            size_t len = strlen(keyword);
+            return i + len <= upper.size() && upper.compare(i, len, keyword) == 0;
+        };
+
+        const char *quantile_fn = nullptr;
+        size_t fn_len = 0;
+        if (at("PERCENTILE_CONT")) {
+            quantile_fn = "QUANTILE_CONT";
+            fn_len = strlen("PERCENTILE_CONT");
+        } else if (at("PERCENTILE_DISC")) {
+            quantile_fn = "QUANTILE_DISC";
+            fn_len = strlen("PERCENTILE_DISC");
+        } else {
+            out.push_back(sql[i]);
+            i++;
+            continue;
+        }
+
+        size_t j = i + fn_len;
+        while (j < sql.size() && std::isspace(static_cast<unsigned char>(sql[j]))) {
+            j++;
+        }
+        if (j >= sql.size() || sql[j] != '(') {
+            out.push_back(sql[i]);
+            i++;
+            continue;
+        }
+
+        size_t args_start = j + 1;
+        size_t depth = 0;
+        size_t k = args_start;
+        for (; k < sql.size(); k++) {
+            if (sql[k] == '(') {
+                depth++;
+            } else if (sql[k] == ')') {
+                if (depth == 0) {
+                    break;
+                }
+                depth--;
+            } else if (sql[k] == '\'' || sql[k] == '"') {
+                char quote = sql[k];
+                k++;
+                while (k < sql.size() && sql[k] != quote) {
+                    if (sql[k] == '\\' && k + 1 < sql.size()) {
+                        k++;
+                    }
+                    k++;
+                }
+            }
+        }
+        if (k >= sql.size() || sql[k] != ')') {
+            out.push_back(sql[i]);
+            i++;
+            continue;
+        }
+        auto args = sql.substr(args_start, k - args_start);
+        size_t after_args = k + 1;
+
+        size_t m = after_args;
+        while (m < sql.size() && std::isspace(static_cast<unsigned char>(sql[m]))) {
+            m++;
+        }
+        if (m >= sql.size() || upper.compare(m, 6, "WITHIN") != 0) {
+            out.push_back(sql[i]);
+            i++;
+            continue;
+        }
+        m += 6;
+        while (m < sql.size() && std::isspace(static_cast<unsigned char>(sql[m]))) {
+            m++;
+        }
+        if (m >= sql.size() || upper.compare(m, 5, "GROUP") != 0) {
+            out.push_back(sql[i]);
+            i++;
+            continue;
+        }
+        m += 5;
+        while (m < sql.size() && std::isspace(static_cast<unsigned char>(sql[m]))) {
+            m++;
+        }
+        if (m >= sql.size() || sql[m] != '(') {
+            out.push_back(sql[i]);
+            i++;
+            continue;
+        }
+
+        size_t inner_start = m + 1;
+        depth = 0;
+        size_t n = inner_start;
+        for (; n < sql.size(); n++) {
+            if (sql[n] == '(') {
+                depth++;
+            } else if (sql[n] == ')') {
+                if (depth == 0) {
+                    break;
+                }
+                depth--;
+            } else if (sql[n] == '\'' || sql[n] == '"') {
+                char quote = sql[n];
+                n++;
+                while (n < sql.size() && sql[n] != quote) {
+                    if (sql[n] == '\\' && n + 1 < sql.size()) {
+                        n++;
+                    }
+                    n++;
+                }
+            }
+        }
+        if (n >= sql.size() || sql[n] != ')') {
+            out.push_back(sql[i]);
+            i++;
+            continue;
+        }
+
+        auto inner = sql.substr(inner_start, n - inner_start);
+        StringUtil::Trim(inner);
+        auto inner_upper = StringUtil::Upper(inner);
+        if (!StringUtil::StartsWith(inner_upper, "ORDER BY")) {
+            out.push_back(sql[i]);
+            i++;
+            continue;
+        }
+        auto order_expr = inner.substr(strlen("ORDER BY"));
+        StringUtil::Trim(order_expr);
+        if (order_expr.empty()) {
+            out.push_back(sql[i]);
+            i++;
+            continue;
+        }
+
+        auto trimmed_args = args;
+        StringUtil::Trim(trimmed_args);
+        out += std::string(quantile_fn) + "(" + order_expr + ", " + trimmed_args + ")";
+        i = n + 1;
+    }
+
+    return out;
+}
+
 //=============================================================================
 // TABLE FUNCTION: yardstick(sql) - Execute SQL with AGGREGATE() expansion
 //=============================================================================
@@ -234,7 +381,8 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
 
     // Check for CREATE VIEW with AS MEASURE
     if (yardstick_has_as_measure(sql_to_check.c_str())) {
-        YardstickCreateViewResult result = yardstick_process_create_view(query.c_str());
+        std::string rewritten_query = RewritePercentileWithinGroup(query);
+        YardstickCreateViewResult result = yardstick_process_create_view(rewritten_query.c_str());
 
         if (result.error) {
             string error_msg(result.error);
@@ -243,7 +391,7 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
         }
 
         if (result.is_measure_view) {
-            string clean_sql(result.clean_sql);
+            string clean_sql = RewritePercentileWithinGroup(result.clean_sql);
             yardstick_free_create_view_result(result);
 
             Parser parser;
