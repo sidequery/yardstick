@@ -16,7 +16,7 @@ Implementation of Julian Hyde's "Measures in SQL" paper (arXiv:2406.00251).
 - Multiple measures in same view
 - Arithmetic with AGGREGATE results (ratios, percentages, differences)
 - All DuckDB aggregate functions (SUM, COUNT, AVG, MIN, MAX, STDDEV, MEDIAN, etc.)
-- COUNT(DISTINCT) aggregations (with restrictions, see below)
+- COUNT(DISTINCT) aggregations via base-row recompute (supports AT modifiers)
 - Derived measures: `revenue - cost AS MEASURE profit` expands to `SUM(revenue) - SUM(cost)`
 - Multi-fact JOINs: measures from different views can be queried together in a single JOIN
 
@@ -49,11 +49,11 @@ SELECT year,
 FROM t;
 ```
 
-### 3. COUNT(DISTINCT) AT Modifier Restrictions
+### 3. COUNT(DISTINCT) Recompute
 
-COUNT(DISTINCT) is non-decomposable: you cannot re-aggregate distinct counts from subsets without double-counting. Yardstick handles this by evaluating COUNT(DISTINCT) via correlated subqueries at query time.
+COUNT(DISTINCT) is non-decomposable: you cannot re-aggregate distinct counts from subsets without double-counting. Yardstick recomputes distinct counts from the view's base relation at query time (the view's FROM/WHERE, including any CTEs). This is correct but can be more expensive than decomposable measures.
 
-**Works:**
+**Works (recomputed):**
 ```sql
 -- Basic COUNT(DISTINCT) measure
 CREATE VIEW orders_v AS
@@ -68,19 +68,10 @@ SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (WHERE region = 'US') FROM 
 
 -- AT (VISIBLE) - applies outer WHERE clause
 SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (VISIBLE) FROM orders_v WHERE region = 'US';
+
+-- AT (ALL) - recompute on the full base relation
+SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (ALL) FROM orders_v;
+
+-- AT (SET) - recompute in a different context
+SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (SET year = year - 1) FROM orders_v;
 ```
-
-**Does NOT work:**
-```sql
--- AT (ALL) - grand total requires re-aggregating distinct counts
-AGGREGATE(unique_customers) AT (ALL)
-
--- AT (ALL dim) - removing a dimension requires re-aggregation
-AGGREGATE(unique_customers) AT (ALL region)
-
--- AT (SET) - comparing across contexts requires re-aggregation
-AGGREGATE(unique_customers) AT (SET year = year - 1)
-```
-
-These will return an error explaining that the modifier is not supported for non-decomposable measures.
-

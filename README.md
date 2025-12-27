@@ -107,7 +107,7 @@ SELECT
 FROM table;
 ```
 
-Yardstick automatically handles the grouping. All DuckDB aggregate functions are supported, including `COUNT(DISTINCT)` with some restrictions (see below).
+Yardstick automatically handles the grouping. All DuckDB aggregate functions are supported; `COUNT(DISTINCT)` is recomputed from base rows at query time (see below).
 
 ### Querying Measures
 
@@ -135,7 +135,7 @@ FROM view_name;
 
 ### COUNT(DISTINCT) Measures
 
-`COUNT(DISTINCT)` is a non-decomposable aggregate: you can't sum distinct counts from subsets without double-counting. Yardstick handles this by deferring evaluation to query time via correlated subqueries.
+`COUNT(DISTINCT)` is a non-decomposable aggregate: you can't sum distinct counts from subsets without double-counting. Yardstick handles this by recomputing distinct counts from the view's base relation at query time (the view's FROM/WHERE, including CTEs). This supports AT modifiers but is typically more expensive than decomposable measures.
 
 ```sql
 -- Define a COUNT(DISTINCT) measure
@@ -148,15 +148,10 @@ SEMANTIC SELECT year, region, AGGREGATE(unique_customers) FROM orders_v;
 
 -- AT (WHERE) works (just adds a filter)
 SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (WHERE region = 'US') FROM orders_v;
-```
 
-**Restrictions**: AT modifiers that require re-aggregation will error:
-
-```sql
--- These will return an error:
-AGGREGATE(unique_customers) AT (ALL)          -- can't compute grand total from subset totals
-AGGREGATE(unique_customers) AT (ALL region)   -- can't remove dimension and re-aggregate
-AGGREGATE(unique_customers) AT (SET year = year - 1)  -- can't compare across contexts
+-- AT modifiers are supported via recompute
+SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (ALL) FROM orders_v;
+SEMANTIC SELECT year, AGGREGATE(unique_customers) AT (SET year = year - 1) FROM orders_v;
 ```
 
 ## Building
@@ -178,9 +173,8 @@ The extension will be at `build/release/extension/yardstick/yardstick.duckdb_ext
 See [LIMITATIONS.md](LIMITATIONS.md) for known issues and workarounds.
 
 Key limitations:
-- Non-decomposable aggregates (COUNT DISTINCT, MEDIAN, PERCENTILE) cannot use AGGREGATE()
+- Non-decomposable aggregates like MEDIAN/PERCENTILE/MODE cannot use AGGREGATE() (COUNT DISTINCT is supported via recompute)
 - Window function measures not supported
-- `COUNT(DISTINCT)` works but cannot be used with `AT (ALL)`, `AT (ALL dim)`, or `AT (SET)` modifiers
 
 ## Testimonials
 
