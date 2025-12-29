@@ -166,6 +166,9 @@ endif()
 if(WIN32)
     target_link_libraries(${EXTENSION_NAME} ws2_32 userenv bcrypt ntdll)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 userenv bcrypt ntdll)
+    # Avoid import lib name collision with Rust staticlib (yardstick.lib).
+    set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES
+        ARCHIVE_OUTPUT_NAME "${TARGET_NAME}_loadable")
 endif()
 
 install(
