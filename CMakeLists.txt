@@ -92,6 +92,11 @@ corrosion_import_crate(MANIFEST_PATH "${CMAKE_CURRENT_SOURCE_DIR}/yardstick-rs/C
     CRATES "yardstick"
 )
 
+# Avoid MSVC import-lib name clashes with the loadable extension output.
+if(WIN32 AND TARGET yardstick-static)
+    set_target_properties(yardstick-static PROPERTIES OUTPUT_NAME yardstick_rust)
+endif()
+
 # Include Rust library headers
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/yardstick-rs/include)
 
