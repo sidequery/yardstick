@@ -51,7 +51,8 @@ SELECT
     COUNT(*) AS MEASURE order_count
 FROM sales;
 
--- Query with AGGREGATE() and AT modifiers (SEMANTIC prefix required)
+-- Query with AGGREGATE() and AT modifiers
+-- SEMANTIC is required for AGGREGATE() without AT, optional for AT queries
 SEMANTIC SELECT
     year,
     region,
@@ -111,12 +112,19 @@ Yardstick automatically handles the grouping. All DuckDB aggregate functions are
 
 ### Querying Measures
 
-Queries using `AGGREGATE()` must use the `SEMANTIC` prefix:
+Queries using `AGGREGATE()` without AT modifiers must use the `SEMANTIC` prefix. If an `AT (...)` modifier is present, the query can run without `SEMANTIC` because the AT syntax routes the statement through the extension parser.
 
 ```sql
 SEMANTIC SELECT
     dimensions,
     AGGREGATE(measure_name) [AT modifier]
+FROM view_name;
+```
+
+```sql
+SELECT
+    dimensions,
+    AGGREGATE(measure_name) AT (ALL)
 FROM view_name;
 ```
 

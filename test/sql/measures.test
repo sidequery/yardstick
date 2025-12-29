@@ -49,6 +49,28 @@ FROM sales_v;
 2023	US	225.0
 
 # =============================================================================
+# Test: AT modifiers without SEMANTIC prefix
+# =============================================================================
+
+query IIR rowsort
+SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
+query IIR rowsort
+SELECT year, region, AGGREGATE(revenue) AT (WHERE region = 'US') AS us_revenue
+FROM sales_v;
+----
+2022	EU	250.0
+2022	US	250.0
+2023	EU	250.0
+2023	US	250.0
+
+# =============================================================================
 # Test: AT (ALL) - grand total (no dimensions)
 # =============================================================================
 
