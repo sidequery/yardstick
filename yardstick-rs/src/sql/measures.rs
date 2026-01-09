@@ -7,7 +7,7 @@
 //!
 //! Reference: https://arxiv.org/abs/2406.00251
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use nom::{
@@ -203,16 +203,135 @@ pub fn has_as_measure(sql: &str) -> bool {
 
 /// Check if SQL contains AGGREGATE( function
 pub fn has_aggregate_function(sql: &str) -> bool {
-    let sql_upper = sql.to_uppercase();
-    let mut search_pos = 0;
+    let chars: Vec<char> = sql.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
 
-    while let Some(offset) = sql_upper[search_pos..].find("AGGREGATE") {
-        let start = search_pos + offset;
-        let after = &sql_upper[start + "AGGREGATE".len()..];
-        if after.trim_start().starts_with('(') {
-            return true;
+    let is_ident_start = |c: char| c.is_alphabetic() || c == '_';
+    let is_ident_char = |c: char| c.is_alphanumeric() || c == '_';
+
+    let skip_whitespace = |mut idx: usize| -> usize {
+        while idx < len && chars[idx].is_whitespace() {
+            idx += 1;
         }
-        search_pos = start + 1;
+        idx
+    };
+
+    let parse_identifier = |start: usize| -> (String, usize) {
+        let mut idx = start + 1;
+        while idx < len && is_ident_char(chars[idx]) {
+            idx += 1;
+        }
+        let token: String = chars[start..idx].iter().collect();
+        (token, idx)
+    };
+
+    let parse_quoted_identifier = |start: usize| -> (String, usize) {
+        let mut token = String::new();
+        let mut idx = start;
+        while idx < len {
+            match chars[idx] {
+                '"' => {
+                    if idx + 1 < len && chars[idx + 1] == '"' {
+                        token.push('"');
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                        break;
+                    }
+                }
+                c => {
+                    token.push(c);
+                    idx += 1;
+                }
+            }
+        }
+        (token, idx)
+    };
+
+    let parse_qualified_chain = |first: String, mut idx: usize| -> (String, usize) {
+        let mut last = first;
+        loop {
+            idx = skip_whitespace(idx);
+            if idx >= len || chars[idx] != '.' {
+                break;
+            }
+            idx += 1;
+            idx = skip_whitespace(idx);
+            if idx >= len {
+                break;
+            }
+            if chars[idx] == '"' {
+                let (token, next) = parse_quoted_identifier(idx + 1);
+                last = token;
+                idx = next;
+            } else if is_ident_start(chars[idx]) {
+                let (token, next) = parse_identifier(idx);
+                last = token;
+                idx = next;
+            } else {
+                break;
+            }
+        }
+        (last, idx)
+    };
+
+    let is_aggregate_token = |token: &str| token.eq_ignore_ascii_case("AGGREGATE");
+
+    while i < len {
+        match chars[i] {
+            '\'' => {
+                i += 1;
+                while i < len {
+                    if chars[i] == '\'' {
+                        if i + 1 < len && chars[i + 1] == '\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '-' if i + 1 < len && chars[i + 1] == '-' => {
+                i += 2;
+                while i < len && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < len && chars[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < len {
+                    if chars[i] == '*' && chars[i + 1] == '/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '"' => {
+                let (token, next) = parse_quoted_identifier(i + 1);
+                let (last, after_chain) = parse_qualified_chain(token, next);
+                let after_ws = skip_whitespace(after_chain);
+                if after_ws < len && chars[after_ws] == '(' && is_aggregate_token(&last) {
+                    return true;
+                }
+                i = after_chain;
+            }
+            c if is_ident_start(c) => {
+                let (token, next) = parse_identifier(i);
+                let (last, after_chain) = parse_qualified_chain(token, next);
+                let after_ws = skip_whitespace(after_chain);
+                if after_ws < len && chars[after_ws] == '(' && is_aggregate_token(&last) {
+                    return true;
+                }
+                i = after_chain;
+            }
+            _ => {
+                i += 1;
+            }
+        }
     }
 
     false
@@ -1244,6 +1363,52 @@ fn group_by_matches_view(outer_cols: &[String], view_cols: &[String]) -> bool {
     !outer_set.is_empty() && outer_set == view_set
 }
 
+fn filter_group_by_cols_for_measure(
+    outer_cols: &[String],
+    view_cols: &[String],
+    dimension_exprs: &HashMap<String, String>,
+) -> Vec<String> {
+    if view_cols.is_empty() {
+        return outer_cols.to_vec();
+    }
+
+    let view_set: HashSet<String> = view_cols
+        .iter()
+        .map(|col| normalize_group_by_col(col))
+        .collect();
+
+    let mut alias_expr_norms: Vec<(String, String)> = Vec::new();
+    alias_expr_norms.reserve(dimension_exprs.len());
+    for (alias, expr) in dimension_exprs.iter() {
+        alias_expr_norms.push((
+            normalize_group_by_col(alias),
+            normalize_group_by_col(expr),
+        ));
+    }
+
+    outer_cols
+        .iter()
+        .filter(|col| {
+            let normalized_outer = normalize_group_by_col(col);
+            if view_set.contains(&normalized_outer) {
+                return true;
+            }
+
+            if let Some(expr) = dimension_exprs.get(&normalized_outer) {
+                let normalized_expr = normalize_group_by_col(expr);
+                if view_set.contains(&normalized_expr) {
+                    return true;
+                }
+            }
+
+            alias_expr_norms.iter().any(|(alias_norm, expr_norm)| {
+                expr_norm == &normalized_outer && view_set.contains(alias_norm)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 fn can_use_view_measure_directly(resolved: &ResolvedMeasure, outer_group_by: &[String]) -> bool {
     group_by_matches_view(outer_group_by, &resolved.view_group_by_cols)
 }
@@ -1485,8 +1650,17 @@ pub fn qualify_outer_reference(expr: &str, table_name: &str, dim: &str) -> Strin
 /// "region = 'US'" -> "_inner.region = 'US'"
 /// "year > 2020 AND region = 'US'" -> "_inner.year > 2020 AND _inner.region = 'US'"
 fn qualify_where_for_inner(where_clause: &str) -> String {
+    if let Ok(result) = parser_ffi::qualify_expression(where_clause, "_inner") {
+        return result;
+    }
+    qualify_where_for_inner_fallback(where_clause)
+}
+
+fn qualify_where_for_inner_fallback(where_clause: &str) -> String {
     let mut result = String::new();
     let mut chars = where_clause.chars().peekable();
+    let mut previous_was_dot = false;
+    let mut previous_was_as = false;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -1501,23 +1675,28 @@ fn qualify_where_for_inner(where_clause: &str) -> String {
             }
 
             // Check if followed by a dot (already qualified) or paren (function call)
-            let already_qualified = chars.peek() == Some(&'.');
+            let already_qualified = previous_was_dot || chars.peek() == Some(&'.');
             let is_function = chars.peek() == Some(&'(');
 
             // SQL keywords that should not be prefixed
             let keywords = [
-                "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
+                "AND", "OR", "NOT", "IN", "IS", "AS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
                 "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
             ];
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
+            let is_type_context = previous_was_as;
+            let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
 
-            if !already_qualified && !is_keyword && !is_function {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
                 result.push_str("_inner.");
             }
             result.push_str(&ident);
+            previous_was_dot = false;
+            previous_was_as = ident.eq_ignore_ascii_case("AS");
         } else if c == '\'' {
             // String literal - copy as-is until closing quote
             result.push(c);
+            previous_was_dot = false;
             while let Some(next) = chars.next() {
                 result.push(next);
                 if next == '\'' {
@@ -1531,6 +1710,7 @@ fn qualify_where_for_inner(where_clause: &str) -> String {
             }
         } else {
             result.push(c);
+            previous_was_dot = c == '.';
         }
     }
 
@@ -1538,8 +1718,17 @@ fn qualify_where_for_inner(where_clause: &str) -> String {
 }
 
 fn qualify_where_for_outer(where_clause: &str, outer_alias: &str) -> String {
+    if let Ok(result) = parser_ffi::qualify_expression(where_clause, outer_alias) {
+        return result;
+    }
+    qualify_where_for_outer_fallback(where_clause, outer_alias)
+}
+
+fn qualify_where_for_outer_fallback(where_clause: &str, outer_alias: &str) -> String {
     let mut result = String::new();
     let mut chars = where_clause.chars().peekable();
+    let mut previous_was_dot = false;
+    let mut previous_was_as = false;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -1552,22 +1741,27 @@ fn qualify_where_for_outer(where_clause: &str, outer_alias: &str) -> String {
                 }
             }
 
-            let already_qualified = chars.peek() == Some(&'.');
+            let already_qualified = previous_was_dot || chars.peek() == Some(&'.');
             let is_function = chars.peek() == Some(&'(');
 
             let keywords = [
-                "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
+                "AND", "OR", "NOT", "IN", "IS", "AS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
                 "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
             ];
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
+            let is_type_context = previous_was_as;
+            let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
 
-            if !already_qualified && !is_keyword && !is_function {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
                 result.push_str(outer_alias);
                 result.push('.');
             }
             result.push_str(&ident);
+            previous_was_dot = false;
+            previous_was_as = ident.eq_ignore_ascii_case("AS");
         } else if c == '\'' {
             result.push(c);
+            previous_was_dot = false;
             while let Some(next) = chars.next() {
                 result.push(next);
                 if next == '\'' {
@@ -1580,6 +1774,7 @@ fn qualify_where_for_outer(where_clause: &str, outer_alias: &str) -> String {
             }
         } else {
             result.push(c);
+            previous_was_dot = c == '.';
         }
     }
 
@@ -1770,6 +1965,8 @@ fn qualify_where_for_inner_with_dimensions(
 ) -> String {
     let mut result = String::new();
     let mut chars = where_clause.chars().peekable();
+    let mut previous_was_dot = false;
+    let mut previous_was_as = false;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -1782,16 +1979,18 @@ fn qualify_where_for_inner_with_dimensions(
                 }
             }
 
-            let already_qualified = chars.peek() == Some(&'.');
+            let already_qualified = previous_was_dot || chars.peek() == Some(&'.');
             let is_function = chars.peek() == Some(&'(');
 
             let keywords = [
-                "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
+                "AND", "OR", "NOT", "IN", "IS", "AS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
                 "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
             ];
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
+            let is_type_context = previous_was_as;
+            let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
 
-            if !already_qualified && !is_keyword && !is_function {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
                 let key = normalize_dimension_key(&ident);
                 if let Some(expr) = dimension_exprs.get(&key) {
                     let inner_expr = qualify_where_for_inner(expr);
@@ -1803,8 +2002,11 @@ fn qualify_where_for_inner_with_dimensions(
                 result.push_str("_inner.");
             }
             result.push_str(&ident);
+            previous_was_dot = false;
+            previous_was_as = ident.eq_ignore_ascii_case("AS");
         } else if c == '\'' {
             result.push(c);
+            previous_was_dot = false;
             while let Some(next) = chars.next() {
                 result.push(next);
                 if next == '\'' {
@@ -1817,10 +2019,36 @@ fn qualify_where_for_inner_with_dimensions(
             }
         } else {
             result.push(c);
+            previous_was_dot = c == '.';
         }
     }
 
     result
+}
+
+fn is_typed_literal_keyword(
+    ident: &str,
+    chars: &std::iter::Peekable<std::str::Chars<'_>>,
+) -> bool {
+    let is_keyword = ident.eq_ignore_ascii_case("DATE")
+        || ident.eq_ignore_ascii_case("TIME")
+        || ident.eq_ignore_ascii_case("TIMESTAMP")
+        || ident.eq_ignore_ascii_case("TIMESTAMPTZ")
+        || ident.eq_ignore_ascii_case("INTERVAL");
+    if !is_keyword {
+        return false;
+    }
+
+    let mut lookahead = chars.clone();
+    while let Some(&next) = lookahead.peek() {
+        if next.is_whitespace() {
+            lookahead.next();
+            continue;
+        }
+        break;
+    }
+
+    matches!(lookahead.peek(), Some(&'\''))
 }
 
 // =============================================================================
@@ -3619,6 +3847,11 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     for (measure_name, modifiers, start, end) in patterns {
         // Look up which view contains this measure (for JOIN support)
         let resolved = resolve_measure_source(&measure_name, &primary_table_name);
+        let measure_group_by_cols = filter_group_by_cols_for_measure(
+            &group_by_cols,
+            &resolved.view_group_by_cols,
+            &resolved.dimension_exprs,
+        );
 
         // Non-decomposable measures are recomputed from base rows (including AT modifiers)
 
@@ -3655,7 +3888,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 &resolved.source_view,
                 outer_alias_ref,
                 outer_where_ref,
-                &group_by_cols,
+                &measure_group_by_cols,
             )
         } else if !resolved.is_decomposable {
             let outer_ref_for_non_decomp =
@@ -3683,7 +3916,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                     &base_relation_sql,
                     outer_ref_for_non_decomp,
                     outer_where_ref,
-                    &group_by_cols,
+                    &measure_group_by_cols,
                     &modifiers,
                     &resolved.dimension_exprs,
                     &format!("_nd_{join_counter}"),
@@ -3699,7 +3932,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                             &base_relation_sql,
                             outer_ref_for_non_decomp,
                             outer_where_ref,
-                            &group_by_cols,
+                            &measure_group_by_cols,
                             &modifiers,
                             &resolved.dimension_exprs,
                         ),
@@ -3720,7 +3953,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 &resolved.source_view,
                 outer_alias_ref,
                 outer_where_ref,
-                &group_by_cols,
+                &measure_group_by_cols,
             )
         };
         result_sql = format!("{}{}{}", &result_sql[..start], expanded, &result_sql[end..]);
@@ -3732,6 +3965,11 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     for (measure_name, start, end) in plain_calls {
         let resolved = resolve_measure_source(&measure_name, &primary_table_name);
+        let measure_group_by_cols = filter_group_by_cols_for_measure(
+            &group_by_cols,
+            &resolved.view_group_by_cols,
+            &resolved.dimension_exprs,
+        );
 
 
         // For derived measures, use the expanded expression; otherwise use AGG(measure_name)
@@ -3761,7 +3999,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                     &base_relation_sql,
                     outer_ref_for_non_decomp,
                     outer_where_ref,
-                    &group_by_cols,
+                    &measure_group_by_cols,
                     &[], // No modifiers for plain AGGREGATE()
                     &resolved.dimension_exprs,
                     &format!("_nd_{join_counter}"),
@@ -3777,7 +4015,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                             &base_relation_sql,
                             outer_ref_for_non_decomp,
                             outer_where_ref,
-                            &group_by_cols,
+                            &measure_group_by_cols,
                             &[], // No modifiers for plain AGGREGATE()
                             &resolved.dimension_exprs,
                         ),
@@ -3977,10 +4215,10 @@ fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
 
     // Filter out AGGREGATE() calls and extract column names
     for item in items {
-        let item_upper = item.to_uppercase();
-        if item_upper.contains("AGGREGATE(") {
+        if has_aggregate_function(&item) {
             continue;
         }
+        let item_upper = item.to_uppercase();
         // Handle "col AS alias" - use the column name, not alias
         let col = if let Some(as_pos) = item_upper.find(" AS ") {
             item[..as_pos].trim()
@@ -4017,7 +4255,58 @@ mod tests {
     #[test]
     fn test_has_aggregate_function() {
         assert!(has_aggregate_function("SELECT AGGREGATE(revenue) FROM foo"));
+        assert!(has_aggregate_function("SELECT AGGREGATE (revenue) FROM foo"));
+        assert!(has_aggregate_function("SELECT \"AGGREGATE\"(revenue) FROM foo"));
+        assert!(has_aggregate_function("SELECT schema.AGGREGATE(revenue) FROM foo"));
+        assert!(has_aggregate_function(
+            "SELECT \"schema\".\"AGGREGATE\" (revenue) FROM foo"
+        ));
+        assert!(!has_aggregate_function("SELECT TOTAL_AGGREGATE(revenue) FROM foo"));
+        assert!(!has_aggregate_function("SELECT \"TOTAL_AGGREGATE\"(revenue) FROM foo"));
+        assert!(!has_aggregate_function("SELECT myaggregate(revenue) FROM foo"));
         assert!(!has_aggregate_function("SELECT SUM(amount) FROM foo"));
+    }
+
+    #[test]
+    fn test_extract_dimension_columns_ignores_aggregate_with_space() {
+        let cols = extract_dimension_columns_from_select(
+            "SELECT region, AGGREGATE (revenue) FROM sales_v",
+        );
+        assert_eq!(cols, vec!["region".to_string()]);
+
+        let cols = extract_dimension_columns_from_select(
+            "SELECT region, AGGREGATE (revenue) AT (ALL region) FROM sales_v",
+        );
+        assert_eq!(cols, vec!["region".to_string()]);
+
+        let cols = extract_dimension_columns_from_select(
+            "SELECT AGGREGATE (revenue) FROM sales_v",
+        );
+        assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn test_extract_dimension_columns_keeps_non_aggregate_suffix() {
+        let cols = extract_dimension_columns_from_select(
+            "SELECT region, TOTAL_AGGREGATE(revenue) FROM sales_v",
+        );
+        assert_eq!(
+            cols,
+            vec!["region".to_string(), "TOTAL_AGGREGATE(revenue)".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_extract_dimension_columns_ignores_quoted_and_qualified_aggregate() {
+        let cols = extract_dimension_columns_from_select(
+            "SELECT region, \"AGGREGATE\"(revenue) FROM sales_v",
+        );
+        assert_eq!(cols, vec!["region".to_string()]);
+
+        let cols = extract_dimension_columns_from_select(
+            "SELECT region, schema.AGGREGATE(revenue) FROM sales_v",
+        );
+        assert_eq!(cols, vec!["region".to_string()]);
     }
 
     #[test]
@@ -4847,6 +5136,44 @@ GROUP BY s.year";
         assert_eq!(
             qualify_where_for_inner("year = 2023 AND MONTH(date) = 6"),
             "_inner.year = 2023 AND MONTH(_inner.date) = 6"
+        );
+
+        // DATE literal keyword should not get _inner. prefix
+        assert_eq!(
+            qualify_where_for_inner("year between date '2023-01-01' and date '2025-01-01'"),
+            "_inner.year between date '2023-01-01' and date '2025-01-01'"
+        );
+        assert_eq!(
+            qualify_where_for_inner("event_time >= time '10:30:00'"),
+            "_inner.event_time >= time '10:30:00'"
+        );
+        assert_eq!(
+            qualify_where_for_inner("created_at < timestamp '2025-01-01 00:00:00'"),
+            "_inner.created_at < timestamp '2025-01-01 00:00:00'"
+        );
+        assert_eq!(
+            qualify_where_for_inner("created_at < timestamptz '2025-01-01 00:00:00+00'"),
+            "_inner.created_at < timestamptz '2025-01-01 00:00:00+00'"
+        );
+        assert_eq!(
+            qualify_where_for_inner("duration > interval '1 day'"),
+            "_inner.duration > interval '1 day'"
+        );
+    }
+
+    #[test]
+    fn test_qualify_where_for_outer_basic() {
+        assert_eq!(
+            qualify_where_for_outer("region = 'US'", "o"),
+            "o.region = 'US'"
+        );
+        assert_eq!(
+            qualify_where_for_outer("sales.region = 'US'", "o"),
+            "sales.region = 'US'"
+        );
+        assert_eq!(
+            qualify_where_for_outer("cast(order_date as date) = date '2023-01-01'", "o"),
+            "cast(o.order_date as date) = date '2023-01-01'"
         );
     }
 
