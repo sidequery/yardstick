@@ -676,6 +676,10 @@ fn is_boundary_char(ch: Option<char>) -> bool {
     ch.map_or(true, |c| !c.is_alphanumeric() && c != '_')
 }
 
+fn is_table_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '.'
+}
+
 fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usize> {
     let upper = sql.to_uppercase();
     let upper_bytes = upper.as_bytes();
@@ -832,6 +836,42 @@ fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usiz
     }
 
     None
+}
+
+fn insert_table_alias(sql: &str, table_name: &str, alias: &str) -> Option<String> {
+    let from_pos = find_top_level_keyword(sql, "FROM", 0)?;
+    let bytes = sql.as_bytes();
+    let mut idx = from_pos + 4;
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if idx >= bytes.len() {
+        return None;
+    }
+
+    let table_start = idx;
+    while idx < bytes.len() && is_table_ident_char(bytes[idx] as char) {
+        idx += 1;
+    }
+    if table_start == idx {
+        return None;
+    }
+
+    let table_token = &sql[table_start..idx];
+    let table_simple = table_token
+        .split('.')
+        .next_back()
+        .unwrap_or(table_token);
+    if !table_simple.eq_ignore_ascii_case(table_name) {
+        return None;
+    }
+
+    let mut updated = String::with_capacity(sql.len() + alias.len() + 1);
+    updated.push_str(&sql[..idx]);
+    updated.push(' ');
+    updated.push_str(alias);
+    updated.push_str(&sql[idx..]);
+    Some(updated)
 }
 
 fn find_first_top_level_keyword(sql: &str, start: usize, keywords: &[&str]) -> Option<usize> {
@@ -3395,10 +3435,12 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 Some(pt.effective_name.clone())
             } else {
                 // No alias on primary table, add _outer
-                let from_pattern = format!("FROM {}", pt.name);
-                let from_replacement = format!("FROM {} _outer", pt.name);
-                result_sql = result_sql.replace(&from_pattern, &from_replacement);
-                Some("_outer".to_string())
+                if let Some(updated_sql) = insert_table_alias(&result_sql, &pt.name, "_outer") {
+                    result_sql = updated_sql;
+                    Some("_outer".to_string())
+                } else {
+                    None
+                }
             }
         } else {
             None
