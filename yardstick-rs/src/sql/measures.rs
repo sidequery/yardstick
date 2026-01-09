@@ -1292,8 +1292,17 @@ pub fn qualify_outer_reference(expr: &str, table_name: &str, dim: &str) -> Strin
 /// "region = 'US'" -> "_inner.region = 'US'"
 /// "year > 2020 AND region = 'US'" -> "_inner.year > 2020 AND _inner.region = 'US'"
 fn qualify_where_for_inner(where_clause: &str) -> String {
+    if let Ok(result) = parser_ffi::qualify_expression(where_clause, "_inner") {
+        return result;
+    }
+    qualify_where_for_inner_fallback(where_clause)
+}
+
+fn qualify_where_for_inner_fallback(where_clause: &str) -> String {
     let mut result = String::new();
     let mut chars = where_clause.chars().peekable();
+    let mut previous_was_dot = false;
+    let mut previous_was_as = false;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -1308,23 +1317,28 @@ fn qualify_where_for_inner(where_clause: &str) -> String {
             }
 
             // Check if followed by a dot (already qualified) or paren (function call)
-            let already_qualified = chars.peek() == Some(&'.');
+            let already_qualified = previous_was_dot || chars.peek() == Some(&'.');
             let is_function = chars.peek() == Some(&'(');
 
             // SQL keywords that should not be prefixed
             let keywords = [
-                "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
+                "AND", "OR", "NOT", "IN", "IS", "AS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
                 "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
             ];
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
+            let is_type_context = previous_was_as;
+            let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
 
-            if !already_qualified && !is_keyword && !is_function {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
                 result.push_str("_inner.");
             }
             result.push_str(&ident);
+            previous_was_dot = false;
+            previous_was_as = ident.eq_ignore_ascii_case("AS");
         } else if c == '\'' {
             // String literal - copy as-is until closing quote
             result.push(c);
+            previous_was_dot = false;
             while let Some(next) = chars.next() {
                 result.push(next);
                 if next == '\'' {
@@ -1338,6 +1352,7 @@ fn qualify_where_for_inner(where_clause: &str) -> String {
             }
         } else {
             result.push(c);
+            previous_was_dot = c == '.';
         }
     }
 
@@ -1345,8 +1360,17 @@ fn qualify_where_for_inner(where_clause: &str) -> String {
 }
 
 fn qualify_where_for_outer(where_clause: &str, outer_alias: &str) -> String {
+    if let Ok(result) = parser_ffi::qualify_expression(where_clause, outer_alias) {
+        return result;
+    }
+    qualify_where_for_outer_fallback(where_clause, outer_alias)
+}
+
+fn qualify_where_for_outer_fallback(where_clause: &str, outer_alias: &str) -> String {
     let mut result = String::new();
     let mut chars = where_clause.chars().peekable();
+    let mut previous_was_dot = false;
+    let mut previous_was_as = false;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -1359,22 +1383,27 @@ fn qualify_where_for_outer(where_clause: &str, outer_alias: &str) -> String {
                 }
             }
 
-            let already_qualified = chars.peek() == Some(&'.');
+            let already_qualified = previous_was_dot || chars.peek() == Some(&'.');
             let is_function = chars.peek() == Some(&'(');
 
             let keywords = [
-                "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
+                "AND", "OR", "NOT", "IN", "IS", "AS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
                 "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
             ];
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
+            let is_type_context = previous_was_as;
+            let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
 
-            if !already_qualified && !is_keyword && !is_function {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
                 result.push_str(outer_alias);
                 result.push('.');
             }
             result.push_str(&ident);
+            previous_was_dot = false;
+            previous_was_as = ident.eq_ignore_ascii_case("AS");
         } else if c == '\'' {
             result.push(c);
+            previous_was_dot = false;
             while let Some(next) = chars.next() {
                 result.push(next);
                 if next == '\'' {
@@ -1387,6 +1416,7 @@ fn qualify_where_for_outer(where_clause: &str, outer_alias: &str) -> String {
             }
         } else {
             result.push(c);
+            previous_was_dot = c == '.';
         }
     }
 
@@ -1577,6 +1607,8 @@ fn qualify_where_for_inner_with_dimensions(
 ) -> String {
     let mut result = String::new();
     let mut chars = where_clause.chars().peekable();
+    let mut previous_was_dot = false;
+    let mut previous_was_as = false;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -1589,16 +1621,18 @@ fn qualify_where_for_inner_with_dimensions(
                 }
             }
 
-            let already_qualified = chars.peek() == Some(&'.');
+            let already_qualified = previous_was_dot || chars.peek() == Some(&'.');
             let is_function = chars.peek() == Some(&'(');
 
             let keywords = [
-                "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
+                "AND", "OR", "NOT", "IN", "IS", "AS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
                 "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
             ];
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
+            let is_type_context = previous_was_as;
+            let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
 
-            if !already_qualified && !is_keyword && !is_function {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
                 let key = normalize_dimension_key(&ident);
                 if let Some(expr) = dimension_exprs.get(&key) {
                     let inner_expr = qualify_where_for_inner(expr);
@@ -1610,8 +1644,11 @@ fn qualify_where_for_inner_with_dimensions(
                 result.push_str("_inner.");
             }
             result.push_str(&ident);
+            previous_was_dot = false;
+            previous_was_as = ident.eq_ignore_ascii_case("AS");
         } else if c == '\'' {
             result.push(c);
+            previous_was_dot = false;
             while let Some(next) = chars.next() {
                 result.push(next);
                 if next == '\'' {
@@ -1624,10 +1661,36 @@ fn qualify_where_for_inner_with_dimensions(
             }
         } else {
             result.push(c);
+            previous_was_dot = c == '.';
         }
     }
 
     result
+}
+
+fn is_typed_literal_keyword(
+    ident: &str,
+    chars: &std::iter::Peekable<std::str::Chars<'_>>,
+) -> bool {
+    let is_keyword = ident.eq_ignore_ascii_case("DATE")
+        || ident.eq_ignore_ascii_case("TIME")
+        || ident.eq_ignore_ascii_case("TIMESTAMP")
+        || ident.eq_ignore_ascii_case("TIMESTAMPTZ")
+        || ident.eq_ignore_ascii_case("INTERVAL");
+    if !is_keyword {
+        return false;
+    }
+
+    let mut lookahead = chars.clone();
+    while let Some(&next) = lookahead.peek() {
+        if next.is_whitespace() {
+            lookahead.next();
+            continue;
+        }
+        break;
+    }
+
+    matches!(lookahead.peek(), Some(&'\''))
 }
 
 // =============================================================================
@@ -4637,6 +4700,44 @@ GROUP BY s.year";
         assert_eq!(
             qualify_where_for_inner("year = 2023 AND MONTH(date) = 6"),
             "_inner.year = 2023 AND MONTH(_inner.date) = 6"
+        );
+
+        // DATE literal keyword should not get _inner. prefix
+        assert_eq!(
+            qualify_where_for_inner("year between date '2023-01-01' and date '2025-01-01'"),
+            "_inner.year between date '2023-01-01' and date '2025-01-01'"
+        );
+        assert_eq!(
+            qualify_where_for_inner("event_time >= time '10:30:00'"),
+            "_inner.event_time >= time '10:30:00'"
+        );
+        assert_eq!(
+            qualify_where_for_inner("created_at < timestamp '2025-01-01 00:00:00'"),
+            "_inner.created_at < timestamp '2025-01-01 00:00:00'"
+        );
+        assert_eq!(
+            qualify_where_for_inner("created_at < timestamptz '2025-01-01 00:00:00+00'"),
+            "_inner.created_at < timestamptz '2025-01-01 00:00:00+00'"
+        );
+        assert_eq!(
+            qualify_where_for_inner("duration > interval '1 day'"),
+            "_inner.duration > interval '1 day'"
+        );
+    }
+
+    #[test]
+    fn test_qualify_where_for_outer_basic() {
+        assert_eq!(
+            qualify_where_for_outer("region = 'US'", "o"),
+            "o.region = 'US'"
+        );
+        assert_eq!(
+            qualify_where_for_outer("sales.region = 'US'", "o"),
+            "sales.region = 'US'"
+        );
+        assert_eq!(
+            qualify_where_for_outer("cast(order_date as date) = date '2023-01-01'", "o"),
+            "cast(o.order_date as date) = date '2023-01-01'"
         );
     }
 

@@ -168,6 +168,7 @@ type FnParseCreateView = unsafe extern "C" fn(*const c_char) -> *mut YardstickCr
 type FnFreeCreateViewInfo = unsafe extern "C" fn(*mut YardstickCreateViewInfo);
 type FnReplaceRange = unsafe extern "C" fn(*const c_char, u32, u32, *const c_char) -> *mut c_char;
 type FnApplyReplacements = unsafe extern "C" fn(*const c_char, *const YardstickReplacement, usize) -> *mut c_char;
+type FnQualifyExpression = unsafe extern "C" fn(*const c_char, *const c_char) -> *mut c_char;
 type FnFreeString = unsafe extern "C" fn(*mut c_char);
 type FnExpandAggregateCall = unsafe extern "C" fn(
     *const c_char, *const c_char, *const YardstickAtModifier, usize,
@@ -185,6 +186,7 @@ static FN_PARSE_CREATE_VIEW: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_FREE_CREATE_VIEW_INFO: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_REPLACE_RANGE: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_APPLY_REPLACEMENTS: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_QUALIFY_EXPRESSION: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_FREE_STRING: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_EXPAND_AGGREGATE_CALL: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
@@ -201,6 +203,7 @@ pub extern "C" fn yardstick_init_parser_ffi(
     free_create_view_info: FnFreeCreateViewInfo,
     replace_range: FnReplaceRange,
     apply_replacements: FnApplyReplacements,
+    qualify_expression: FnQualifyExpression,
     free_string: FnFreeString,
     expand_aggregate_call: FnExpandAggregateCall,
 ) {
@@ -214,6 +217,7 @@ pub extern "C" fn yardstick_init_parser_ffi(
     FN_FREE_CREATE_VIEW_INFO.store(free_create_view_info as *mut (), Ordering::SeqCst);
     FN_REPLACE_RANGE.store(replace_range as *mut (), Ordering::SeqCst);
     FN_APPLY_REPLACEMENTS.store(apply_replacements as *mut (), Ordering::SeqCst);
+    FN_QUALIFY_EXPRESSION.store(qualify_expression as *mut (), Ordering::SeqCst);
     FN_FREE_STRING.store(free_string as *mut (), Ordering::SeqCst);
     FN_EXPAND_AGGREGATE_CALL.store(expand_aggregate_call as *mut (), Ordering::SeqCst);
 }
@@ -790,6 +794,27 @@ pub fn apply_replacements(sql: &str, replacements: &[Replacement]) -> Result<Str
     }
 }
 
+pub fn qualify_expression(expr: &str, qualifier: &str) -> Result<String, String> {
+    let expr_ptr = CString::new(expr).map_err(|e| format!("Invalid expression string: {e}"))?;
+    let qualifier_ptr = CString::new(qualifier).map_err(|e| format!("Invalid qualifier: {e}"))?;
+
+    let fn_ptr = FN_QUALIFY_EXPRESSION.load(Ordering::SeqCst);
+    if fn_ptr.is_null() {
+        return Err("Parser FFI not initialized".to_string());
+    }
+
+    unsafe {
+        let f: FnQualifyExpression = std::mem::transmute(fn_ptr);
+        let result_ptr = f(expr_ptr.as_ptr(), qualifier_ptr.as_ptr());
+        if result_ptr.is_null() {
+            return Err("Failed to qualify expression".to_string());
+        }
+        let result = c_str_to_string(result_ptr).unwrap_or_default();
+        yardstick_free_string(result_ptr);
+        Ok(result)
+    }
+}
+
 /// Expand a single AGGREGATE() call to SQL.
 ///
 /// Generates a correlated subquery for the measure based on the aggregation function
@@ -985,6 +1010,17 @@ mod tests {
         ];
         let result = apply_replacements("SELECT foo FROM bar", &replacements).unwrap();
         assert_eq!(result, "SELECT baz FROM bar");
+    }
+
+    #[test]
+    #[ignore = "requires C++ library to be linked"]
+    fn test_qualify_expression() {
+        let result = qualify_expression("year between date '2023-01-01' and date '2025-01-01'", "_inner")
+            .unwrap();
+        assert_eq!(
+            result,
+            "_inner.year BETWEEN DATE '2023-01-01' AND DATE '2025-01-01'"
+        );
     }
 
     #[test]
