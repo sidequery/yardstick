@@ -3767,10 +3767,10 @@ fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
 
     // Filter out AGGREGATE() calls and extract column names
     for item in items {
-        let item_upper = item.to_uppercase();
-        if item_upper.contains("AGGREGATE(") {
+        if has_aggregate_function(&item) {
             continue;
         }
+        let item_upper = item.to_uppercase();
         // Handle "col AS alias" - use the column name, not alias
         let col = if let Some(as_pos) = item_upper.find(" AS ") {
             item[..as_pos].trim()
@@ -3807,7 +3807,26 @@ mod tests {
     #[test]
     fn test_has_aggregate_function() {
         assert!(has_aggregate_function("SELECT AGGREGATE(revenue) FROM foo"));
+        assert!(has_aggregate_function("SELECT AGGREGATE (revenue) FROM foo"));
         assert!(!has_aggregate_function("SELECT SUM(amount) FROM foo"));
+    }
+
+    #[test]
+    fn test_extract_dimension_columns_ignores_aggregate_with_space() {
+        let cols = extract_dimension_columns_from_select(
+            "SELECT region, AGGREGATE (revenue) FROM sales_v",
+        );
+        assert_eq!(cols, vec!["region".to_string()]);
+
+        let cols = extract_dimension_columns_from_select(
+            "SELECT region, AGGREGATE (revenue) AT (ALL region) FROM sales_v",
+        );
+        assert_eq!(cols, vec!["region".to_string()]);
+
+        let cols = extract_dimension_columns_from_select(
+            "SELECT AGGREGATE (revenue) FROM sales_v",
+        );
+        assert!(cols.is_empty());
     }
 
     #[test]
