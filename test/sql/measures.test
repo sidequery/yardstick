@@ -35,6 +35,36 @@ SEMANTIC SELECT year, region, AGGREGATE(revenue) FROM sales_v;
 2023	US	150.0
 
 # =============================================================================
+# Test: CTE with AGGREGATE
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC WITH a AS (
+    SELECT year, region, AGGREGATE(revenue) AS revenue
+    FROM sales_v
+)
+SELECT * FROM a;
+----
+2022	EU	50.0
+2022	US	100.0
+2023	EU	75.0
+2023	US	150.0
+
+# =============================================================================
+# Test: GROUP BY with extra spaces
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+GROUP   BY year, region;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
+# =============================================================================
 # Test: AT (ALL dimension) - remove dimension from context
 # =============================================================================
 
