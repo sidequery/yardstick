@@ -839,6 +839,26 @@ fn find_first_top_level_keyword(sql: &str, start: usize, keywords: &[&str]) -> O
         .min()
 }
 
+fn has_top_level_group_by(sql: &str) -> bool {
+    find_top_level_keyword(sql, "GROUP BY", 0).is_some()
+}
+
+fn has_group_by_anywhere(sql: &str) -> bool {
+    let upper = sql.to_uppercase();
+    let mut idx = 0;
+    while idx < upper.len() {
+        if matches_keyword_at(&upper, idx, "GROUP") {
+            let mut next = idx + "GROUP".len();
+            next = skip_whitespace(sql, next);
+            if matches_keyword_at(&upper, next, "BY") {
+                return true;
+            }
+        }
+        idx += 1;
+    }
+    false
+}
+
 fn skip_whitespace(sql: &str, mut idx: usize) -> usize {
     while idx < sql.len() && sql.as_bytes()[idx].is_ascii_whitespace() {
         idx += 1;
@@ -1996,7 +2016,7 @@ fn extract_measures_from_sql(
         .iter()
         .any(|m| find_aggregation_in_expression(&m.expression).is_some());
     let clean_sql_upper = clean_sql.to_uppercase();
-    let has_group_by = clean_sql_upper.contains("GROUP BY");
+    let has_group_by = has_top_level_group_by(&clean_sql);
 
     if has_aggregate_measure && !has_group_by {
         // Find insertion point: before ORDER BY, LIMIT, or at end
@@ -2181,7 +2201,7 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
 
     // Check if we need to add GROUP BY
     let result_upper = result_sql.to_uppercase();
-    if !result_upper.contains("GROUP BY") {
+    if !has_group_by_anywhere(&result_sql) {
         // Extract dimension columns (non-aggregate items)
         let dim_cols = extract_dimension_columns_from_select_info(&select_info);
         if !dim_cols.is_empty() {
@@ -3796,7 +3816,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     // If no GROUP BY, add explicit GROUP BY with dimension columns from original SQL
     // (GROUP BY ALL doesn't work reliably with scalar subqueries mixed with aggregates)
     let result_upper = result_sql.to_uppercase();
-    if !result_upper.contains("GROUP BY") && !original_dim_cols.is_empty() {
+    if !has_group_by_anywhere(&result_sql) && !original_dim_cols.is_empty() {
         // Find insertion point: before ORDER BY, LIMIT, HAVING, or at end
         let insert_pos = ["ORDER BY", "LIMIT", "HAVING", ";"]
             .iter()

@@ -51,6 +51,20 @@ SELECT * FROM a;
 2023	US	150.0
 
 # =============================================================================
+# Test: GROUP BY with extra spaces
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+GROUP   BY year, region;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
+# =============================================================================
 # Test: AT (ALL dimension) - remove dimension from context
 # =============================================================================
 
