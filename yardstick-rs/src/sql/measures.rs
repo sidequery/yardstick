@@ -868,6 +868,21 @@ fn matches_keyword_at(upper: &str, idx: usize, keyword: &str) -> bool {
     is_boundary_char(prev) && is_boundary_char(next)
 }
 
+fn advance_after_group_by(query: &str, group_pos: usize) -> Option<usize> {
+    let upper = query.to_uppercase();
+    let mut idx = group_pos;
+    if !matches_keyword_at(&upper, idx, "GROUP") {
+        return None;
+    }
+    idx += "GROUP".len();
+    idx = skip_whitespace(query, idx);
+    if !matches_keyword_at(&upper, idx, "BY") {
+        return None;
+    }
+    idx += "BY".len();
+    Some(skip_whitespace(query, idx))
+}
+
 struct CteExpansion {
     sql: String,
     had_aggregate: bool,
@@ -1110,7 +1125,8 @@ fn extract_view_group_by_cols(view_query: &str) -> Vec<String> {
         None => return Vec::new(),
     };
 
-    let start = group_pos + "GROUP BY".len();
+    let start = advance_after_group_by(query, group_pos)
+        .unwrap_or_else(|| group_pos + "GROUP BY".len());
     let end = find_first_top_level_keyword(
         query,
         start,
@@ -3865,7 +3881,8 @@ fn extract_group_by_columns(sql: &str) -> Vec<String> {
 
     let query = sql.trim().trim_end_matches(';').trim();
     if let Some(group_by_pos) = find_top_level_keyword(query, "GROUP BY", 0) {
-        let start = group_by_pos + "GROUP BY".len();
+        let start = advance_after_group_by(query, group_by_pos)
+            .unwrap_or_else(|| group_by_pos + "GROUP BY".len());
         let end = find_first_top_level_keyword(
             query,
             start,
