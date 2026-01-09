@@ -252,6 +252,8 @@ char* yardstick_replace_range(
     const char* replacement
 );
 
+char* yardstick_qualify_expression(const char* expr, const char* qualifier);
+
 /**
  * Free a string allocated by yardstick functions.
  */

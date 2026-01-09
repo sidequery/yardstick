@@ -87,6 +87,7 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
 static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableRef>& tables);
 static bool ExpressionContainsAggregate(ParsedExpression* expr);
 static bool ExpressionContainsMeasureRef(ParsedExpression* expr);
+static void QualifyColumnRefs(ParsedExpression* expr, const std::string& qualifier);
 
 //=============================================================================
 // AST Walking: Find AGGREGATE() function calls
@@ -455,6 +456,95 @@ static bool ExpressionContainsMeasureRef(ParsedExpression* expr) {
 
         default:
             return false;
+    }
+}
+
+static void QualifyColumnRefs(ParsedExpression* expr, const std::string& qualifier) {
+    if (!expr) return;
+
+    switch (expr->expression_class) {
+        case ExpressionClass::COLUMN_REF: {
+            auto* col = static_cast<ColumnRefExpression*>(expr);
+            if (col->column_names.size() == 1) {
+                col->column_names.insert(col->column_names.begin(), qualifier);
+            }
+            break;
+        }
+        case ExpressionClass::FUNCTION: {
+            auto* func = static_cast<FunctionExpression*>(expr);
+            for (auto& child : func->children) {
+                QualifyColumnRefs(child.get(), qualifier);
+            }
+            if (func->filter) {
+                QualifyColumnRefs(func->filter.get(), qualifier);
+            }
+            break;
+        }
+        case ExpressionClass::COMPARISON: {
+            auto* comp = static_cast<ComparisonExpression*>(expr);
+            QualifyColumnRefs(comp->left.get(), qualifier);
+            QualifyColumnRefs(comp->right.get(), qualifier);
+            break;
+        }
+        case ExpressionClass::CONJUNCTION: {
+            auto* conj = static_cast<ConjunctionExpression*>(expr);
+            for (auto& child : conj->children) {
+                QualifyColumnRefs(child.get(), qualifier);
+            }
+            break;
+        }
+        case ExpressionClass::OPERATOR: {
+            auto* op = static_cast<OperatorExpression*>(expr);
+            for (auto& child : op->children) {
+                QualifyColumnRefs(child.get(), qualifier);
+            }
+            break;
+        }
+        case ExpressionClass::CASE: {
+            auto* case_expr = static_cast<CaseExpression*>(expr);
+            for (auto& check : case_expr->case_checks) {
+                QualifyColumnRefs(check.when_expr.get(), qualifier);
+                QualifyColumnRefs(check.then_expr.get(), qualifier);
+            }
+            if (case_expr->else_expr) {
+                QualifyColumnRefs(case_expr->else_expr.get(), qualifier);
+            }
+            break;
+        }
+        case ExpressionClass::CAST: {
+            auto* cast = static_cast<CastExpression*>(expr);
+            QualifyColumnRefs(cast->child.get(), qualifier);
+            break;
+        }
+        case ExpressionClass::SUBQUERY: {
+            auto* subq = static_cast<SubqueryExpression*>(expr);
+            if (subq->child) {
+                QualifyColumnRefs(subq->child.get(), qualifier);
+            }
+            break;
+        }
+        case ExpressionClass::WINDOW: {
+            auto* window = static_cast<WindowExpression*>(expr);
+            for (auto& child : window->children) {
+                QualifyColumnRefs(child.get(), qualifier);
+            }
+            for (auto& part : window->partitions) {
+                QualifyColumnRefs(part.get(), qualifier);
+            }
+            if (window->filter_expr) {
+                QualifyColumnRefs(window->filter_expr.get(), qualifier);
+            }
+            break;
+        }
+        case ExpressionClass::BETWEEN: {
+            auto* between = static_cast<BetweenExpression*>(expr);
+            QualifyColumnRefs(between->input.get(), qualifier);
+            QualifyColumnRefs(between->lower.get(), qualifier);
+            QualifyColumnRefs(between->upper.get(), qualifier);
+            break;
+        }
+        default:
+            break;
     }
 }
 
@@ -917,6 +1007,34 @@ extern "C" char* yardstick_replace_range(
     }
 
     return safe_strdup(result);
+}
+
+extern "C" char* yardstick_qualify_expression(const char* expr_str, const char* qualifier) {
+    if (!expr_str || !qualifier) return nullptr;
+
+    try {
+        auto expressions = Parser::ParseExpressionList(expr_str);
+        if (expressions.empty()) {
+            return safe_strdup(expr_str);
+        }
+
+        for (auto& expr : expressions) {
+            QualifyColumnRefs(expr.get(), qualifier);
+        }
+
+        if (expressions.size() == 1) {
+            return safe_strdup(expressions[0]->ToString());
+        }
+
+        std::string result;
+        for (size_t i = 0; i < expressions.size(); i++) {
+            if (i > 0) result += ", ";
+            result += expressions[i]->ToString();
+        }
+        return safe_strdup(result);
+    } catch (const std::exception&) {
+        return nullptr;
+    }
 }
 
 //=============================================================================
