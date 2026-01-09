@@ -583,58 +583,90 @@ pub fn extract_table_name_from_sql(sql: &str) -> Option<String> {
 /// Extract table name and optional alias from SQL FROM clause
 /// Returns (table_name, Option<alias>)
 pub fn extract_table_and_alias_from_sql(sql: &str) -> Option<(String, Option<String>)> {
-    // Normalize whitespace to handle newlines/tabs in SQL
-    let normalized: String = sql
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .collect();
-    let normalized_upper = normalized.to_uppercase();
-    let from_pos = normalized_upper.find(" FROM ")?;
-    let after_from = &normalized[from_pos..];
-
-    // Parse: FROM table_name [AS] [alias]
-    let (rest, _) = multispace1::<_, nom::error::Error<&str>>(after_from).ok()?;
-    let (rest, _) = tag_no_case::<_, _, nom::error::Error<&str>>("FROM")(rest).ok()?;
-    let (rest, _) = multispace1::<_, nom::error::Error<&str>>(rest).ok()?;
-    let (rest, table) = identifier(rest).ok()?;
-
-    // Check for alias (optional AS keyword followed by identifier)
-    let rest_trimmed = rest.trim_start();
-
-    // Check for end of FROM clause (WHERE, GROUP, ORDER, etc.)
-    let rest_upper = rest_trimmed.to_uppercase();
-    if rest_trimmed.is_empty()
-        || rest_upper.starts_with("WHERE")
-        || rest_upper.starts_with("GROUP")
-        || rest_upper.starts_with("ORDER")
-        || rest_upper.starts_with("LIMIT")
-        || rest_upper.starts_with("HAVING")
-        || rest_upper.starts_with("JOIN")
-        || rest_trimmed.starts_with(';')
-    {
-        return Some((table.to_string(), None));
+    fn skip_ws_and_comments(sql: &str, mut idx: usize) -> usize {
+        let bytes = sql.as_bytes();
+        while idx < bytes.len() {
+            let c = bytes[idx] as char;
+            if c.is_whitespace() {
+                idx += 1;
+                continue;
+            }
+            if c == '-' && idx + 1 < bytes.len() && bytes[idx + 1] as char == '-' {
+                idx += 2;
+                while idx < bytes.len() {
+                    let ch = bytes[idx] as char;
+                    idx += 1;
+                    if ch == '\n' || ch == '\r' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if c == '/' && idx + 1 < bytes.len() && bytes[idx + 1] as char == '*' {
+                idx += 2;
+                while idx + 1 < bytes.len() {
+                    let ch = bytes[idx] as char;
+                    if ch == '*' && bytes[idx + 1] as char == '/' {
+                        idx += 2;
+                        break;
+                    }
+                    idx += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        idx
     }
 
-    // Try to parse optional AS keyword
-    let after_as = if rest_upper.starts_with("AS ") {
-        &rest_trimmed[3..]
-    } else {
-        rest_trimmed
-    };
+    let from_pos = find_top_level_keyword(sql, "FROM", 0)?;
+    let mut idx = from_pos + 4;
+    idx = skip_ws_and_comments(sql, idx);
+    if idx >= sql.len() {
+        return None;
+    }
 
-    // Parse the alias identifier
-    if let Ok((_, alias)) = identifier(after_as.trim_start()) {
-        // Make sure alias isn't a keyword
+    let table_start = idx;
+    while idx < sql.len() && is_table_ident_char(sql.as_bytes()[idx] as char) {
+        idx += 1;
+    }
+    if table_start == idx {
+        return None;
+    }
+    let table = sql[table_start..idx].to_string();
+
+    idx = skip_ws_and_comments(sql, idx);
+    if idx >= sql.len() || sql.as_bytes()[idx] as char == ';' {
+        return Some((table, None));
+    }
+
+    let rest = &sql[idx..];
+    let rest_upper = rest.to_uppercase();
+    let mut rest_after_as = rest;
+    if rest_upper.starts_with("AS") {
+        let after_as = &rest[2..];
+        if after_as
+            .chars()
+            .next()
+            .map_or(false, |ch| ch.is_whitespace())
+        {
+            let mut as_idx = idx + 2;
+            as_idx = skip_ws_and_comments(sql, as_idx);
+            rest_after_as = &sql[as_idx..];
+        }
+    }
+
+    if let Ok((_, alias)) = identifier(rest_after_as.trim_start()) {
         let alias_upper = alias.to_uppercase();
         if matches!(
             alias_upper.as_str(),
-            "WHERE" | "GROUP" | "ORDER" | "LIMIT" | "HAVING" | "JOIN"
+            "FROM" | "WHERE" | "GROUP" | "ORDER" | "LIMIT" | "HAVING" | "JOIN"
         ) {
-            return Some((table.to_string(), None));
+            return Some((table, None));
         }
-        Some((table.to_string(), Some(alias.to_string())))
+        Some((table, Some(alias.to_string())))
     } else {
-        Some((table.to_string(), None))
+        Some((table, None))
     }
 }
 
