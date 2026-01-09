@@ -35,6 +35,36 @@ SEMANTIC SELECT year, region, AGGREGATE(revenue) FROM sales_v;
 2023	US	150.0
 
 # =============================================================================
+# Test: CTE with AGGREGATE
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC WITH a AS (
+    SELECT year, region, AGGREGATE(revenue) AS revenue
+    FROM sales_v
+)
+SELECT * FROM a;
+----
+2022	EU	50.0
+2022	US	100.0
+2023	EU	75.0
+2023	US	150.0
+
+# =============================================================================
+# Test: GROUP BY with extra spaces
+# =============================================================================
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+GROUP   BY year, region;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
+# =============================================================================
 # Test: AT (ALL dimension) - remove dimension from context
 # =============================================================================
 
@@ -795,6 +825,34 @@ FROM daily_orders_v
 3	270.0	840.0
 
 # =============================================================================
+# Test: GROUP BY alias for expression dimension
+# =============================================================================
+
+statement ok
+CREATE TABLE monthly_sales (order_date DATE, region TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO monthly_sales VALUES
+    ('2023-01-05', 'US', 100), ('2023-01-12', 'EU', 50),
+    ('2023-02-03', 'US', 200), ('2023-02-20', 'EU', 20);
+
+statement ok
+CREATE VIEW monthly_sales_v AS
+SELECT DATE_TRUNC('month', order_date) AS month, region, SUM(amount) AS MEASURE revenue
+FROM monthly_sales
+GROUP BY DATE_TRUNC('month', order_date), region;
+
+query IIRR rowsort
+SEMANTIC SELECT month, region, AGGREGATE(revenue), AGGREGATE(revenue) AT (ALL region) AS month_total
+FROM monthly_sales_v
+;
+----
+2023-01-01	EU	50.0	150.0
+2023-01-01	US	100.0	150.0
+2023-02-01	EU	20.0	220.0
+2023-02-01	US	200.0	220.0
+
+# =============================================================================
 # Test: Multi-fact JOINs (wide tables)
 # =============================================================================
 
@@ -850,6 +908,40 @@ FROM fact_orders_v o JOIN fact_returns_v r ON o.year = r.year AND o.region = r.r
 2022	US	100.0	150.0
 2023	EU	75.0	225.0
 2023	US	150.0	225.0
+
+# =============================================================================
+# Test: JOIN with extra dimension from second table
+# =============================================================================
+
+statement ok
+CREATE TABLE salesdetails (year INT, region TEXT, product TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO salesdetails VALUES
+    (2022, 'US', 'Shoes', 2), (2022, 'US', 'Cars', 1),
+    (2022, 'EU', 'Shoes', 3),
+    (2023, 'US', 'Shoes', 4), (2023, 'US', 'Cars', 2),
+    (2023, 'EU', 'Cars', 5);
+
+statement ok
+CREATE VIEW salesdetails_v AS
+SELECT year, region, product, SUM(amount) AS MEASURE quantity
+FROM salesdetails;
+
+query IIIRRR rowsort
+SEMANTIC SELECT s.year, s.region, sd.product,
+    AGGREGATE(revenue) AS year_sales_revenue,
+    AGGREGATE(revenue) AT (ALL year) AS region_total,
+    AGGREGATE(quantity) AS product_qty
+FROM sales_v s JOIN salesdetails_v sd ON s.year = sd.year AND s.region = sd.region
+;
+----
+2022	EU	Shoes	50.0	125.0	3.0
+2022	US	Cars	100.0	250.0	1.0
+2022	US	Shoes	100.0	250.0	2.0
+2023	EU	Cars	75.0	125.0	5.0
+2023	US	Cars	150.0	250.0	2.0
+2023	US	Shoes	150.0	250.0	4.0
 
 # =============================================================================
 # Test: SET reaches beyond WHERE clause (paper semantics)

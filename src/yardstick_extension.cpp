@@ -21,6 +21,7 @@ extern "C" {
     void yardstick_free_create_view_info(YardstickCreateViewInfo* info);
     char* yardstick_replace_range(const char* sql, uint32_t start, uint32_t end, const char* replacement);
     char* yardstick_apply_replacements(const char* sql, const YardstickReplacement* replacements, size_t count);
+    char* yardstick_qualify_expression(const char* expr, const char* qualifier);
     void yardstick_free_string(char* ptr);
     char* yardstick_expand_aggregate_call(
         const char* measure_name,
@@ -59,6 +60,7 @@ extern "C" {
         void (*free_create_view_info)(YardstickCreateViewInfo*),
         char* (*replace_range)(const char*, uint32_t, uint32_t, const char*),
         char* (*apply_replacements)(const char*, const YardstickReplacement*, size_t),
+        char* (*qualify_expression)(const char*, const char*),
         void (*free_string)(char*),
         char* (*expand_aggregate_call)(const char*, const char*, const YardstickAtModifier*, size_t, const char*, const char*, const char*, const char* const*, size_t)
     );
@@ -469,6 +471,7 @@ static void LoadInternal(ExtensionLoader &loader) {
         yardstick_free_create_view_info,
         yardstick_replace_range,
         yardstick_apply_replacements,
+        yardstick_qualify_expression,
         yardstick_free_string,
         yardstick_expand_aggregate_call
     );
