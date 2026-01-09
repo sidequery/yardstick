@@ -702,56 +702,90 @@ pub fn extract_table_name_from_sql(sql: &str) -> Option<String> {
 /// Extract table name and optional alias from SQL FROM clause
 /// Returns (table_name, Option<alias>)
 pub fn extract_table_and_alias_from_sql(sql: &str) -> Option<(String, Option<String>)> {
-    // Normalize whitespace to handle newlines/tabs in SQL
-    let normalized: String = sql
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .collect();
-    let from_pos = find_top_level_keyword(&normalized, "FROM", 0)?;
-    let after_from = &normalized[from_pos..];
-
-    // Parse: FROM table_name [AS] [alias]
-    let (rest, _) = tag_no_case::<_, _, nom::error::Error<&str>>("FROM")(after_from).ok()?;
-    let (rest, _) = multispace1::<_, nom::error::Error<&str>>(rest).ok()?;
-    let (rest, table) = identifier(rest).ok()?;
-
-    // Check for alias (optional AS keyword followed by identifier)
-    let rest_trimmed = rest.trim_start();
-
-    // Check for end of FROM clause (WHERE, GROUP, ORDER, etc.)
-    let rest_upper = rest_trimmed.to_uppercase();
-    if rest_trimmed.is_empty()
-        || rest_upper.starts_with("WHERE")
-        || rest_upper.starts_with("GROUP")
-        || rest_upper.starts_with("ORDER")
-        || rest_upper.starts_with("LIMIT")
-        || rest_upper.starts_with("HAVING")
-        || rest_upper.starts_with("JOIN")
-        || rest_trimmed.starts_with(';')
-    {
-        return Some((table.to_string(), None));
+    fn skip_ws_and_comments(sql: &str, mut idx: usize) -> usize {
+        let bytes = sql.as_bytes();
+        while idx < bytes.len() {
+            let c = bytes[idx] as char;
+            if c.is_whitespace() {
+                idx += 1;
+                continue;
+            }
+            if c == '-' && idx + 1 < bytes.len() && bytes[idx + 1] as char == '-' {
+                idx += 2;
+                while idx < bytes.len() {
+                    let ch = bytes[idx] as char;
+                    idx += 1;
+                    if ch == '\n' || ch == '\r' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if c == '/' && idx + 1 < bytes.len() && bytes[idx + 1] as char == '*' {
+                idx += 2;
+                while idx + 1 < bytes.len() {
+                    let ch = bytes[idx] as char;
+                    if ch == '*' && bytes[idx + 1] as char == '/' {
+                        idx += 2;
+                        break;
+                    }
+                    idx += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        idx
     }
 
-    // Try to parse optional AS keyword
-    let after_as = if rest_upper.starts_with("AS ") {
-        &rest_trimmed[3..]
-    } else {
-        rest_trimmed
-    };
+    let from_pos = find_top_level_keyword(sql, "FROM", 0)?;
+    let mut idx = from_pos + 4;
+    idx = skip_ws_and_comments(sql, idx);
+    if idx >= sql.len() {
+        return None;
+    }
 
-    // Parse the alias identifier
-    if let Ok((_, alias)) = identifier(after_as.trim_start()) {
-        // Make sure alias isn't a keyword
+    let table_start = idx;
+    while idx < sql.len() && is_table_ident_char(sql.as_bytes()[idx] as char) {
+        idx += 1;
+    }
+    if table_start == idx {
+        return None;
+    }
+    let table = sql[table_start..idx].to_string();
+
+    idx = skip_ws_and_comments(sql, idx);
+    if idx >= sql.len() || sql.as_bytes()[idx] as char == ';' {
+        return Some((table, None));
+    }
+
+    let rest = &sql[idx..];
+    let rest_upper = rest.to_uppercase();
+    let mut rest_after_as = rest;
+    if rest_upper.starts_with("AS") {
+        let after_as = &rest[2..];
+        if after_as
+            .chars()
+            .next()
+            .map_or(false, |ch| ch.is_whitespace())
+        {
+            let mut as_idx = idx + 2;
+            as_idx = skip_ws_and_comments(sql, as_idx);
+            rest_after_as = &sql[as_idx..];
+        }
+    }
+
+    if let Ok((_, alias)) = identifier(rest_after_as.trim_start()) {
         let alias_upper = alias.to_uppercase();
         if matches!(
             alias_upper.as_str(),
-            "WHERE" | "GROUP" | "ORDER" | "LIMIT" | "HAVING" | "JOIN"
+            "FROM" | "WHERE" | "GROUP" | "ORDER" | "LIMIT" | "HAVING" | "JOIN"
         ) {
-            return Some((table.to_string(), None));
+            return Some((table, None));
         }
-        Some((table.to_string(), Some(alias.to_string())))
+        Some((table, Some(alias.to_string())))
     } else {
-        Some((table.to_string(), None))
+        Some((table, None))
     }
 }
 
@@ -793,6 +827,10 @@ fn is_boundary_char(ch: Option<char>) -> bool {
     ch.map_or(true, |c| !c.is_alphanumeric() && c != '_')
 }
 
+fn is_table_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '.'
+}
+
 fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usize> {
     let upper = sql.to_uppercase();
     let upper_bytes = upper.as_bytes();
@@ -810,10 +848,30 @@ fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usiz
     let mut in_double = false;
     let mut in_backtick = false;
     let mut in_bracket = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
 
     let mut i = start;
     while i < bytes.len() {
         let c = bytes[i] as char;
+
+        if in_line_comment {
+            if c == '\n' || c == '\r' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if c == '*' && i + 1 < bytes.len() && bytes[i + 1] as char == '/' {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
 
         if in_single {
             if c == '\'' {
@@ -848,6 +906,18 @@ fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usiz
                 in_bracket = false;
             }
             i += 1;
+            continue;
+        }
+
+        if c == '-' && i + 1 < bytes.len() && bytes[i + 1] as char == '-' {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] as char == '*' {
+            in_block_comment = true;
+            i += 2;
             continue;
         }
 
@@ -949,6 +1019,42 @@ fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usiz
     }
 
     None
+}
+
+fn insert_table_alias(sql: &str, table_name: &str, alias: &str) -> Option<String> {
+    let from_pos = find_top_level_keyword(sql, "FROM", 0)?;
+    let bytes = sql.as_bytes();
+    let mut idx = from_pos + 4;
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if idx >= bytes.len() {
+        return None;
+    }
+
+    let table_start = idx;
+    while idx < bytes.len() && is_table_ident_char(bytes[idx] as char) {
+        idx += 1;
+    }
+    if table_start == idx {
+        return None;
+    }
+
+    let table_token = &sql[table_start..idx];
+    let table_simple = table_token
+        .split('.')
+        .next_back()
+        .unwrap_or(table_token);
+    if !table_simple.eq_ignore_ascii_case(table_name) {
+        return None;
+    }
+
+    let mut updated = String::with_capacity(sql.len() + alias.len() + 1);
+    updated.push_str(&sql[..idx]);
+    updated.push(' ');
+    updated.push_str(alias);
+    updated.push_str(&sql[idx..]);
+    Some(updated)
 }
 
 fn find_first_top_level_keyword(sql: &str, start: usize, keywords: &[&str]) -> Option<usize> {
@@ -3826,10 +3932,12 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 Some(pt.effective_name.clone())
             } else {
                 // No alias on primary table, add _outer
-                let from_pattern = format!("FROM {}", pt.name);
-                let from_replacement = format!("FROM {} _outer", pt.name);
-                result_sql = result_sql.replace(&from_pattern, &from_replacement);
-                Some("_outer".to_string())
+                if let Some(updated_sql) = insert_table_alias(&result_sql, &pt.name, "_outer") {
+                    result_sql = updated_sql;
+                    Some("_outer".to_string())
+                } else {
+                    None
+                }
             }
         } else {
             None
