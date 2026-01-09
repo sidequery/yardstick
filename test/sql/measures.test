@@ -762,6 +762,34 @@ FROM daily_orders_v
 3	270.0	840.0
 
 # =============================================================================
+# Test: GROUP BY alias for expression dimension
+# =============================================================================
+
+statement ok
+CREATE TABLE monthly_sales (order_date DATE, region TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO monthly_sales VALUES
+    ('2023-01-05', 'US', 100), ('2023-01-12', 'EU', 50),
+    ('2023-02-03', 'US', 200), ('2023-02-20', 'EU', 20);
+
+statement ok
+CREATE VIEW monthly_sales_v AS
+SELECT DATE_TRUNC('month', order_date) AS month, region, SUM(amount) AS MEASURE revenue
+FROM monthly_sales
+GROUP BY DATE_TRUNC('month', order_date), region;
+
+query IIRR rowsort
+SEMANTIC SELECT month, region, AGGREGATE(revenue), AGGREGATE(revenue) AT (ALL region) AS month_total
+FROM monthly_sales_v
+;
+----
+2023-01-01	EU	50.0	150.0
+2023-01-01	US	100.0	150.0
+2023-02-01	EU	20.0	220.0
+2023-02-01	US	200.0	220.0
+
+# =============================================================================
 # Test: Multi-fact JOINs (wide tables)
 # =============================================================================
 
