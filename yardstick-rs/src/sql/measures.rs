@@ -2069,7 +2069,7 @@ fn find_expression_start(sql: &str, end: usize) -> usize {
 /// Uses position-based replacement with the C++ FFI parser
 pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
     let cte_expansion = expand_cte_queries(sql);
-    let mut sql = cte_expansion.sql;
+    let sql = cte_expansion.sql;
     let mut had_aggregate = cte_expansion.had_aggregate;
 
     if !has_aggregate_function(&sql) {
@@ -2124,7 +2124,7 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
                 .unwrap_or(false)
         });
         if uses_non_decomposable {
-            return expand_aggregate_with_at(sql);
+            return expand_aggregate_with_at(&sql);
         }
     }
 
@@ -3494,7 +3494,7 @@ fn expand_modifiers_to_sql_derived(
 /// Expand AGGREGATE() with AT modifiers in SQL
 pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     let cte_expansion = expand_cte_queries(sql);
-    let mut sql = cte_expansion.sql;
+    let sql = cte_expansion.sql;
     let mut had_aggregate = cte_expansion.had_aggregate;
 
     // Check if we need the full expansion path (AT modifiers or non-decomposable measures)
