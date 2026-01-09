@@ -203,26 +203,135 @@ pub fn has_as_measure(sql: &str) -> bool {
 
 /// Check if SQL contains AGGREGATE( function
 pub fn has_aggregate_function(sql: &str) -> bool {
-    let sql_upper = sql.to_uppercase();
-    let mut search_pos = 0;
+    let chars: Vec<char> = sql.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
 
+    let is_ident_start = |c: char| c.is_alphabetic() || c == '_';
     let is_ident_char = |c: char| c.is_alphanumeric() || c == '_';
 
-    while let Some(offset) = sql_upper[search_pos..].find("AGGREGATE") {
-        let start = search_pos + offset;
-        if start > 0 {
-            if let Some(prev) = sql_upper[..start].chars().last() {
-                if is_ident_char(prev) {
-                    search_pos = start + 1;
-                    continue;
+    let skip_whitespace = |mut idx: usize| -> usize {
+        while idx < len && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        idx
+    };
+
+    let parse_identifier = |start: usize| -> (String, usize) {
+        let mut idx = start + 1;
+        while idx < len && is_ident_char(chars[idx]) {
+            idx += 1;
+        }
+        let token: String = chars[start..idx].iter().collect();
+        (token, idx)
+    };
+
+    let parse_quoted_identifier = |start: usize| -> (String, usize) {
+        let mut token = String::new();
+        let mut idx = start;
+        while idx < len {
+            match chars[idx] {
+                '"' => {
+                    if idx + 1 < len && chars[idx + 1] == '"' {
+                        token.push('"');
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                        break;
+                    }
+                }
+                c => {
+                    token.push(c);
+                    idx += 1;
                 }
             }
         }
-        let after = &sql_upper[start + "AGGREGATE".len()..];
-        if after.trim_start().starts_with('(') {
-            return true;
+        (token, idx)
+    };
+
+    let parse_qualified_chain = |first: String, mut idx: usize| -> (String, usize) {
+        let mut last = first;
+        loop {
+            idx = skip_whitespace(idx);
+            if idx >= len || chars[idx] != '.' {
+                break;
+            }
+            idx += 1;
+            idx = skip_whitespace(idx);
+            if idx >= len {
+                break;
+            }
+            if chars[idx] == '"' {
+                let (token, next) = parse_quoted_identifier(idx + 1);
+                last = token;
+                idx = next;
+            } else if is_ident_start(chars[idx]) {
+                let (token, next) = parse_identifier(idx);
+                last = token;
+                idx = next;
+            } else {
+                break;
+            }
         }
-        search_pos = start + 1;
+        (last, idx)
+    };
+
+    let is_aggregate_token = |token: &str| token.eq_ignore_ascii_case("AGGREGATE");
+
+    while i < len {
+        match chars[i] {
+            '\'' => {
+                i += 1;
+                while i < len {
+                    if chars[i] == '\'' {
+                        if i + 1 < len && chars[i + 1] == '\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '-' if i + 1 < len && chars[i + 1] == '-' => {
+                i += 2;
+                while i < len && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < len && chars[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < len {
+                    if chars[i] == '*' && chars[i + 1] == '/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '"' => {
+                let (token, next) = parse_quoted_identifier(i + 1);
+                let (last, after_chain) = parse_qualified_chain(token, next);
+                let after_ws = skip_whitespace(after_chain);
+                if after_ws < len && chars[after_ws] == '(' && is_aggregate_token(&last) {
+                    return true;
+                }
+                i = after_chain;
+            }
+            c if is_ident_start(c) => {
+                let (token, next) = parse_identifier(i);
+                let (last, after_chain) = parse_qualified_chain(token, next);
+                let after_ws = skip_whitespace(after_chain);
+                if after_ws < len && chars[after_ws] == '(' && is_aggregate_token(&last) {
+                    return true;
+                }
+                i = after_chain;
+            }
+            _ => {
+                i += 1;
+            }
+        }
     }
 
     false
@@ -3818,7 +3927,13 @@ mod tests {
     fn test_has_aggregate_function() {
         assert!(has_aggregate_function("SELECT AGGREGATE(revenue) FROM foo"));
         assert!(has_aggregate_function("SELECT AGGREGATE (revenue) FROM foo"));
+        assert!(has_aggregate_function("SELECT \"AGGREGATE\"(revenue) FROM foo"));
+        assert!(has_aggregate_function("SELECT schema.AGGREGATE(revenue) FROM foo"));
+        assert!(has_aggregate_function(
+            "SELECT \"schema\".\"AGGREGATE\" (revenue) FROM foo"
+        ));
         assert!(!has_aggregate_function("SELECT TOTAL_AGGREGATE(revenue) FROM foo"));
+        assert!(!has_aggregate_function("SELECT \"TOTAL_AGGREGATE\"(revenue) FROM foo"));
         assert!(!has_aggregate_function("SELECT myaggregate(revenue) FROM foo"));
         assert!(!has_aggregate_function("SELECT SUM(amount) FROM foo"));
     }
@@ -3850,6 +3965,19 @@ mod tests {
             cols,
             vec!["region".to_string(), "TOTAL_AGGREGATE(revenue)".to_string()]
         );
+    }
+
+    #[test]
+    fn test_extract_dimension_columns_ignores_quoted_and_qualified_aggregate() {
+        let cols = extract_dimension_columns_from_select(
+            "SELECT region, \"AGGREGATE\"(revenue) FROM sales_v",
+        );
+        assert_eq!(cols, vec!["region".to_string()]);
+
+        let cols = extract_dimension_columns_from_select(
+            "SELECT region, schema.AGGREGATE(revenue) FROM sales_v",
+        );
+        assert_eq!(cols, vec!["region".to_string()]);
     }
 
     #[test]
