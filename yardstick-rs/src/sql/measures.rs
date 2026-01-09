@@ -697,10 +697,30 @@ fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usiz
     let mut in_double = false;
     let mut in_backtick = false;
     let mut in_bracket = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
 
     let mut i = start;
     while i < bytes.len() {
         let c = bytes[i] as char;
+
+        if in_line_comment {
+            if c == '\n' || c == '\r' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if c == '*' && i + 1 < bytes.len() && bytes[i + 1] as char == '/' {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
 
         if in_single {
             if c == '\'' {
@@ -735,6 +755,18 @@ fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usiz
                 in_bracket = false;
             }
             i += 1;
+            continue;
+        }
+
+        if c == '-' && i + 1 < bytes.len() && bytes[i + 1] as char == '-' {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] as char == '*' {
+            in_block_comment = true;
+            i += 2;
             continue;
         }
 
