@@ -7,7 +7,7 @@
 //!
 //! Reference: https://arxiv.org/abs/2406.00251
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use nom::{
@@ -1049,6 +1049,26 @@ fn group_by_matches_view(outer_cols: &[String], view_cols: &[String]) -> bool {
         view_cols.iter().map(|c| normalize_group_by_col(c)).collect();
 
     !outer_set.is_empty() && outer_set == view_set
+}
+
+fn filter_group_by_cols_for_measure(
+    outer_cols: &[String],
+    view_cols: &[String],
+) -> Vec<String> {
+    if view_cols.is_empty() {
+        return outer_cols.to_vec();
+    }
+
+    let view_set: HashSet<String> = view_cols
+        .iter()
+        .map(|col| normalize_group_by_col(col))
+        .collect();
+
+    outer_cols
+        .iter()
+        .filter(|col| view_set.contains(&normalize_group_by_col(col)))
+        .cloned()
+        .collect()
 }
 
 fn can_use_view_measure_directly(resolved: &ResolvedMeasure, outer_group_by: &[String]) -> bool {
@@ -3416,6 +3436,8 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     for (measure_name, modifiers, start, end) in patterns {
         // Look up which view contains this measure (for JOIN support)
         let resolved = resolve_measure_source(&measure_name, &primary_table_name);
+        let measure_group_by_cols =
+            filter_group_by_cols_for_measure(&group_by_cols, &resolved.view_group_by_cols);
 
         // Non-decomposable measures are recomputed from base rows (including AT modifiers)
 
@@ -3452,7 +3474,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 &resolved.source_view,
                 outer_alias_ref,
                 outer_where_ref,
-                &group_by_cols,
+                &measure_group_by_cols,
             )
         } else if !resolved.is_decomposable {
             let outer_ref_for_non_decomp =
@@ -3480,7 +3502,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                     &base_relation_sql,
                     outer_ref_for_non_decomp,
                     outer_where_ref,
-                    &group_by_cols,
+                    &measure_group_by_cols,
                     &modifiers,
                     &resolved.dimension_exprs,
                     &format!("_nd_{join_counter}"),
@@ -3496,7 +3518,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                             &base_relation_sql,
                             outer_ref_for_non_decomp,
                             outer_where_ref,
-                            &group_by_cols,
+                            &measure_group_by_cols,
                             &modifiers,
                             &resolved.dimension_exprs,
                         ),
@@ -3517,7 +3539,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 &resolved.source_view,
                 outer_alias_ref,
                 outer_where_ref,
-                &group_by_cols,
+                &measure_group_by_cols,
             )
         };
         result_sql = format!("{}{}{}", &result_sql[..start], expanded, &result_sql[end..]);
@@ -3529,6 +3551,8 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     for (measure_name, start, end) in plain_calls {
         let resolved = resolve_measure_source(&measure_name, &primary_table_name);
+        let measure_group_by_cols =
+            filter_group_by_cols_for_measure(&group_by_cols, &resolved.view_group_by_cols);
 
 
         // For derived measures, use the expanded expression; otherwise use AGG(measure_name)
@@ -3558,7 +3582,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                     &base_relation_sql,
                     outer_ref_for_non_decomp,
                     outer_where_ref,
-                    &group_by_cols,
+                    &measure_group_by_cols,
                     &[], // No modifiers for plain AGGREGATE()
                     &resolved.dimension_exprs,
                     &format!("_nd_{join_counter}"),
@@ -3574,7 +3598,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                             &base_relation_sql,
                             outer_ref_for_non_decomp,
                             outer_where_ref,
-                            &group_by_cols,
+                            &measure_group_by_cols,
                             &[], // No modifiers for plain AGGREGATE()
                             &resolved.dimension_exprs,
                         ),

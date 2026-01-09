@@ -819,6 +819,40 @@ FROM fact_orders_v o JOIN fact_returns_v r ON o.year = r.year AND o.region = r.r
 2023	US	150.0	225.0
 
 # =============================================================================
+# Test: JOIN with extra dimension from second table
+# =============================================================================
+
+statement ok
+CREATE TABLE salesdetails (year INT, region TEXT, product TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO salesdetails VALUES
+    (2022, 'US', 'Shoes', 2), (2022, 'US', 'Cars', 1),
+    (2022, 'EU', 'Shoes', 3),
+    (2023, 'US', 'Shoes', 4), (2023, 'US', 'Cars', 2),
+    (2023, 'EU', 'Cars', 5);
+
+statement ok
+CREATE VIEW salesdetails_v AS
+SELECT year, region, product, SUM(amount) AS MEASURE quantity
+FROM salesdetails;
+
+query IIIRRR rowsort
+SEMANTIC SELECT s.year, s.region, sd.product,
+    AGGREGATE(revenue) AS year_sales_revenue,
+    AGGREGATE(revenue) AT (ALL year) AS region_total,
+    AGGREGATE(quantity) AS product_qty
+FROM sales_v s JOIN salesdetails_v sd ON s.year = sd.year AND s.region = sd.region
+;
+----
+2022	EU	Shoes	50.0	125.0	3.0
+2022	US	Cars	100.0	250.0	1.0
+2022	US	Shoes	100.0	250.0	2.0
+2023	EU	Cars	75.0	125.0	5.0
+2023	US	Cars	150.0	250.0	2.0
+2023	US	Shoes	150.0	250.0	4.0
+
+# =============================================================================
 # Test: SET reaches beyond WHERE clause (paper semantics)
 # Per paper: SET should evaluate over data removed by outer WHERE clause
 # =============================================================================
