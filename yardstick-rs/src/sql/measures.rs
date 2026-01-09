@@ -206,8 +206,18 @@ pub fn has_aggregate_function(sql: &str) -> bool {
     let sql_upper = sql.to_uppercase();
     let mut search_pos = 0;
 
+    let is_ident_char = |c: char| c.is_alphanumeric() || c == '_';
+
     while let Some(offset) = sql_upper[search_pos..].find("AGGREGATE") {
         let start = search_pos + offset;
+        if start > 0 {
+            if let Some(prev) = sql_upper[..start].chars().last() {
+                if is_ident_char(prev) {
+                    search_pos = start + 1;
+                    continue;
+                }
+            }
+        }
         let after = &sql_upper[start + "AGGREGATE".len()..];
         if after.trim_start().starts_with('(') {
             return true;
@@ -3808,6 +3818,8 @@ mod tests {
     fn test_has_aggregate_function() {
         assert!(has_aggregate_function("SELECT AGGREGATE(revenue) FROM foo"));
         assert!(has_aggregate_function("SELECT AGGREGATE (revenue) FROM foo"));
+        assert!(!has_aggregate_function("SELECT TOTAL_AGGREGATE(revenue) FROM foo"));
+        assert!(!has_aggregate_function("SELECT myaggregate(revenue) FROM foo"));
         assert!(!has_aggregate_function("SELECT SUM(amount) FROM foo"));
     }
 
@@ -3827,6 +3839,17 @@ mod tests {
             "SELECT AGGREGATE (revenue) FROM sales_v",
         );
         assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn test_extract_dimension_columns_keeps_non_aggregate_suffix() {
+        let cols = extract_dimension_columns_from_select(
+            "SELECT region, TOTAL_AGGREGATE(revenue) FROM sales_v",
+        );
+        assert_eq!(
+            cols,
+            vec!["region".to_string(), "TOTAL_AGGREGATE(revenue)".to_string()]
+        );
     }
 
     #[test]
