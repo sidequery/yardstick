@@ -1299,3 +1299,90 @@ query I
 SEMANTIC SELECT AGGREGATE(total) FROM series_v;
 ----
 15
+
+# =============================================================================
+# Test: Literal constants in SELECT should not become GROUP BY terms (#10)
+# =============================================================================
+
+# Integer constant with AGGREGATE
+query IR
+SEMANTIC SELECT 1000, AGGREGATE(revenue) FROM sales_v;
+----
+1000	375.0
+
+# String literal with AGGREGATE
+query IR
+SEMANTIC SELECT 'hello', AGGREGATE(revenue) FROM sales_v;
+----
+hello	375.0
+
+# Dimension column alongside integer constant
+query IIR rowsort
+SEMANTIC SELECT year, 1000, AGGREGATE(revenue) FROM sales_v;
+----
+2022	1000	150.0
+2023	1000	225.0
+
+# NULL constant with AGGREGATE
+query IR
+SEMANTIC SELECT NULL, AGGREGATE(revenue) FROM sales_v;
+----
+NULL	375.0
+
+# =============================================================================
+# Test: NULL dimension values handled correctly (#6)
+# =============================================================================
+
+# Setup: table with NULL dimension values
+statement ok
+CREATE TABLE sales_nulls (year INT, region TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO sales_nulls VALUES
+    (2022, 'US', 100), (2022, NULL, 50),
+    (2023, 'US', 150), (2023, NULL, 75),
+    (NULL, 'US', 10),  (NULL, NULL, 5);
+
+statement ok
+CREATE VIEW sales_nulls_v AS
+SELECT year, region, SUM(amount) AS MEASURE revenue
+FROM sales_nulls;
+
+# Basic: NULL region rows should appear with correct aggregation
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) FROM sales_nulls_v;
+----
+2022	NULL	50.0
+2022	US	100.0
+2023	NULL	75.0
+2023	US	150.0
+NULL	NULL	5.0
+NULL	US	10.0
+
+# AT (ALL region): year totals should include NULL region rows
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total FROM sales_nulls_v;
+----
+2022	NULL	150.0
+2022	US	150.0
+2023	NULL	225.0
+2023	US	225.0
+NULL	NULL	15.0
+NULL	US	15.0
+
+# AT (ALL year): region totals should include NULL year rows
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL year) AS region_total FROM sales_nulls_v;
+----
+2022	NULL	130.0
+2022	US	260.0
+2023	NULL	130.0
+2023	US	260.0
+NULL	NULL	130.0
+NULL	US	260.0
+
+# Grand total across all (including NULLs)
+query I
+SEMANTIC SELECT AGGREGATE(revenue) FROM sales_nulls_v;
+----
+390.0

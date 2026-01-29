@@ -1126,11 +1126,11 @@ extern "C" char* yardstick_expand_aggregate_call(
             std::string correlation;
 
             if (outer_alias) {
-                correlation = std::string(table_name) + "." + col + " = " +
+                correlation = std::string(table_name) + "." + col + " IS NOT DISTINCT FROM " +
                               std::string(outer_alias) + "." + col;
             } else {
                 // Use the column directly for correlation
-                correlation = std::string(table_name) + "." + col + " = " + col;
+                correlation = std::string(table_name) + "." + col + " IS NOT DISTINCT FROM " + col;
             }
 
             where_conditions.push_back(correlation);

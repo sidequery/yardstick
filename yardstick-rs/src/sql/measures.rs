@@ -2571,6 +2571,7 @@ fn extract_dimension_columns_from_select_info(info: &SelectInfo) -> Vec<String> 
     info.items
         .iter()
         .filter(|item| !item.is_aggregate && !item.is_star && !item.is_measure_ref)
+        .filter(|item| !is_literal_constant(&item.expression_sql))
         .map(|item| {
             // Use alias if present, otherwise expression
             item.alias
@@ -2789,7 +2790,7 @@ fn correlation_condition_for_dim(
     outer_alias: Option<&str>,
 ) -> String {
     let (inner_expr, outer_expr) = correlation_exprs_for_dim(dim, dimension_exprs, outer_alias);
-    format!("{inner_expr} = {outer_expr}")
+    format!("{inner_expr} IS NOT DISTINCT FROM {outer_expr}")
 }
 
 struct NonDecompJoinPlan {
@@ -2926,7 +2927,7 @@ fn build_non_decomposable_join_plan(
 
         select_parts.push(format!("{inner_expr} AS {alias}"));
         group_parts.push(alias.clone());
-        join_conditions.push(format!("{join_alias}.{alias} = {outer_expr}"));
+        join_conditions.push(format!("{join_alias}.{alias} IS NOT DISTINCT FROM {outer_expr}"));
     }
 
     let mut agg_query = format!(
@@ -2957,7 +2958,7 @@ fn build_non_decomposable_join_plan(
 /// - expression: "COUNT(DISTINCT user_id)"
 /// - base_relation_sql: "SELECT * FROM orders"
 /// - group_by_cols: ["year", "region"]
-/// - Result: (SELECT COUNT(DISTINCT user_id) FROM (SELECT * FROM orders) _inner WHERE _inner.year = _outer.year AND _inner.region = _outer.region)
+/// - Result: (SELECT COUNT(DISTINCT user_id) FROM (SELECT * FROM orders) _inner WHERE _inner.year IS NOT DISTINCT FROM _outer.year AND _inner.region IS NOT DISTINCT FROM _outer.region)
 fn expand_non_decomposable_to_sql(
     expression: &str,
     base_relation_sql: &str,
@@ -3123,7 +3124,7 @@ fn expand_non_decomposable_to_sql(
                     } else {
                         format!("_inner.{dim_name}")
                     };
-                    set_conditions.push(format!("{inner_dim} = {qualified_expr}"));
+                    set_conditions.push(format!("{inner_dim} IS NOT DISTINCT FROM {qualified_expr}"));
                 }
             }
         }
@@ -3232,7 +3233,7 @@ fn expand_non_decomposable_at_to_sql(
             } else {
                 format!("_inner.{dim_name}")
             };
-            let set_condition = format!("{inner_dim} = {qualified_expr}");
+            let set_condition = format!("{inner_dim} IS NOT DISTINCT FROM {qualified_expr}");
 
             let dim_lower = dim.to_lowercase();
             let is_expression = dim.contains('(');
@@ -3357,11 +3358,11 @@ pub fn expand_at_to_sql(
                         if col_is_expr {
                             // For expression dimensions, qualify column refs inside
                             let inner_expr = qualify_where_for_inner(col);
-                            format!("{inner_expr} = {col}")
+                            format!("{inner_expr} IS NOT DISTINCT FROM {col}")
                         } else {
                             // Extract just the column name for _inner reference
                             let col_name = col.split('.').next_back().unwrap_or(col);
-                            format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                            format!("_inner.{col_name} IS NOT DISTINCT FROM {outer_ref}.{col_name}")
                         }
                     })
                     .collect();
@@ -3387,7 +3388,7 @@ pub fn expand_at_to_sql(
             };
 
             // SET condition for the specified dimension
-            let set_condition = format!("{inner_dim} = {qualified_expr}");
+            let set_condition = format!("{inner_dim} IS NOT DISTINCT FROM {qualified_expr}");
 
             // Build correlation conditions for OTHER GROUP BY columns (not the SET dim)
             // Per paper: SET only removes terms for the specified dimension, correlates on others
@@ -3407,10 +3408,10 @@ pub fn expand_at_to_sql(
                     let col_is_expr = col.contains('(');
                     if col_is_expr {
                         let inner_expr = qualify_where_for_inner(col);
-                        format!("{inner_expr} = {col}")
+                        format!("{inner_expr} IS NOT DISTINCT FROM {col}")
                     } else {
                         let col_name = col.split('.').next_back().unwrap_or(col);
-                        format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                        format!("_inner.{col_name} IS NOT DISTINCT FROM {outer_ref}.{col_name}")
                     }
                 })
                 .collect();
@@ -3449,7 +3450,7 @@ pub fn expand_at_to_sql(
                     .map(|col| {
                         // Extract just the column name for _inner reference
                         let col_name = col.split('.').next_back().unwrap_or(col);
-                        format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                        format!("_inner.{col_name} IS NOT DISTINCT FROM {outer_ref}.{col_name}")
                     })
                     .collect();
                 let full_where = match outer_where {
@@ -3558,7 +3559,7 @@ pub fn expand_modifiers_to_sql(
             .iter()
             .map(|col| {
                 let col_name = col.split('.').next_back().unwrap_or(col);
-                format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                format!("_inner.{col_name} IS NOT DISTINCT FROM {outer_ref}.{col_name}")
             })
             .collect();
         return format!(
@@ -3627,7 +3628,7 @@ pub fn expand_modifiers_to_sql(
                     } else {
                         format!("_inner.{dim}")
                     };
-                    set_conditions.push(format!("{inner_dim} = {qualified_expr}"));
+                    set_conditions.push(format!("{inner_dim} IS NOT DISTINCT FROM {qualified_expr}"));
                 }
             }
         }
@@ -3663,10 +3664,10 @@ pub fn expand_modifiers_to_sql(
             if col_is_expr {
                 // For expression dimensions, qualify column refs inside
                 let inner_expr = qualify_where_for_inner(col);
-                format!("{inner_expr} = {col}")
+                format!("{inner_expr} IS NOT DISTINCT FROM {col}")
             } else {
                 let col_name = col.split('.').next_back().unwrap_or(col);
-                format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                format!("_inner.{col_name} IS NOT DISTINCT FROM {outer_ref}.{col_name}")
             }
         })
         .collect();
@@ -3756,10 +3757,10 @@ fn expand_modifiers_to_sql_derived(
                 if col_is_expr {
                     // For expression dimensions, qualify column refs inside
                     let inner_expr = qualify_where_for_inner(col);
-                    format!("{inner_expr} = {col}")
+                    format!("{inner_expr} IS NOT DISTINCT FROM {col}")
                 } else {
                     let col_name = col.split('.').next_back().unwrap_or(col);
-                    format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                    format!("_inner.{col_name} IS NOT DISTINCT FROM {outer_ref}.{col_name}")
                 }
             })
             .collect();
@@ -3837,10 +3838,10 @@ fn expand_modifiers_to_sql_derived(
             if col_is_expr {
                 // For expression dimensions, qualify column refs inside
                 let inner_expr = qualify_where_for_inner(col);
-                format!("{inner_expr} = {col}")
+                format!("{inner_expr} IS NOT DISTINCT FROM {col}")
             } else {
                 let col_name = col.split('.').next_back().unwrap_or(col);
-                format!("_inner.{col_name} = {outer_ref}.{col_name}")
+                format!("_inner.{col_name} IS NOT DISTINCT FROM {outer_ref}.{col_name}")
             }
         })
         .collect();
@@ -4274,6 +4275,63 @@ fn extract_group_by_columns(sql: &str) -> Vec<String> {
     columns
 }
 
+/// Check if a SQL expression is a literal constant (integer, float, string, NULL, TRUE, FALSE,
+/// or typed literals like DATE '...', TIMESTAMP '...', INTERVAL '...').
+/// These should not be included in GROUP BY since they are not dimension columns.
+fn is_literal_constant(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let upper = trimmed.to_uppercase();
+
+    // NULL, TRUE, FALSE
+    if upper == "NULL" || upper == "TRUE" || upper == "FALSE" {
+        return true;
+    }
+
+    // String literal: starts and ends with single quote
+    if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+        return true;
+    }
+
+    // Typed literals: DATE '...', TIMESTAMP '...', INTERVAL '...', TIME '...'
+    for prefix in &["DATE ", "TIMESTAMP ", "INTERVAL ", "TIME "] {
+        if upper.starts_with(prefix) {
+            let rest = trimmed[prefix.len()..].trim();
+            if rest.starts_with('\'') && rest.ends_with('\'') {
+                return true;
+            }
+        }
+    }
+
+    // Numeric: integer or float (possibly negative)
+    let numeric_part = if trimmed.starts_with('-') || trimmed.starts_with('+') {
+        &trimmed[1..]
+    } else {
+        trimmed
+    };
+
+    if !numeric_part.is_empty() {
+        let mut saw_dot = false;
+        let is_numeric = numeric_part.chars().all(|c| {
+            if c == '.' && !saw_dot {
+                saw_dot = true;
+                true
+            } else {
+                c.is_ascii_digit()
+            }
+        });
+        // Must have at least one digit (not just "." or "-")
+        if is_numeric && numeric_part.chars().any(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Extract non-AGGREGATE columns from SELECT clause to use as implicit GROUP BY columns
 fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
     let mut columns = Vec::new();
@@ -4321,7 +4379,7 @@ fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
         items.push(current.trim().to_string());
     }
 
-    // Filter out AGGREGATE() calls and extract column names
+    // Filter out AGGREGATE() calls, literal constants, and extract column names
     for item in items {
         if has_aggregate_function(&item) {
             continue;
@@ -4333,7 +4391,7 @@ fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
         } else {
             item.trim()
         };
-        if !col.is_empty() {
+        if !col.is_empty() && !is_literal_constant(col) {
             columns.push(col.to_string());
         }
     }
@@ -4415,6 +4473,85 @@ mod tests {
             "SELECT region, schema.AGGREGATE(revenue) FROM sales_v",
         );
         assert_eq!(cols, vec!["region".to_string()]);
+    }
+
+    #[test]
+    fn test_is_literal_constant() {
+        // Integers
+        assert!(is_literal_constant("1000"));
+        assert!(is_literal_constant("0"));
+        assert!(is_literal_constant("-1"));
+        assert!(is_literal_constant("+42"));
+
+        // Floats
+        assert!(is_literal_constant("3.14"));
+        assert!(is_literal_constant("-0.5"));
+        assert!(is_literal_constant("100.0"));
+
+        // String literals
+        assert!(is_literal_constant("'hello'"));
+        assert!(is_literal_constant("'it''s a test'"));
+
+        // NULL, TRUE, FALSE (case insensitive)
+        assert!(is_literal_constant("NULL"));
+        assert!(is_literal_constant("null"));
+        assert!(is_literal_constant("TRUE"));
+        assert!(is_literal_constant("true"));
+        assert!(is_literal_constant("FALSE"));
+        assert!(is_literal_constant("false"));
+
+        // Date/time literals
+        assert!(is_literal_constant("DATE '2023-01-01'"));
+        assert!(is_literal_constant("TIMESTAMP '2023-01-01 00:00:00'"));
+        assert!(is_literal_constant("INTERVAL '1 day'"));
+        assert!(is_literal_constant("TIME '12:00:00'"));
+
+        // Not constants
+        assert!(!is_literal_constant("year"));
+        assert!(!is_literal_constant("region"));
+        assert!(!is_literal_constant("UPPER(region)"));
+        assert!(!is_literal_constant("year + 1"));
+        assert!(!is_literal_constant(""));
+        assert!(!is_literal_constant("SUM(amount)"));
+    }
+
+    #[test]
+    fn test_extract_dimension_columns_skips_literal_constants() {
+        // Integer constant only
+        let cols = extract_dimension_columns_from_select(
+            "SELECT 1000, AGGREGATE(revenue) FROM sales_v",
+        );
+        assert!(cols.is_empty());
+
+        // String literal only
+        let cols = extract_dimension_columns_from_select(
+            "SELECT 'hello', AGGREGATE(revenue) FROM sales_v",
+        );
+        assert!(cols.is_empty());
+
+        // Mixed: dimension + constant
+        let cols = extract_dimension_columns_from_select(
+            "SELECT year, 1000, AGGREGATE(revenue) FROM sales_v",
+        );
+        assert_eq!(cols, vec!["year".to_string()]);
+
+        // NULL constant
+        let cols = extract_dimension_columns_from_select(
+            "SELECT NULL, AGGREGATE(revenue) FROM sales_v",
+        );
+        assert!(cols.is_empty());
+
+        // Float constant
+        let cols = extract_dimension_columns_from_select(
+            "SELECT 3.14, AGGREGATE(revenue) FROM sales_v",
+        );
+        assert!(cols.is_empty());
+
+        // Negative integer
+        let cols = extract_dimension_columns_from_select(
+            "SELECT -1, AGGREGATE(revenue) FROM sales_v",
+        );
+        assert!(cols.is_empty());
     }
 
     #[test]
@@ -4592,7 +4729,7 @@ FROM orders"#;
         );
         assert_eq!(
             expanded2,
-            "(SELECT SUM(revenue) FROM sales_v _inner WHERE _inner.year = _outer.year)"
+            "(SELECT SUM(revenue) FROM sales_v _inner WHERE _inner.year IS NOT DISTINCT FROM _outer.year)"
         );
     }
 
@@ -4627,7 +4764,7 @@ FROM orders"#;
         );
         assert_eq!(
             expanded,
-            "(SELECT SUM(revenue) FROM sales_yearly _inner WHERE _inner.year = _outer.year - 1)"
+            "(SELECT SUM(revenue) FROM sales_yearly _inner WHERE _inner.year IS NOT DISTINCT FROM _outer.year - 1)"
         );
     }
 
@@ -4757,7 +4894,7 @@ FROM orders"#;
         assert!(upper.contains("YEAR"));
         assert!(upper.contains("REGION"));
         // Should correlate on year (not region, since AT ALL region removes it)
-        assert!(result.expanded_sql.contains("_inner.year = _outer.year"));
+        assert!(result.expanded_sql.contains("_inner.year IS NOT DISTINCT FROM _outer.year"));
     }
 
     #[test]
@@ -4901,7 +5038,7 @@ FROM orders"#;
         // Should correlate on year only (not grand total)
         assert_eq!(
             expanded,
-            "(SELECT SUM(revenue) FROM sales_v _inner WHERE _inner.year = _outer.year)"
+            "(SELECT SUM(revenue) FROM sales_v _inner WHERE _inner.year IS NOT DISTINCT FROM _outer.year)"
         );
     }
 
@@ -5442,7 +5579,7 @@ GROUP BY s.year";
         assert!(result.error.is_none());
         assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
         assert!(result.expanded_sql.contains("LEFT JOIN"));
-        assert!(result.expanded_sql.contains("= _outer.year"));
+        assert!(result.expanded_sql.contains("IS NOT DISTINCT FROM _outer.year"));
     }
 
     #[test]
@@ -5578,7 +5715,7 @@ GROUP BY s.year";
         assert!(result
             .expanded_sql
             .contains("date_trunc('year', _inner.order_date) AS dim_0"));
-        assert!(result.expanded_sql.contains("= _outer.year"));
+        assert!(result.expanded_sql.contains("IS NOT DISTINCT FROM _outer.year"));
     }
 
     #[test]
