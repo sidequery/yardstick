@@ -54,6 +54,21 @@ SELECT * FROM a;
 # Test: GROUP BY with extra spaces
 # =============================================================================
 
+statement ok
+CREATE VIEW sales_grouped AS
+SELECT year, region, SUM(amount) AS MEASURE revenue
+FROM sales
+GROUP   BY year, region;
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_grouped;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
 query IIR rowsort
 SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total
 FROM sales_v
