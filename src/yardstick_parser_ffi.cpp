@@ -1109,7 +1109,7 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
         auto* select_node = static_cast<SelectNode*>(select_stmt->node.get());
         size_t from_pos = FindTopLevelFrom(sql);
         if (from_pos == std::string::npos) {
-            from_pos = sql.size();
+            from_pos = std::strlen(sql);
         }
 
         // Process SELECT list
