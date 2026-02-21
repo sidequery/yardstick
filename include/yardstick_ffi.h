@@ -315,6 +315,7 @@ struct YardstickMeasureAggResult {
 
 bool yardstick_has_as_measure(const char* sql);
 bool yardstick_has_aggregate(const char* sql);
+bool yardstick_drop_measure_view_from_sql(const char* sql);
 bool yardstick_has_curly_brace(const char* sql);
 bool yardstick_has_at_syntax(const char* sql);
 

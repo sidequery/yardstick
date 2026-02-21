@@ -694,6 +694,39 @@ pub fn extract_view_name(sql: &str) -> Option<String> {
         .map(|(_, name)| name.to_string())
 }
 
+/// Extract view name from DROP VIEW statement
+pub fn extract_drop_view_name(sql: &str) -> Option<String> {
+    let upper = sql.to_uppercase();
+    let mut idx = skip_ws_and_comments(sql, 0);
+    if !matches_keyword_at(&upper, idx, "DROP") {
+        return None;
+    }
+    idx += "DROP".len();
+    idx = skip_ws_and_comments(sql, idx);
+
+    if !matches_keyword_at(&upper, idx, "VIEW") {
+        return None;
+    }
+    idx += "VIEW".len();
+    idx = skip_ws_and_comments(sql, idx);
+
+    if matches_keyword_at(&upper, idx, "IF") {
+        idx += "IF".len();
+        idx = skip_ws_and_comments(sql, idx);
+        if !matches_keyword_at(&upper, idx, "EXISTS") {
+            return None;
+        }
+        idx += "EXISTS".len();
+        idx = skip_ws_and_comments(sql, idx);
+    }
+
+    let end = parse_qualified_name_span(sql, idx)?;
+    if !is_statement_tail(sql, end) {
+        return None;
+    }
+    extract_last_qualified_identifier(&sql[idx..end])
+}
+
 /// Extract table name from SQL FROM clause
 pub fn extract_table_name_from_sql(sql: &str) -> Option<String> {
     extract_table_and_alias_from_sql(sql).map(|(name, _)| name)
@@ -702,91 +735,66 @@ pub fn extract_table_name_from_sql(sql: &str) -> Option<String> {
 /// Extract table name and optional alias from SQL FROM clause
 /// Returns (table_name, Option<alias>)
 pub fn extract_table_and_alias_from_sql(sql: &str) -> Option<(String, Option<String>)> {
-    fn skip_ws_and_comments(sql: &str, mut idx: usize) -> usize {
-        let bytes = sql.as_bytes();
-        while idx < bytes.len() {
-            let c = bytes[idx] as char;
-            if c.is_whitespace() {
-                idx += 1;
-                continue;
-            }
-            if c == '-' && idx + 1 < bytes.len() && bytes[idx + 1] as char == '-' {
-                idx += 2;
-                while idx < bytes.len() {
-                    let ch = bytes[idx] as char;
-                    idx += 1;
-                    if ch == '\n' || ch == '\r' {
-                        break;
-                    }
-                }
-                continue;
-            }
-            if c == '/' && idx + 1 < bytes.len() && bytes[idx + 1] as char == '*' {
-                idx += 2;
-                while idx + 1 < bytes.len() {
-                    let ch = bytes[idx] as char;
-                    if ch == '*' && bytes[idx + 1] as char == '/' {
-                        idx += 2;
-                        break;
-                    }
-                    idx += 1;
-                }
-                continue;
-            }
-            break;
-        }
-        idx
-    }
-
     let from_pos = find_top_level_keyword(sql, "FROM", 0)?;
-    let mut idx = from_pos + 4;
-    idx = skip_ws_and_comments(sql, idx);
-    if idx >= sql.len() {
+    let upper = sql.to_uppercase();
+    let i = skip_ws_and_comments(sql, from_pos + 4);
+    let bytes = sql.as_bytes();
+    if i >= bytes.len() || bytes[i] == b'(' {
         return None;
     }
 
-    let table_start = idx;
-    while idx < sql.len() && is_table_ident_char(sql.as_bytes()[idx] as char) {
-        idx += 1;
-    }
-    if table_start == idx {
-        return None;
-    }
-    let table = sql[table_start..idx].to_string();
+    let table_end = parse_qualified_name_span(sql, i)?;
+    let raw_table = sql[i..table_end].trim();
+    let table_name =
+        extract_last_qualified_identifier(raw_table).unwrap_or_else(|| raw_table.to_string());
 
-    idx = skip_ws_and_comments(sql, idx);
-    if idx >= sql.len() || sql.as_bytes()[idx] as char == ';' {
-        return Some((table, None));
+    let j = skip_ws_and_comments(sql, table_end);
+    if j >= bytes.len() || sql[j..].starts_with(';') {
+        return Some((table_name, None));
     }
 
-    let rest = &sql[idx..];
-    let rest_upper = rest.to_uppercase();
-    let mut rest_after_as = rest;
-    if rest_upper.starts_with("AS") {
-        let after_as = &rest[2..];
-        if after_as
-            .chars()
-            .next()
-            .map_or(false, |ch| ch.is_whitespace())
-        {
-            let mut as_idx = idx + 2;
-            as_idx = skip_ws_and_comments(sql, as_idx);
-            rest_after_as = &sql[as_idx..];
-        }
+    if matches_keyword_at(&upper, j, "WHERE")
+        || matches_keyword_at(&upper, j, "GROUP")
+        || matches_keyword_at(&upper, j, "ORDER")
+        || matches_keyword_at(&upper, j, "LIMIT")
+        || matches_keyword_at(&upper, j, "HAVING")
+        || matches_keyword_at(&upper, j, "JOIN")
+    {
+        return Some((table_name, None));
     }
 
-    if let Ok((_, alias)) = identifier(rest_after_as.trim_start()) {
-        let alias_upper = alias.to_uppercase();
-        if matches!(
-            alias_upper.as_str(),
-            "FROM" | "WHERE" | "GROUP" | "ORDER" | "LIMIT" | "HAVING" | "JOIN"
-        ) {
-            return Some((table, None));
-        }
-        Some((table, Some(alias.to_string())))
+    if let Some((_, alias)) = parse_alias_span(sql, j) {
+        Some((table_name, Some(alias)))
     } else {
-        Some((table, None))
+        Some((table_name, None))
     }
+}
+
+fn insert_primary_table_alias(sql: &str, alias: &str) -> Option<String> {
+    // Cases:
+    // - no top-level FROM: leave unchanged
+    // - FROM starts with subquery: leave unchanged
+    // - existing alias (with or without AS, quoted or unquoted): leave unchanged
+    // - no alias: insert the provided alias after the primary table name
+    let from_pos = find_top_level_keyword(sql, "FROM", 0)?;
+    let bytes = sql.as_bytes();
+    let i = skip_ws_and_comments(sql, from_pos + 4);
+    if i >= bytes.len() || bytes[i] == b'(' {
+        return None;
+    }
+
+    let table_end = parse_qualified_name_span(sql, i)?;
+    let j = skip_ws_and_comments(sql, table_end);
+    if parse_alias_span(sql, j).is_some() {
+        return None;
+    }
+
+    let mut result = String::with_capacity(sql.len() + alias.len() + 1);
+    result.push_str(&sql[..table_end]);
+    result.push(' ');
+    result.push_str(alias);
+    result.push_str(&sql[table_end..]);
+    Some(result)
 }
 
 /// Extract the SELECT/WITH query from a CREATE VIEW statement
@@ -827,8 +835,205 @@ fn is_boundary_char(ch: Option<char>) -> bool {
     ch.map_or(true, |c| !c.is_alphanumeric() && c != '_')
 }
 
-fn is_table_ident_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_' || ch == '.'
+fn is_statement_tail(sql: &str, mut idx: usize) -> bool {
+    let bytes = sql.as_bytes();
+    idx = skip_ws_and_comments(sql, idx);
+    while idx < bytes.len() && bytes[idx] == b';' {
+        idx += 1;
+        idx = skip_ws_and_comments(sql, idx);
+    }
+    idx == bytes.len()
+}
+
+fn skip_ws_and_comments(sql: &str, mut idx: usize) -> usize {
+    let bytes = sql.as_bytes();
+    while idx < bytes.len() {
+        if bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+            continue;
+        }
+        if bytes[idx] == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
+            idx += 2;
+            while idx < bytes.len() {
+                let ch = bytes[idx];
+                idx += 1;
+                if ch == b'\n' || ch == b'\r' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if bytes[idx] == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+            idx += 2;
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx += 2;
+                    break;
+                }
+                idx += 1;
+            }
+            if idx + 1 >= bytes.len() {
+                idx = bytes.len();
+            }
+            continue;
+        }
+        break;
+    }
+    idx
+}
+
+fn is_ident_start_byte(b: u8) -> bool {
+    (b as char).is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_ident_part_byte(b: u8) -> bool {
+    (b as char).is_ascii_alphanumeric() || b == b'_'
+}
+
+fn strip_identifier_quotes(input: &str) -> &str {
+    if input.len() >= 2 {
+        let bytes = input.as_bytes();
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"')
+            || (first == b'`' && last == b'`')
+            || (first == b'[' && last == b']')
+        {
+            return &input[1..input.len() - 1];
+        }
+    }
+    input
+}
+
+fn extract_last_qualified_identifier(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut i = skip_ws_and_comments(input, 0);
+    let (end, _) = parse_identifier_token(input, i)?;
+    let mut last_start = i;
+    let mut last_end = end;
+    i = end;
+
+    loop {
+        let mut j = skip_ws_and_comments(input, i);
+        if j >= bytes.len() || bytes[j] != b'.' {
+            break;
+        }
+        j += 1;
+        j = skip_ws_and_comments(input, j);
+        let (next_end, _) = parse_identifier_token(input, j)?;
+        last_start = j;
+        last_end = next_end;
+        i = next_end;
+    }
+
+    let tail = skip_ws_and_comments(input, i);
+    if tail < bytes.len() {
+        return None;
+    }
+
+    Some(strip_identifier_quotes(input[last_start..last_end].trim()).to_string())
+}
+
+fn parse_identifier_token(sql: &str, start: usize) -> Option<(usize, bool)> {
+    let bytes = sql.as_bytes();
+    if start >= bytes.len() {
+        return None;
+    }
+    let first = bytes[start];
+    if first == b'"' || first == b'`' || first == b'[' {
+        let end_char = match first {
+            b'"' => b'"',
+            b'`' => b'`',
+            _ => b']',
+        };
+        let mut i = start + 1;
+        while i < bytes.len() {
+            if bytes[i] == end_char {
+                if end_char == b'"' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                return Some((i + 1, true));
+            }
+            i += 1;
+        }
+        return None;
+    }
+    if !is_ident_start_byte(first) {
+        return None;
+    }
+    let mut i = start + 1;
+    while i < bytes.len() && is_ident_part_byte(bytes[i]) {
+        i += 1;
+    }
+    Some((i, false))
+}
+
+fn parse_qualified_name_span(sql: &str, start: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut i = start;
+    let (mut end, _) = parse_identifier_token(sql, i)?;
+    i = end;
+
+    loop {
+        let mut j = skip_ws_and_comments(sql, i);
+        if j >= bytes.len() || bytes[j] != b'.' {
+            break;
+        }
+        j += 1;
+        j = skip_ws_and_comments(sql, j);
+        let (next_end, _) = parse_identifier_token(sql, j)?;
+        end = next_end;
+        i = end;
+    }
+
+    Some(end)
+}
+
+fn parse_alias_span(sql: &str, start: usize) -> Option<(usize, String)> {
+    let upper = sql.to_uppercase();
+    let mut i = skip_ws_and_comments(sql, start);
+    let bytes = sql.as_bytes();
+    if i >= bytes.len() {
+        return None;
+    }
+
+    if matches_keyword_at(&upper, i, "AS") {
+        i += 2;
+        i = skip_ws_and_comments(sql, i);
+    }
+
+    let (end, quoted) = parse_identifier_token(sql, i)?;
+    let raw = sql[i..end].trim().to_string();
+    if quoted {
+        return Some((end, raw));
+    }
+
+    let alias_upper = raw.to_uppercase();
+    if matches!(
+        alias_upper.as_str(),
+        "WHERE"
+            | "GROUP"
+            | "ORDER"
+            | "LIMIT"
+            | "HAVING"
+            | "JOIN"
+            | "ON"
+            | "USING"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "CROSS"
+            | "UNION"
+            | "EXCEPT"
+            | "INTERSECT"
+            | "WINDOW"
+            | "QUALIFY"
+    ) {
+        return None;
+    }
+
+    Some((end, raw))
 }
 
 fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usize> {
@@ -1019,42 +1224,6 @@ fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usiz
     }
 
     None
-}
-
-fn insert_table_alias(sql: &str, table_name: &str, alias: &str) -> Option<String> {
-    let from_pos = find_top_level_keyword(sql, "FROM", 0)?;
-    let bytes = sql.as_bytes();
-    let mut idx = from_pos + 4;
-    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
-        idx += 1;
-    }
-    if idx >= bytes.len() {
-        return None;
-    }
-
-    let table_start = idx;
-    while idx < bytes.len() && is_table_ident_char(bytes[idx] as char) {
-        idx += 1;
-    }
-    if table_start == idx {
-        return None;
-    }
-
-    let table_token = &sql[table_start..idx];
-    let table_simple = table_token
-        .split('.')
-        .next_back()
-        .unwrap_or(table_token);
-    if !table_simple.eq_ignore_ascii_case(table_name) {
-        return None;
-    }
-
-    let mut updated = String::with_capacity(sql.len() + alias.len() + 1);
-    updated.push_str(&sql[..idx]);
-    updated.push(' ');
-    updated.push_str(alias);
-    updated.push_str(&sql[idx..]);
-    Some(updated)
 }
 
 fn find_first_top_level_keyword(sql: &str, start: usize, keywords: &[&str]) -> Option<usize> {
@@ -1682,6 +1851,54 @@ fn expand_derived_measure_expr(expr: &str, measure_view: &MeasureView) -> String
     let mut chars = expr.chars().peekable();
 
     while let Some(c) = chars.next() {
+        if c == '\'' {
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c == '"' {
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '"' {
+                    if chars.peek() == Some(&'"') {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c == '`' {
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '`' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '[' {
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == ']' {
+                    break;
+                }
+            }
+            continue;
+        }
         if c.is_alphabetic() || c == '_' {
             // Collect identifier
             let mut ident = String::from(c);
@@ -4047,18 +4264,16 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     let mut result_sql = sql;
 
     // Handle alias for the primary table if needed for correlation
+    let mut insert_outer_alias = false;
     let primary_alias: Option<String> = if needs_outer_alias {
         if let Some(ref pt) = from_info.primary_table {
             if pt.has_alias {
                 Some(pt.effective_name.clone())
+            } else if insert_primary_table_alias(&result_sql, "_outer").is_some() {
+                insert_outer_alias = true;
+                Some("_outer".to_string())
             } else {
-                // No alias on primary table, add _outer
-                if let Some(updated_sql) = insert_table_alias(&result_sql, &pt.name, "_outer") {
-                    result_sql = updated_sql;
-                    Some("_outer".to_string())
-                } else {
-                    None
-                }
+                None
             }
         } else {
             None
@@ -4275,6 +4490,12 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         }
     }
 
+    if insert_outer_alias {
+        if let Some(updated_sql) = insert_primary_table_alias(&result_sql, "_outer") {
+            result_sql = updated_sql;
+        }
+    }
+
     // Check if there are still any remaining AGGREGATE calls (shouldn't be, but just in case)
     if has_aggregate_function(&result_sql) {
         return expand_aggregate(&result_sql);
@@ -4346,6 +4567,27 @@ pub fn get_measure_view(view_name: &str) -> Option<MeasureView> {
 pub fn clear_measure_views() {
     let mut views = MEASURE_VIEWS.lock().unwrap();
     views.clear();
+}
+
+pub fn drop_measure_view(view_name: &str) -> bool {
+    let mut views = MEASURE_VIEWS.lock().unwrap();
+    let key = views
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(view_name))
+        .cloned();
+    if let Some(k) = key {
+        views.remove(&k);
+        return true;
+    }
+    false
+}
+
+pub fn drop_measure_view_from_sql(sql: &str) -> bool {
+    let name = match extract_drop_view_name(sql) {
+        Some(name) => name,
+        None => return false,
+    };
+    drop_measure_view(&name)
 }
 
 pub fn get_measure_aggregation(column_name: &str) -> Option<(String, String)> {
@@ -4992,6 +5234,47 @@ FROM orders"#;
     }
 
     #[test]
+    #[serial]
+    fn test_drop_measure_view_from_sql() {
+        clear_measure_views();
+        store_measure_view(
+            "orders_v",
+            vec![ViewMeasure {
+                column_name: "revenue".to_string(),
+                expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
+            }],
+            "SELECT year, SUM(amount) AS revenue FROM orders GROUP BY year",
+            Some("orders".to_string()),
+        );
+
+        assert!(get_measure_view("orders_v").is_some());
+        assert!(!drop_measure_view_from_sql(
+            "DROP VIEW orders_v /* invalid tail */ extra"
+        ));
+        assert!(get_measure_view("orders_v").is_some());
+        assert!(drop_measure_view_from_sql("DROP VIEW orders_v;"));
+        assert!(get_measure_view("orders_v").is_none());
+    }
+
+    #[test]
+    fn test_extract_drop_view_name_variants() {
+        assert_eq!(
+            extract_drop_view_name("DROP VIEW IF EXISTS analytics.orders_v"),
+            Some("orders_v".to_string())
+        );
+        assert_eq!(
+            extract_drop_view_name("drop view if exists \"Analytics\".\"Order.View\""),
+            Some("Order.View".to_string())
+        );
+        assert_eq!(
+            extract_drop_view_name("DROP VIEW /* keep */ IF EXISTS [dbo].[Orders View]"),
+            Some("Orders View".to_string())
+        );
+        assert_eq!(extract_drop_view_name("DROP VIEW orders_v extra"), None);
+    }
+
+    #[test]
     fn test_extract_base_relation_sql_with_cte() {
         let view_query = "WITH base AS (SELECT * FROM orders) \
                           SELECT year, COUNT(*) AS cnt FROM base GROUP BY year";
@@ -5288,6 +5571,30 @@ FROM orders"#;
     }
 
     #[test]
+    fn test_expand_derived_measure_expr_ignores_string_literals() {
+        let mv = MeasureView {
+            view_name: "sales_v".to_string(),
+            measures: vec![ViewMeasure {
+                column_name: "revenue".to_string(),
+                expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
+            }],
+            base_query: "".to_string(),
+            base_table: Some("sales".to_string()),
+            base_relation_sql: None,
+            dimension_exprs: HashMap::new(),
+            group_by_cols: Vec::new(),
+        };
+
+        let expanded =
+            expand_derived_measure_expr("CASE WHEN status = 'revenue' THEN revenue ELSE 0 END", &mv);
+        assert_eq!(
+            expanded,
+            "CASE WHEN status = 'revenue' THEN SUM(revenue) ELSE 0 END"
+        );
+    }
+
+    #[test]
     fn test_extract_table_and_alias() {
         // No alias
         assert_eq!(
@@ -5318,6 +5625,36 @@ FROM orders"#;
             extract_table_and_alias_from_sql("SELECT x FROM orders GROUP BY x"),
             Some(("orders".to_string(), None))
         );
+
+        // Quoted qualified names with dots inside identifiers
+        assert_eq!(
+            extract_table_and_alias_from_sql(
+                "SELECT * FROM \"sales.schema\".\"orders.table\" o WHERE 1=1"
+            ),
+            Some(("orders.table".to_string(), Some("o".to_string())))
+        );
+
+        // Alias after comments (no AS)
+        assert_eq!(
+            extract_table_and_alias_from_sql("SELECT * FROM orders /* source */ o"),
+            Some(("orders".to_string(), Some("o".to_string())))
+        );
+
+        // Alias after comments (with AS)
+        assert_eq!(
+            extract_table_and_alias_from_sql("SELECT * FROM orders AS /* source */ o"),
+            Some(("orders".to_string(), Some("o".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_insert_primary_table_alias_skips_comments() {
+        let sql = "SELECT year, AGGREGATE(revenue) AT (SET year = year - 1) FROM sales_v /* c */ GROUP BY year";
+        let updated = insert_primary_table_alias(sql, "_outer").unwrap();
+        assert!(updated.contains("FROM sales_v _outer /* c */ GROUP BY"));
+
+        let sql_with_alias = "SELECT year FROM sales_v /* c */ s GROUP BY year";
+        assert!(insert_primary_table_alias(sql_with_alias, "_outer").is_none());
     }
 
     #[test]

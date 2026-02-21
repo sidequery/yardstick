@@ -11,8 +11,9 @@ use std::os::raw::c_char;
 use std::ptr;
 
 use crate::sql::{
-    expand_aggregate_with_at, expand_curly_braces, get_measure_aggregation, has_aggregate_function,
-    has_as_measure, has_at_syntax, has_curly_brace_measure, process_create_view,
+    drop_measure_view_from_sql, expand_aggregate_with_at, expand_curly_braces,
+    get_measure_aggregation, has_aggregate_function, has_as_measure, has_at_syntax,
+    has_curly_brace_measure, process_create_view,
 };
 
 /// Result from processing CREATE VIEW with AS MEASURE
@@ -71,6 +72,23 @@ pub extern "C" fn yardstick_has_aggregate(sql: *const c_char) -> bool {
     };
 
     has_aggregate_function(sql_str)
+}
+
+/// Drop a measure view from the catalog if the SQL is a DROP VIEW statement
+#[no_mangle]
+pub extern "C" fn yardstick_drop_measure_view_from_sql(sql: *const c_char) -> bool {
+    if sql.is_null() {
+        return false;
+    }
+
+    let sql_str = unsafe {
+        match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+
+    drop_measure_view_from_sql(sql_str)
 }
 
 /// Check if SQL contains curly brace measure syntax: `{column}`
