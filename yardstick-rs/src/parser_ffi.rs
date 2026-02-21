@@ -973,6 +973,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires C++ library to be linked"]
+    fn test_find_aggregates_with_comments_in_at_chain() {
+        let sql = "SELECT AGGREGATE(revenue) /* keep */ AT (ALL) FROM sales";
+        let calls = find_aggregates(sql).unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(
+            &sql[call.start_pos as usize..call.end_pos as usize],
+            "AGGREGATE(revenue) /* keep */ AT (ALL)"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires C++ library to be linked"]
     fn test_parse_select() {
         let info = parse_select("SELECT region, SUM(amount) FROM sales GROUP BY region").unwrap();
         assert_eq!(info.items.len(), 2);
@@ -980,6 +993,19 @@ mod tests {
         assert!(info.has_group_by);
         assert!(!info.group_by_all);
         assert_eq!(info.group_by_cols.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires C++ library to be linked"]
+    fn test_parse_select_item_positions_ignore_comment_tokens() {
+        let sql = "SELECT region /* , fake comma FROM fake */, AGGREGATE(revenue) FROM sales";
+        let info = parse_select(sql).unwrap();
+        assert_eq!(info.items.len(), 2);
+        let first = &info.items[0];
+        assert_eq!(
+            sql[first.start_pos as usize..first.end_pos as usize].trim(),
+            "region /* , fake comma FROM fake */"
+        );
     }
 
     #[test]

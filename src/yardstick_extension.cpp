@@ -42,6 +42,7 @@ extern "C" {
 extern "C" {
     bool yardstick_has_as_measure(const char *sql);
     bool yardstick_has_aggregate(const char *sql);
+    bool yardstick_drop_measure_view_from_sql(const char *sql);
     YardstickCreateViewResult yardstick_process_create_view(const char *sql);
     YardstickAggregateResult yardstick_expand_aggregate(const char *sql);
     void yardstick_free(char *ptr);
@@ -336,6 +337,10 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
     bool had_semantic_prefix = StartsWithSemantic(query, semantic_stripped);
     if (had_semantic_prefix) {
         sql_to_check = semantic_stripped;
+    }
+
+    if (yardstick_drop_measure_view_from_sql(sql_to_check.c_str())) {
+        return ParserExtensionParseResult();
     }
 
     // Check for AGGREGATE() function

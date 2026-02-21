@@ -4,6 +4,7 @@ pub mod measures;
 
 pub use measures::{
     // Processing functions
+    drop_measure_view_from_sql,
     expand_aggregate,
     expand_aggregate_with_at,
     expand_curly_braces,

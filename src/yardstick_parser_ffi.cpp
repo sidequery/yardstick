@@ -33,6 +33,7 @@
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/common/string_util.hpp"
 
+#include <cctype>
 #include <cstring>
 #include <vector>
 #include <string>
@@ -50,6 +51,405 @@ static char* safe_strdup(const char* s) {
 
 static char* safe_strdup(const std::string& s) {
     return strdup(s.c_str());
+}
+
+static bool IsBoundaryChar(char c) {
+    return !std::isalnum(static_cast<unsigned char>(c)) && c != '_';
+}
+
+static size_t SkipWhitespaceAndComments(const std::string& sql, size_t idx) {
+    while (idx < sql.size()) {
+        if (std::isspace(static_cast<unsigned char>(sql[idx]))) {
+            idx++;
+            continue;
+        }
+        if (sql[idx] == '-' && idx + 1 < sql.size() && sql[idx + 1] == '-') {
+            idx += 2;
+            while (idx < sql.size() && sql[idx] != '\n' && sql[idx] != '\r') {
+                idx++;
+            }
+            continue;
+        }
+        if (sql[idx] == '/' && idx + 1 < sql.size() && sql[idx + 1] == '*') {
+            idx += 2;
+            while (idx + 1 < sql.size() && !(sql[idx] == '*' && sql[idx + 1] == '/')) {
+                idx++;
+            }
+            if (idx + 1 < sql.size()) {
+                idx += 2;
+            } else {
+                idx = sql.size();
+            }
+            continue;
+        }
+        break;
+    }
+    return idx;
+}
+
+static size_t FindMatchingParen(const std::string& sql, size_t open_pos) {
+    size_t depth = 0;
+    bool in_single = false;
+    bool in_double = false;
+    bool in_backtick = false;
+    bool in_bracket = false;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+
+    for (size_t i = open_pos; i < sql.size(); i++) {
+        char c = sql[i];
+
+        if (in_line_comment) {
+            if (c == '\n' || c == '\r') {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if (in_block_comment) {
+            if (c == '*' && i + 1 < sql.size() && sql[i + 1] == '/') {
+                in_block_comment = false;
+                i++;
+            }
+            continue;
+        }
+
+        if (in_single) {
+            if (c == '\'') {
+                if (i + 1 < sql.size() && sql[i + 1] == '\'') {
+                    i++;
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+        if (in_double) {
+            if (c == '"') {
+                if (i + 1 < sql.size() && sql[i + 1] == '"') {
+                    i++;
+                } else {
+                    in_double = false;
+                }
+            }
+            continue;
+        }
+        if (in_backtick) {
+            if (c == '`') {
+                in_backtick = false;
+            }
+            continue;
+        }
+        if (in_bracket) {
+            if (c == ']') {
+                in_bracket = false;
+            }
+            continue;
+        }
+
+        if (c == '\'') {
+            in_single = true;
+            continue;
+        }
+        if (c == '"') {
+            in_double = true;
+            continue;
+        }
+        if (c == '`') {
+            in_backtick = true;
+            continue;
+        }
+        if (c == '[') {
+            in_bracket = true;
+            continue;
+        }
+        if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            in_line_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+            in_block_comment = true;
+            i++;
+            continue;
+        }
+
+        if (c == '(') {
+            depth++;
+            continue;
+        }
+        if (c == ')') {
+            if (depth == 0) {
+                return i;
+            }
+            depth--;
+            if (depth == 0) {
+                return i;
+            }
+        }
+    }
+
+    return std::string::npos;
+}
+
+static size_t FindTopLevelFrom(const std::string& sql) {
+    std::string upper = StringUtil::Upper(sql);
+    const std::string keyword = "FROM";
+
+    size_t depth = 0;
+    bool in_single = false;
+    bool in_double = false;
+    bool in_backtick = false;
+    bool in_bracket = false;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+
+    for (size_t i = 0; i + keyword.size() <= upper.size(); i++) {
+        char c = sql[i];
+
+        if (in_line_comment) {
+            if (c == '\n' || c == '\r') {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if (in_block_comment) {
+            if (c == '*' && i + 1 < sql.size() && sql[i + 1] == '/') {
+                in_block_comment = false;
+                i++;
+            }
+            continue;
+        }
+
+        if (in_single) {
+            if (c == '\'') {
+                if (i + 1 < sql.size() && sql[i + 1] == '\'') {
+                    i++;
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+        if (in_double) {
+            if (c == '"') {
+                if (i + 1 < upper.size() && upper[i + 1] == '"') {
+                    i++;
+                } else {
+                    in_double = false;
+                }
+            }
+            continue;
+        }
+        if (in_backtick) {
+            if (c == '`') {
+                in_backtick = false;
+            }
+            continue;
+        }
+        if (in_bracket) {
+            if (c == ']') {
+                in_bracket = false;
+            }
+            continue;
+        }
+
+        if (c == '\'') {
+            in_single = true;
+            continue;
+        }
+        if (c == '"') {
+            in_double = true;
+            continue;
+        }
+        if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            in_line_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+            in_block_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '`') {
+            in_backtick = true;
+            continue;
+        }
+        if (c == '[') {
+            in_bracket = true;
+            continue;
+        }
+
+        if (c == '(') {
+            depth++;
+            continue;
+        }
+        if (c == ')') {
+            if (depth > 0) {
+                depth--;
+            }
+            continue;
+        }
+
+        if (depth == 0 && upper.compare(i, keyword.size(), keyword) == 0) {
+            char prev = i == 0 ? '\0' : upper[i - 1];
+            char next = i + keyword.size() < upper.size() ? upper[i + keyword.size()] : '\0';
+            if (IsBoundaryChar(prev) && IsBoundaryChar(next)) {
+                return i;
+            }
+        }
+    }
+
+    return std::string::npos;
+}
+
+static size_t FindSelectItemEnd(const std::string& sql, size_t start, size_t from_pos) {
+    if (start >= sql.size()) {
+        return start;
+    }
+    size_t limit = from_pos == std::string::npos ? sql.size() : from_pos;
+    size_t depth = 0;
+    bool in_single = false;
+    bool in_double = false;
+    bool in_backtick = false;
+    bool in_bracket = false;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+
+    for (size_t i = start; i < limit; i++) {
+        char c = sql[i];
+
+        if (in_line_comment) {
+            if (c == '\n' || c == '\r') {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if (in_block_comment) {
+            if (c == '*' && i + 1 < limit && sql[i + 1] == '/') {
+                in_block_comment = false;
+                i++;
+            }
+            continue;
+        }
+
+        if (in_single) {
+            if (c == '\'') {
+                if (i + 1 < limit && sql[i + 1] == '\'') {
+                    i++;
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+        if (in_double) {
+            if (c == '"') {
+                if (i + 1 < limit && sql[i + 1] == '"') {
+                    i++;
+                } else {
+                    in_double = false;
+                }
+            }
+            continue;
+        }
+        if (in_backtick) {
+            if (c == '`') {
+                in_backtick = false;
+            }
+            continue;
+        }
+        if (in_bracket) {
+            if (c == ']') {
+                in_bracket = false;
+            }
+            continue;
+        }
+
+        if (c == '\'') {
+            in_single = true;
+            continue;
+        }
+        if (c == '"') {
+            in_double = true;
+            continue;
+        }
+        if (c == '-' && i + 1 < limit && sql[i + 1] == '-') {
+            in_line_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < limit && sql[i + 1] == '*') {
+            in_block_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '`') {
+            in_backtick = true;
+            continue;
+        }
+        if (c == '[') {
+            in_bracket = true;
+            continue;
+        }
+
+        if (c == '(') {
+            depth++;
+            continue;
+        }
+        if (c == ')') {
+            if (depth > 0) {
+                depth--;
+            }
+            continue;
+        }
+
+        if (depth == 0 && c == ',') {
+            return i;
+        }
+    }
+
+    return limit;
+}
+
+static size_t FindAggregateCallEnd(const std::string& sql, size_t start) {
+    std::string upper = StringUtil::Upper(sql);
+    const std::string keyword = "AGGREGATE";
+    if (start >= sql.size() || upper.compare(start, keyword.size(), keyword) != 0) {
+        return start;
+    }
+
+    size_t i = SkipWhitespaceAndComments(sql, start + keyword.size());
+    if (i >= sql.size() || sql[i] != '(') {
+        return start;
+    }
+
+    size_t close = FindMatchingParen(sql, i);
+    if (close == std::string::npos) {
+        return start;
+    }
+    size_t end = close + 1;
+
+    while (end < sql.size()) {
+        size_t j = SkipWhitespaceAndComments(sql, end);
+        if (j + 2 > sql.size()) {
+            break;
+        }
+        if (upper.compare(j, 2, "AT") != 0) {
+            break;
+        }
+        size_t k = SkipWhitespaceAndComments(sql, j + 2);
+        if (k >= sql.size() || sql[k] != '(') {
+            break;
+        }
+        size_t at_close = FindMatchingParen(sql, k);
+        if (at_close == std::string::npos) {
+            break;
+        }
+        end = at_close + 1;
+    }
+
+    return end;
 }
 
 //=============================================================================
@@ -83,7 +483,8 @@ struct AggregateCallInfo {
     std::vector<YardstickAtModifier> modifiers;
 };
 
-static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCallInfo>& results);
+static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCallInfo>& results,
+                               const std::string& sql);
 static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableRef>& tables);
 static bool ExpressionContainsAggregate(ParsedExpression* expr);
 static bool ExpressionContainsMeasureRef(ParsedExpression* expr);
@@ -93,7 +494,8 @@ static void QualifyColumnRefs(ParsedExpression* expr, const std::string& qualifi
 // AST Walking: Find AGGREGATE() function calls
 //=============================================================================
 
-static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCallInfo>& results) {
+static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCallInfo>& results,
+                               const std::string& sql) {
     if (!expr) return;
 
     switch (expr->expression_class) {
@@ -122,8 +524,8 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
                 } else {
                     info.start_pos = 0;
                 }
-                // End position is harder without lexer info; estimate from ToString
-                info.end_pos = info.start_pos + static_cast<uint32_t>(expr->ToString().length());
+                size_t end_pos = FindAggregateCallEnd(sql, info.start_pos);
+                info.end_pos = static_cast<uint32_t>(end_pos);
 
                 // Parse AT modifiers from remaining arguments
                 // AT syntax in DuckDB typically appears as special function arguments
@@ -192,25 +594,25 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
 
             // Recurse into function children
             for (auto& child : func->children) {
-                FindAggregateCalls(child.get(), results);
+                FindAggregateCalls(child.get(), results, sql);
             }
             if (func->filter) {
-                FindAggregateCalls(func->filter.get(), results);
+                FindAggregateCalls(func->filter.get(), results, sql);
             }
             break;
         }
 
         case ExpressionClass::COMPARISON: {
             auto* comp = static_cast<ComparisonExpression*>(expr);
-            FindAggregateCalls(comp->left.get(), results);
-            FindAggregateCalls(comp->right.get(), results);
+            FindAggregateCalls(comp->left.get(), results, sql);
+            FindAggregateCalls(comp->right.get(), results, sql);
             break;
         }
 
         case ExpressionClass::CONJUNCTION: {
             auto* conj = static_cast<ConjunctionExpression*>(expr);
             for (auto& child : conj->children) {
-                FindAggregateCalls(child.get(), results);
+                FindAggregateCalls(child.get(), results, sql);
             }
             break;
         }
@@ -218,7 +620,7 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
         case ExpressionClass::OPERATOR: {
             auto* op = static_cast<OperatorExpression*>(expr);
             for (auto& child : op->children) {
-                FindAggregateCalls(child.get(), results);
+                FindAggregateCalls(child.get(), results, sql);
             }
             break;
         }
@@ -226,25 +628,25 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
         case ExpressionClass::CASE: {
             auto* case_expr = static_cast<CaseExpression*>(expr);
             for (auto& check : case_expr->case_checks) {
-                FindAggregateCalls(check.when_expr.get(), results);
-                FindAggregateCalls(check.then_expr.get(), results);
+                FindAggregateCalls(check.when_expr.get(), results, sql);
+                FindAggregateCalls(check.then_expr.get(), results, sql);
             }
             if (case_expr->else_expr) {
-                FindAggregateCalls(case_expr->else_expr.get(), results);
+                FindAggregateCalls(case_expr->else_expr.get(), results, sql);
             }
             break;
         }
 
         case ExpressionClass::CAST: {
             auto* cast = static_cast<CastExpression*>(expr);
-            FindAggregateCalls(cast->child.get(), results);
+            FindAggregateCalls(cast->child.get(), results, sql);
             break;
         }
 
         case ExpressionClass::SUBQUERY: {
             auto* subq = static_cast<SubqueryExpression*>(expr);
             if (subq->child) {
-                FindAggregateCalls(subq->child.get(), results);
+                FindAggregateCalls(subq->child.get(), results, sql);
             }
             // Note: We don't recurse into the subquery itself
             break;
@@ -253,22 +655,22 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
         case ExpressionClass::WINDOW: {
             auto* window = static_cast<WindowExpression*>(expr);
             for (auto& child : window->children) {
-                FindAggregateCalls(child.get(), results);
+                FindAggregateCalls(child.get(), results, sql);
             }
             for (auto& part : window->partitions) {
-                FindAggregateCalls(part.get(), results);
+                FindAggregateCalls(part.get(), results, sql);
             }
             if (window->filter_expr) {
-                FindAggregateCalls(window->filter_expr.get(), results);
+                FindAggregateCalls(window->filter_expr.get(), results, sql);
             }
             break;
         }
 
         case ExpressionClass::BETWEEN: {
             auto* between = static_cast<BetweenExpression*>(expr);
-            FindAggregateCalls(between->input.get(), results);
-            FindAggregateCalls(between->lower.get(), results);
-            FindAggregateCalls(between->upper.get(), results);
+            FindAggregateCalls(between->input.get(), results, sql);
+            FindAggregateCalls(between->lower.get(), results, sql);
+            FindAggregateCalls(between->upper.get(), results, sql);
             break;
         }
 
@@ -587,22 +989,22 @@ extern "C" YardstickAggregateCallList* yardstick_find_aggregates(const char* sql
 
             // Search in SELECT list
             for (auto& expr : select_node->select_list) {
-                FindAggregateCalls(expr.get(), aggregates);
+                FindAggregateCalls(expr.get(), aggregates, sql);
             }
 
             // Search in WHERE clause
             if (select_node->where_clause) {
-                FindAggregateCalls(select_node->where_clause.get(), aggregates);
+                FindAggregateCalls(select_node->where_clause.get(), aggregates, sql);
             }
 
             // Search in HAVING clause
             if (select_node->having) {
-                FindAggregateCalls(select_node->having.get(), aggregates);
+                FindAggregateCalls(select_node->having.get(), aggregates, sql);
             }
 
             // Search in GROUP BY expressions
             for (auto& expr : select_node->groups.group_expressions) {
-                FindAggregateCalls(expr.get(), aggregates);
+                FindAggregateCalls(expr.get(), aggregates, sql);
             }
         }
 
@@ -705,6 +1107,10 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
         }
 
         auto* select_node = static_cast<SelectNode*>(select_stmt->node.get());
+        size_t from_pos = FindTopLevelFrom(sql);
+        if (from_pos == std::string::npos) {
+            from_pos = sql.size();
+        }
 
         // Process SELECT list
         std::vector<YardstickSelectItem> items;
@@ -718,7 +1124,8 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
             } else {
                 item.start_pos = 0;
             }
-            item.end_pos = item.start_pos + static_cast<uint32_t>(expr->ToString().length());
+            size_t end_pos = FindSelectItemEnd(sql, item.start_pos, from_pos);
+            item.end_pos = static_cast<uint32_t>(end_pos);
 
             item.is_aggregate = ExpressionContainsAggregate(expr.get());
             item.is_star = expr->expression_class == ExpressionClass::STAR;
