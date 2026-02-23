@@ -1316,6 +1316,77 @@ B	10
 # Test: DuckDB generate_series / UNNEST
 # =============================================================================
 
+# =============================================================================
+# Test: Window function in AS MEASURE
+# =============================================================================
+
+statement ok
+CREATE TABLE window_measure_orders (year INT, revenue INT);
+
+statement ok
+INSERT INTO window_measure_orders VALUES
+    (2021, 10),
+    (2022, 20),
+    (2023, 30);
+
+statement ok
+CREATE VIEW window_measure_v AS
+SELECT
+    year,
+    SUM(revenue) OVER (ORDER BY year) AS MEASURE running_total
+FROM window_measure_orders;
+
+query IT rowsort
+SELECT year, running_total::VARCHAR
+FROM window_measure_v
+ORDER BY year;
+----
+2021	10
+2022	30
+2023	60
+
+query IT rowsort
+SEMANTIC SELECT year, AGGREGATE(running_total)::VARCHAR
+FROM window_measure_v
+GROUP BY year
+ORDER BY year;
+----
+2021	10
+2022	30
+2023	60
+
+query IT rowsort
+SEMANTIC SELECT year, AGGREGATE(running_total) AT (WHERE year = 2022)::VARCHAR
+FROM window_measure_v;
+----
+2021	20
+2022	20
+2023	20
+
+statement error
+SEMANTIC SELECT year, AGGREGATE(running_total) AT (ALL)
+FROM window_measure_v
+GROUP BY year;
+----
+Window measure running_total returned multiple values for the evaluation context
+
+statement ok
+CREATE VIEW window_total_v AS
+SELECT
+    year,
+    SUM(revenue) OVER () AS MEASURE global_total
+FROM window_measure_orders;
+
+query IT rowsort
+SEMANTIC SELECT year, AGGREGATE(global_total) AT (ALL)::VARCHAR
+FROM window_total_v
+GROUP BY year
+ORDER BY year;
+----
+2021	60
+2022	60
+2023	60
+
 statement ok
 CREATE VIEW series_v AS
 SELECT x, SUM(x) AS MEASURE total

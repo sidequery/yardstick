@@ -1789,6 +1789,21 @@ fn find_first_top_level_keyword(sql: &str, start: usize, keywords: &[&str]) -> O
         .min()
 }
 
+fn find_group_by_insert_pos(sql: &str) -> usize {
+    let mut insert_pos = find_first_top_level_keyword(
+        sql,
+        0,
+        &["ORDER BY", "LIMIT", "HAVING", "QUALIFY", "UNION", "INTERSECT", "EXCEPT"],
+    )
+    .unwrap_or(sql.len());
+
+    if let Some(semicolon_pos) = sql.rfind(';') {
+        insert_pos = insert_pos.min(semicolon_pos);
+    }
+
+    insert_pos
+}
+
 fn has_top_level_group_by(sql: &str) -> bool {
     find_top_level_keyword(sql, "GROUP BY", 0).is_some()
 }
@@ -2347,6 +2362,125 @@ fn has_distinct_modifier(expr: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Returns true if expression appears to use a SQL window clause.
+fn is_window_expression(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+
+    let is_word_boundary = |b: Option<u8>| b.map_or(true, |c| !c.is_ascii_alphanumeric() && c != b'_');
+
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'`' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'`' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'[' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b']' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() {
+                let ch = bytes[i];
+                i += 1;
+                if ch == b'\n' || ch == b'\r' {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            if i + 1 >= bytes.len() {
+                i = bytes.len();
+            }
+            continue;
+        }
+
+        // Window clauses follow a function invocation: "<fn_call>) OVER (...)|OVER window_name"
+        if bytes[i] == b')' {
+            let mut j = skip_ws_and_comments(expr, i + 1);
+            let has_over = j + 4 <= bytes.len()
+                && bytes[j..j + 4]
+                    .iter()
+                    .zip(b"OVER")
+                    .all(|(b, kw)| b.to_ascii_uppercase() == *kw)
+                && is_word_boundary(if j == 0 { None } else { Some(bytes[j - 1]) })
+                && is_word_boundary(if j + 4 >= bytes.len() {
+                    None
+                } else {
+                    Some(bytes[j + 4])
+                });
+
+            if has_over {
+                j += 4;
+                j = skip_ws_and_comments(expr, j);
+                if j < bytes.len() && (bytes[j] == b'(' || parse_identifier_token(expr, j).is_some()) {
+                    return true;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    false
 }
 
 /// Non-decomposable aggregate functions that require recompute from base rows
@@ -3356,18 +3490,20 @@ fn extract_measures_from_sql(
     // Replace measured expressions:
     // - decomposable measures become NULL placeholders (virtual columns)
     // - non-decomposable measures keep their aggregate expression for direct querying
+    // - window measures keep their expression materialized in the view
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
     let mut has_materialized_non_decomposable = false;
 
     for info in &measure_infos {
         let is_non_decomp = is_non_decomposable(&info.expression);
+        let is_window = is_window_expression(&info.expression);
         if is_non_decomp {
             has_materialized_non_decomposable = true;
         }
         replacements.push((
             info.expr_start,
             info.name_end,
-            if is_non_decomp {
+            if is_non_decomp || is_window {
                 format!("{} AS {}", info.expression.trim(), info.name)
             } else {
                 format!("NULL AS {}", info.name)
@@ -3380,7 +3516,7 @@ fn extract_measures_from_sql(
         .into_iter()
         .map(|m| ViewMeasure {
             column_name: m.name,
-            is_decomposable: !is_non_decomposable(&m.expression),
+            is_decomposable: !is_non_decomposable(&m.expression) && !is_window_expression(&m.expression),
             expression: m.expression,
         })
         .collect();
@@ -3580,17 +3716,12 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
     }
 
     // Check if we need to add GROUP BY
-    let result_upper = result_sql.to_uppercase();
     if !has_group_by_anywhere(&result_sql) {
         // Extract dimension columns (non-aggregate items)
         let dim_cols = extract_dimension_columns_from_select_info(&select_info);
         if !dim_cols.is_empty() {
             // Find insertion point
-            let insert_pos = ["ORDER BY", "LIMIT", "HAVING", ";"]
-                .iter()
-                .filter_map(|kw| result_upper.find(kw))
-                .min()
-                .unwrap_or(result_sql.len());
+            let insert_pos = find_group_by_insert_pos(&result_sql);
 
             result_sql = format!(
                 "{} GROUP BY {}{}",
@@ -3876,6 +4007,36 @@ fn expand_non_decomposable_default_context(
         expression,
         base_relation,
         where_clauses.join(" AND ")
+    )
+}
+
+fn scalar_subquery_to_rows_sql(scalar_sql: &str, value_alias: &str) -> Option<String> {
+    let trimmed = scalar_sql.trim();
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?.trim();
+    if !inner.to_uppercase().starts_with("SELECT") {
+        return None;
+    }
+
+    let select_start = "SELECT".len();
+    let from_pos = find_top_level_keyword(inner, "FROM", select_start)?;
+    let select_expr = inner[select_start..from_pos].trim();
+    let from_clause = inner[from_pos..].trim();
+    Some(format!("SELECT {select_expr} AS {value_alias} {from_clause}"))
+}
+
+fn wrap_window_rows_as_single_value(row_sql: &str, measure_name: &str) -> String {
+    let escaped_measure = measure_name.replace('\'', "''");
+    format!(
+        "(SELECT CASE \
+            WHEN EXISTS (\
+                SELECT 1 \
+                FROM ({row_sql}) __window_vals \
+                CROSS JOIN (SELECT __window_value AS __first FROM ({row_sql}) LIMIT 1) __window_first \
+                WHERE __window_vals.__window_value IS DISTINCT FROM __window_first.__first\
+            ) \
+            THEN error('Window measure {escaped_measure} returned multiple values for the evaluation context') \
+            ELSE (SELECT __window_value FROM ({row_sql}) LIMIT 1) \
+         END)"
     )
 }
 
@@ -5213,8 +5374,39 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
             .derived_expr
             .clone()
             .unwrap_or_else(|| resolved.expression.clone());
+        let is_window_measure =
+            is_window_expression(&expression_for_eval) || is_window_expression(&resolved.expression);
 
-        let expanded = if !expression_for_eval.is_empty() {
+        let expanded = if is_window_measure {
+            let scalar_eval_sql = expand_non_decomposable_to_sql(
+                &expression_for_eval,
+                &base_relation_sql,
+                outer_ref_for_eval,
+                outer_where_ref,
+                &eval_group_by_cols,
+                &modifiers,
+                &resolved.dimension_exprs,
+            );
+            let row_eval_sql = match scalar_subquery_to_rows_sql(&scalar_eval_sql, "__window_value")
+            {
+                Some(sql) => sql,
+                None => {
+                    return AggregateExpandResult {
+                        had_aggregate: true,
+                        expanded_sql: result_sql,
+                        error: Some(format!(
+                            "Failed to rewrite window measure {measure_lookup_name} with AT modifiers"
+                        )),
+                    };
+                }
+            };
+            let eval_sql = wrap_window_rows_as_single_value(&row_eval_sql, &measure_lookup_name);
+            if original_dim_cols.is_empty() {
+                format!("MAX({eval_sql})")
+            } else {
+                eval_sql
+            }
+        } else if !expression_for_eval.is_empty() {
             let eval_sql = expand_non_decomposable_to_sql(
                 &expression_for_eval,
                 &base_relation_sql,
@@ -5328,8 +5520,17 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
             .derived_expr
             .clone()
             .unwrap_or_else(|| resolved.expression.clone());
+        let is_window_measure =
+            is_window_expression(&expression_for_eval) || is_window_expression(&resolved.expression);
 
-        let expanded = if !expression_for_eval.is_empty() {
+        let expanded = if is_window_measure {
+            let _ = use_default_context;
+            let _ = base_relation_sql;
+            let _ = outer_ref_for_eval;
+            let _ = outer_where_ref;
+            let _ = eval_group_by_cols;
+            format!("{}({measure_lookup_name})", resolved.agg_fn)
+        } else if !expression_for_eval.is_empty() {
             let eval_sql = if use_default_context {
                 expand_non_decomposable_default_context(
                     &expression_for_eval,
@@ -5378,14 +5579,9 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     // If no GROUP BY, add explicit GROUP BY with dimension columns from original SQL
     // (GROUP BY ALL doesn't work reliably with scalar subqueries mixed with aggregates)
-    let result_upper = result_sql.to_uppercase();
     if !has_group_by_anywhere(&result_sql) && !original_dim_cols.is_empty() {
         // Find insertion point: before ORDER BY, LIMIT, HAVING, or at end
-        let insert_pos = ["ORDER BY", "LIMIT", "HAVING", ";"]
-            .iter()
-            .filter_map(|kw| result_upper.find(kw))
-            .min()
-            .unwrap_or(result_sql.len());
+        let insert_pos = find_group_by_insert_pos(&result_sql);
 
         result_sql = format!(
             "{} GROUP BY {}{}",
@@ -5743,6 +5939,19 @@ mod tests {
     }
 
     #[test]
+    fn test_is_window_expression_variants() {
+        assert!(is_window_expression("SUM(amount) OVER (PARTITION BY year)"));
+        assert!(is_window_expression("SUM(amount)\nOVER\t(\nORDER BY year\n)"));
+        assert!(is_window_expression("SUM(amount) OVER running_win"));
+        assert!(is_window_expression("SUM(amount)/*x*/OVER/*y*/running_win"));
+        assert!(is_window_expression("SUM(amount)OVER(ORDER BY year)"));
+
+        assert!(!is_window_expression("OVER(amount)"));
+        assert!(!is_window_expression("cover(amount)"));
+        assert!(!is_window_expression("'SUM(amount) OVER (ORDER BY year)'"));
+    }
+
+    #[test]
     fn test_extract_dimension_columns_ignores_aggregate_with_space() {
         let cols = extract_dimension_columns_from_select(
             "SELECT region, AGGREGATE (revenue) FROM sales_v",
@@ -5946,6 +6155,25 @@ mod tests {
         assert!(result.clean_sql.contains("AS cost"));
         assert!(!result.clean_sql.contains("AS profit"));
         assert!(!result.clean_sql.contains("revenue - cost"));
+    }
+
+    #[test]
+    fn test_extract_measures_named_window_measure() {
+        let sql = r#"CREATE VIEW sales_window_v AS
+SELECT
+    year,
+    SUM(amount)
+    OVER win AS MEASURE running_total
+FROM sales
+WINDOW win AS (ORDER BY year)"#;
+        let (clean_sql, measures, view_name, _) = extract_measures_from_sql(sql).unwrap();
+
+        assert_eq!(view_name, Some("sales_window_v".to_string()));
+        assert_eq!(measures.len(), 1);
+        assert_eq!(measures[0].column_name, "running_total");
+        assert!(!measures[0].is_decomposable);
+        assert!(!clean_sql.contains("NULL AS running_total"));
+        assert!(clean_sql.contains("AS running_total"));
     }
 
     #[test]

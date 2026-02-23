@@ -23,12 +23,23 @@ Implementation of Julian Hyde's "Measures in SQL" paper (arXiv:2406.00251).
 
 ## Known Limitations
 
-### 1. No Window Function Measures
+### 1. Ambiguous AT Contexts for Window Measures
 
 ```sql
--- NOT SUPPORTED: Window functions in measure definitions
+-- Supported: window measures in view definitions
 CREATE VIEW v AS
 SELECT year,
   SUM(revenue) OVER (ORDER BY year) AS MEASURE running_total
 FROM t;
+
+-- Supported: direct query and AGGREGATE() without AT
+SEMANTIC SELECT year, AGGREGATE(running_total)
+FROM v
+GROUP BY year;
+
+-- Supported: AT modifiers when the evaluated window result is single-valued
+SEMANTIC SELECT AGGREGATE(running_total) AT (WHERE year = 2024) FROM v;
+
+-- Error: AT context produced multiple distinct window values
+SEMANTIC SELECT year, AGGREGATE(running_total) AT (ALL) FROM v GROUP BY year;
 ```

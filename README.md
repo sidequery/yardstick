@@ -160,7 +160,7 @@ The extension will be at `build/release/extension/yardstick/yardstick.duckdb_ext
 See [LIMITATIONS.md](LIMITATIONS.md) for known issues and workarounds.
 
 Key limitations:
-- Window function measures not supported
+- Window-defined measures with `AT (...)` must evaluate to a single value per context, or they error
 
 ## Testimonials
 
