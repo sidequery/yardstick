@@ -453,6 +453,9 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
             }
             throw BinderException("Registered state not found");
         }
+
+        // Non-yardstick extension statements should not be rewritten by yardstick.
+        return {};
     }
     case StatementType::SELECT_STATEMENT: {
         auto sql_to_check = context.GetCurrentQuery();

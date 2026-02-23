@@ -5487,12 +5487,16 @@ fn extract_group_by_columns(sql: &str) -> Vec<String> {
                 return extract_dimension_columns_from_select(sql);
             }
             if !info.group_by_cols.is_empty() {
-                return info
+                let parser_group_by_cols: Vec<String> = info
                     .group_by_cols
                     .into_iter()
                     .map(|c| c.trim().to_string())
                     .filter(|c| !c.is_empty() && !c.chars().all(|ch| ch.is_ascii_digit()))
                     .collect();
+
+                if !parser_group_by_cols.is_empty() {
+                    return parser_group_by_cols;
+                }
             }
         }
     }
@@ -6162,6 +6166,14 @@ FROM orders"#;
         let sql2 = "SELECT status, region FROM t GROUP BY status, region ORDER BY status";
         let cols2 = extract_group_by_columns(sql2);
         assert_eq!(cols2, vec!["status".to_string(), "region".to_string()]);
+
+        let sql3 = "SELECT status, AGGREGATE(revenue) FROM orders_summary GROUP BY 1";
+        let cols3 = extract_group_by_columns(sql3);
+        assert_eq!(cols3, vec!["status".to_string()]);
+
+        let sql4 = "SELECT status, region, AGGREGATE(revenue) FROM orders_summary GROUP BY 1, 2";
+        let cols4 = extract_group_by_columns(sql4);
+        assert_eq!(cols4, vec!["status".to_string(), "region".to_string()]);
     }
 
     #[test]

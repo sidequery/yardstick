@@ -79,6 +79,27 @@ GROUP   BY year, region;
 2023	EU	225.0
 2023	US	225.0
 
+# Positional GROUP BY should resolve to SELECT dimensions (fallback from parser ordinals)
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(revenue)
+FROM sales_v
+GROUP BY 1
+ORDER BY 1;
+----
+2022	150.0
+2023	225.0
+
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue)
+FROM sales_v
+GROUP BY 1, 2
+ORDER BY 1, 2;
+----
+2022	EU	50.0
+2022	US	100.0
+2023	EU	75.0
+2023	US	150.0
+
 # =============================================================================
 # Test: AT (ALL dimension) - remove dimension from context
 # =============================================================================
