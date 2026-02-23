@@ -2366,8 +2366,121 @@ fn has_distinct_modifier(expr: &str) -> bool {
 
 /// Returns true if expression appears to use a SQL window clause.
 fn is_window_expression(expr: &str) -> bool {
-    let expr_upper = expr.to_uppercase();
-    expr_upper.contains(" OVER(") || expr_upper.contains(" OVER (")
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+
+    let is_word_boundary = |b: Option<u8>| b.map_or(true, |c| !c.is_ascii_alphanumeric() && c != b'_');
+
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'`' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'`' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'[' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b']' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() {
+                let ch = bytes[i];
+                i += 1;
+                if ch == b'\n' || ch == b'\r' {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            if i + 1 >= bytes.len() {
+                i = bytes.len();
+            }
+            continue;
+        }
+
+        // Window clauses follow a function invocation: "<fn_call>) OVER (...)|OVER window_name"
+        if bytes[i] == b')' {
+            let mut j = skip_ws_and_comments(expr, i + 1);
+            let has_over = j + 4 <= bytes.len()
+                && bytes[j..j + 4]
+                    .iter()
+                    .zip(b"OVER")
+                    .all(|(b, kw)| b.to_ascii_uppercase() == *kw)
+                && is_word_boundary(if j == 0 { None } else { Some(bytes[j - 1]) })
+                && is_word_boundary(if j + 4 >= bytes.len() {
+                    None
+                } else {
+                    Some(bytes[j + 4])
+                });
+
+            if has_over {
+                j += 4;
+                j = skip_ws_and_comments(expr, j);
+                if j < bytes.len() && (bytes[j] == b'(' || parse_identifier_token(expr, j).is_some()) {
+                    return true;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    false
 }
 
 /// Non-decomposable aggregate functions that require recompute from base rows
@@ -5261,7 +5374,8 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
             .derived_expr
             .clone()
             .unwrap_or_else(|| resolved.expression.clone());
-        let is_window_measure = is_window_expression(&resolved.expression);
+        let is_window_measure =
+            is_window_expression(&expression_for_eval) || is_window_expression(&resolved.expression);
 
         let expanded = if is_window_measure {
             let scalar_eval_sql = expand_non_decomposable_to_sql(
@@ -5406,7 +5520,8 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
             .derived_expr
             .clone()
             .unwrap_or_else(|| resolved.expression.clone());
-        let is_window_measure = is_window_expression(&resolved.expression);
+        let is_window_measure =
+            is_window_expression(&expression_for_eval) || is_window_expression(&resolved.expression);
 
         let expanded = if is_window_measure {
             let _ = use_default_context;
@@ -5824,6 +5939,19 @@ mod tests {
     }
 
     #[test]
+    fn test_is_window_expression_variants() {
+        assert!(is_window_expression("SUM(amount) OVER (PARTITION BY year)"));
+        assert!(is_window_expression("SUM(amount)\nOVER\t(\nORDER BY year\n)"));
+        assert!(is_window_expression("SUM(amount) OVER running_win"));
+        assert!(is_window_expression("SUM(amount)/*x*/OVER/*y*/running_win"));
+        assert!(is_window_expression("SUM(amount)OVER(ORDER BY year)"));
+
+        assert!(!is_window_expression("OVER(amount)"));
+        assert!(!is_window_expression("cover(amount)"));
+        assert!(!is_window_expression("'SUM(amount) OVER (ORDER BY year)'"));
+    }
+
+    #[test]
     fn test_extract_dimension_columns_ignores_aggregate_with_space() {
         let cols = extract_dimension_columns_from_select(
             "SELECT region, AGGREGATE (revenue) FROM sales_v",
@@ -6027,6 +6155,25 @@ mod tests {
         assert!(result.clean_sql.contains("AS cost"));
         assert!(!result.clean_sql.contains("AS profit"));
         assert!(!result.clean_sql.contains("revenue - cost"));
+    }
+
+    #[test]
+    fn test_extract_measures_named_window_measure() {
+        let sql = r#"CREATE VIEW sales_window_v AS
+SELECT
+    year,
+    SUM(amount)
+    OVER win AS MEASURE running_total
+FROM sales
+WINDOW win AS (ORDER BY year)"#;
+        let (clean_sql, measures, view_name, _) = extract_measures_from_sql(sql).unwrap();
+
+        assert_eq!(view_name, Some("sales_window_v".to_string()));
+        assert_eq!(measures.len(), 1);
+        assert_eq!(measures[0].column_name, "running_total");
+        assert!(!measures[0].is_decomposable);
+        assert!(!clean_sql.contains("NULL AS running_total"));
+        assert!(clean_sql.contains("AS running_total"));
     }
 
     #[test]
