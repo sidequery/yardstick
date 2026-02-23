@@ -453,6 +453,52 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
             }
             throw BinderException("Registered state not found");
         }
+
+        // Non-yardstick extension statements should not be rewritten by yardstick.
+        return {};
+    }
+    case StatementType::SELECT_STATEMENT: {
+        auto sql_to_check = context.GetCurrentQuery();
+
+        if (yardstick_has_aggregate(sql_to_check.c_str())) {
+            YardstickAggregateResult result = yardstick_expand_aggregate(sql_to_check.c_str());
+            if (result.error) {
+                string error_msg(result.error);
+                yardstick_free_aggregate_result(result);
+                throw BinderException("Failed to expand AGGREGATE: %s", error_msg);
+            }
+
+            if (result.had_aggregate) {
+                string expanded_sql(result.expanded_sql);
+                yardstick_free_aggregate_result(result);
+
+                // Escape single quotes for embedding in string literal
+                string escaped_sql;
+                for (char c : expanded_sql) {
+                    if (c == '\'') {
+                        escaped_sql += "''";
+                    } else {
+                        escaped_sql += c;
+                    }
+                }
+
+                // Rebind through table function so rewritten SQL executes with normal planning
+                string wrapper_sql = "SELECT * FROM yardstick('" + escaped_sql + "')";
+                Parser parser;
+                parser.ParseQuery(wrapper_sql);
+                auto statements = std::move(parser.statements);
+
+                if (statements.empty()) {
+                    throw BinderException("Table function wrapper produced no statements");
+                }
+
+                auto yardstick_binder = Binder::CreateBinder(context);
+                return yardstick_binder->Bind(*statements[0]);
+            }
+
+            yardstick_free_aggregate_result(result);
+        }
+        return {};
     }
     default:
         return {};

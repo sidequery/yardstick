@@ -14,6 +14,7 @@ use crate::sql::{
     drop_measure_view_from_sql, expand_aggregate_with_at, expand_curly_braces,
     get_measure_aggregation, has_aggregate_function, has_as_measure, has_at_syntax,
     has_curly_brace_measure, process_create_view,
+    has_implicit_measure_refs, has_measure_at_refs,
 };
 
 /// Result from processing CREATE VIEW with AS MEASURE
@@ -57,7 +58,7 @@ pub extern "C" fn yardstick_has_as_measure(sql: *const c_char) -> bool {
     has_as_measure(sql_str)
 }
 
-/// Check if SQL contains AGGREGATE() function
+/// Check if SQL contains AGGREGATE() or implicit measure references
 #[no_mangle]
 pub extern "C" fn yardstick_has_aggregate(sql: *const c_char) -> bool {
     if sql.is_null() {
@@ -72,6 +73,8 @@ pub extern "C" fn yardstick_has_aggregate(sql: *const c_char) -> bool {
     };
 
     has_aggregate_function(sql_str)
+        || has_implicit_measure_refs(sql_str)
+        || has_measure_at_refs(sql_str)
 }
 
 /// Drop a measure view from the catalog if the SQL is a DROP VIEW statement
