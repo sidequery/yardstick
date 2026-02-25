@@ -1,73 +1,28 @@
 #
-# Build, test and (optionally) release the extension
+# Build and test the extension using the DuckDB reusable CI workflow.
+# Tracks the v1.4 stable branch so point releases (v1.4.5, v1.4.6, ...)
+# automatically trigger a rebuild with matching platform strings.
 #
 name: Main Extension Distribution Pipeline
 on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 1-5"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build (${{ matrix.duckdb_arch }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            duckdb_arch: linux_amd64
-            rust_target: x86_64-unknown-linux-gnu
-          - os: macos-14
-            duckdb_arch: osx_amd64
-            rust_target: x86_64-apple-darwin
-            osx_build_arch: x86_64
-          - os: macos-14
-            duckdb_arch: osx_arm64
-            rust_target: aarch64-apple-darwin
-            osx_build_arch: arm64
-          - os: windows-latest
-            duckdb_arch: windows_amd64
-            rust_target: x86_64-pc-windows-msvc
-    env:
-      OSX_BUILD_ARCH: ${{ matrix.osx_build_arch }}
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
-
-      - name: Build extension (Unix)
-        if: runner.os != 'Windows'
-        run: make release
-
-      - name: Build extension (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          cd yardstick-rs && cargo build --release
-          cd ..
-          mkdir -p build/release
-          cd build/release
-          cmake -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release ../..
-          cmake --build . --config Release
-
-      - name: Test extension
-        if: matrix.osx_build_arch != 'x86_64' && runner.os != 'Windows'
-        run: make test
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: yardstick-${{ matrix.duckdb_arch }}
-          path: build/release/extension/yardstick/yardstick.duckdb_extension
+  duckdb-stable-build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: v1.4-andium
+      ci_tools_version: main
+      extension_name: yardstick
+      extra_toolchains: rust
+      exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;linux_amd64_gcc4;windows_amd64_rtools;windows_amd64_mingw"
+      rust_logs: true
