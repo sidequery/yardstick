@@ -883,10 +883,10 @@ SEMANTIC SELECT month, region, AGGREGATE(revenue), AGGREGATE(revenue) AT (ALL re
 FROM monthly_sales_v
 ;
 ----
-2023-01-01	EU	50.0	150.0
-2023-01-01	US	100.0	150.0
-2023-02-01	EU	20.0	220.0
-2023-02-01	US	200.0	220.0
+2023-01-01 00:00:00	EU	50.0	150.0
+2023-01-01 00:00:00	US	100.0	150.0
+2023-02-01 00:00:00	EU	20.0	220.0
+2023-02-01 00:00:00	US	200.0	220.0
 
 # =============================================================================
 # Test: Multi-fact JOINs (wide tables)
@@ -1054,8 +1054,8 @@ SEMANTIC SELECT DATE_TRUNC('year', sale_date) AS yr, AGGREGATE(revenue)
 FROM dated_sales_v
 ;
 ----
-2023-01-01	530.0
-2024-01-01	430.0
+2023-01-01 00:00:00	530.0
+2024-01-01 00:00:00	430.0
 
 # =============================================================================
 # Test: DuckDB string functions in measures

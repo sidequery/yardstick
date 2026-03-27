@@ -2,7 +2,11 @@
 
 #include "duckdb.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/operator_extension.hpp"
 
 namespace duckdb {
 
