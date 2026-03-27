@@ -18,10 +18,10 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build stable extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: v1.4-andium
-      ci_tools_version: main
+      duckdb_version: v1.5-variegata
+      ci_tools_version: v1.5-variegata
       extension_name: yardstick
       extra_toolchains: rust
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;linux_amd64_gcc4;windows_amd64_rtools;windows_amd64_mingw"
