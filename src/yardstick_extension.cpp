@@ -2,6 +2,7 @@
 
 #include "yardstick_extension.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
@@ -532,10 +533,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 
     // Register parser extension
     YardstickParserExtension parser;
+    #if __has_include("duckdb/main/extension_callback_manager.hpp")
+    ParserExtension::Register(config, parser);
+    #else
     config.parser_extensions.push_back(parser);
+    #endif
 
     // Register operator extension
+    #if __has_include("duckdb/main/extension_callback_manager.hpp")
+    OperatorExtension::Register(config, make_shared_ptr<YardstickOperatorExtension>());
+    #else
     config.operator_extensions.push_back(make_uniq<YardstickOperatorExtension>());
+    #endif
 
     // Register table function for AGGREGATE() expansion
     TableFunction query_func("yardstick", {LogicalType::VARCHAR},
