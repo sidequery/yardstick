@@ -95,6 +95,21 @@ SEMANTIC SELECT
 FROM sales_v;
 ```
 
+## Notebooks
+
+Notebooks embed their dependencies via juv metadata.
+
+```bash
+uv tool install juv
+# or run without install
+uvx juv run docs/yardstick_adtech_kitchen_sink.ipynb
+uvx juv run docs/yardstick_looker_demo.ipynb
+```
+
+These notebooks load the local extension if it exists at:
+`build/release/extension/yardstick/yardstick.duckdb_extension`
+and fall back to `INSTALL yardstick FROM community`.
+
 ## Syntax
 
 ### Defining Measures
