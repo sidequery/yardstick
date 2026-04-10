@@ -5167,6 +5167,118 @@ fn validate_set_expression_requirements(
     None
 }
 
+/// Extract alias names of SELECT items whose expressions contain subqueries.
+fn extract_subquery_aliases_from_select(sql: &str) -> Vec<String> {
+    let from_pos = find_top_level_keyword(sql, "FROM", 0).unwrap_or(sql.len());
+    let upper = sql.to_uppercase();
+    let select_start = upper.find("SELECT").map(|p| p + 6).unwrap_or(0);
+    let select_text = &sql[select_start..from_pos];
+
+    let mut aliases = Vec::new();
+    let bytes = select_text.as_bytes();
+    let mut depth: i32 = 0;
+    let mut item_start = 0;
+
+    for i in 0..select_text.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'\'' => {
+                // Skip single-quoted strings
+                let mut j = i + 1;
+                while j < select_text.len() {
+                    if bytes[j] == b'\'' {
+                        if j + 1 < select_text.len() && bytes[j + 1] == b'\'' {
+                            j += 2;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        j += 1;
+                    }
+                }
+            }
+            b',' if depth == 0 => {
+                if let Some(alias) = subquery_alias_from_item(&select_text[item_start..i]) {
+                    aliases.push(alias);
+                }
+                item_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    // Last item
+    if let Some(alias) = subquery_alias_from_item(&select_text[item_start..]) {
+        aliases.push(alias);
+    }
+
+    aliases
+}
+
+/// Check if a single SELECT item contains a `(SELECT ...)` subquery and has an AS alias.
+fn subquery_alias_from_item(item: &str) -> Option<String> {
+    let upper = item.to_uppercase();
+    if !upper.contains("(SELECT ") {
+        return None;
+    }
+    // Find the last top-level " AS " (not inside parentheses)
+    let bytes = item.as_bytes();
+    let mut depth: i32 = 0;
+    let mut last_as_pos: Option<usize> = None;
+    let mut i = 0;
+    while i < item.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 => {
+                if i + 4 <= item.len() && upper[i..].starts_with(" AS ") {
+                    last_as_pos = Some(i + 4);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let as_pos = last_as_pos?;
+    let alias = item[as_pos..].trim();
+    // Extract identifier: alphanumeric, underscore, or quoted
+    let alias = alias
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '"' && c != '`')
+        .next()
+        .unwrap_or(alias)
+        .trim_matches('"')
+        .trim_matches('`');
+    if alias.is_empty() {
+        None
+    } else {
+        Some(alias.to_string())
+    }
+}
+
+/// Check if an identifier appears as a whole word in text (case-insensitive).
+fn identifier_appears_in(text: &str, ident: &str) -> bool {
+    let text_upper = text.to_uppercase();
+    let ident_upper = ident.to_uppercase();
+    let mut search_from = 0;
+    while let Some(pos) = text_upper[search_from..].find(&ident_upper) {
+        let abs = search_from + pos;
+        let before_ok = abs == 0 || {
+            let c = text.as_bytes()[abs - 1];
+            !c.is_ascii_alphanumeric() && c != b'_' && c != b'.'
+        };
+        let after_pos = abs + ident_upper.len();
+        let after_ok = after_pos >= text_upper.len() || {
+            let c = text.as_bytes()[after_pos];
+            !c.is_ascii_alphanumeric() && c != b'_'
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        search_from = abs + 1;
+    }
+    false
+}
+
 /// Expand AGGREGATE() with AT modifiers in SQL
 pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     let cte_expansion = expand_cte_queries(sql);
@@ -5593,6 +5705,29 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 String::new()
             }
         );
+    }
+
+    // If ORDER BY references an alias whose SELECT expression is a subquery,
+    // wrap the query to avoid DuckDB's "Alias has subquery" limitation.
+    if let Some(order_pos) = find_top_level_keyword(&result_sql, "ORDER BY", 0) {
+        let subquery_aliases = extract_subquery_aliases_from_select(&result_sql);
+        if !subquery_aliases.is_empty() {
+            let order_end = find_first_top_level_keyword(
+                &result_sql,
+                order_pos + 8,
+                &["LIMIT", "OFFSET"],
+            )
+            .unwrap_or(result_sql.len());
+            let order_text = &result_sql[order_pos + 8..order_end];
+            let needs_wrap = subquery_aliases
+                .iter()
+                .any(|alias| identifier_appears_in(order_text, alias));
+            if needs_wrap {
+                let trailing = result_sql[order_pos..].trim_end_matches(';').trim_end();
+                let inner = result_sql[..order_pos].trim_end().trim_end_matches(';').trim_end();
+                result_sql = format!("SELECT * FROM ({inner}) _q {trailing}");
+            }
+        }
     }
 
     AggregateExpandResult {
@@ -7538,5 +7673,29 @@ GROUP BY s.year";
         assert!(result.expanded_sql.contains(
             "FROM (SELECT * FROM (SELECT year, region FROM a UNION ALL SELECT year, region FROM b)) _inner"
         ));
+    }
+
+    #[test]
+    fn test_extract_subquery_aliases_from_select() {
+        let sql = "SELECT year, region, SUM(revenue) AS revenue, (SELECT SUM(revenue) FROM t _inner WHERE _inner.year IS NOT DISTINCT FROM _outer.year) AS year_total FROM sales_v _outer GROUP BY year, region";
+        let aliases = extract_subquery_aliases_from_select(sql);
+        assert_eq!(aliases, vec!["year_total"]);
+    }
+
+    #[test]
+    fn test_extract_subquery_aliases_no_subquery() {
+        let sql = "SELECT year, SUM(revenue) AS revenue FROM sales_v GROUP BY year";
+        let aliases = extract_subquery_aliases_from_select(sql);
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn test_identifier_appears_in() {
+        assert!(identifier_appears_in("revenue/year_total", "year_total"));
+        assert!(identifier_appears_in("revenue/year_total", "revenue"));
+        assert!(!identifier_appears_in("revenue/year_total", "year"));
+        assert!(identifier_appears_in("year_total DESC", "year_total"));
+        assert!(identifier_appears_in(" year_total", "year_total"));
+        assert!(!identifier_appears_in("o.prodName", "year_total"));
     }
 }
