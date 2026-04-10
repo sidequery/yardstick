@@ -5170,8 +5170,7 @@ fn validate_set_expression_requirements(
 /// Extract alias names of SELECT items whose expressions contain subqueries.
 fn extract_subquery_aliases_from_select(sql: &str) -> Vec<String> {
     let from_pos = find_top_level_keyword(sql, "FROM", 0).unwrap_or(sql.len());
-    let upper = sql.to_uppercase();
-    let select_start = upper.find("SELECT").map(|p| p + 6).unwrap_or(0);
+    let select_start = find_top_level_keyword(sql, "SELECT", 0).map(|p| p + 6).unwrap_or(0);
     let select_text = &sql[select_start..from_pos];
 
     let mut aliases = Vec::new();
