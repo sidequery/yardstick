@@ -3930,6 +3930,21 @@ fn base_relation_for_subquery(base_relation_sql: &str) -> String {
     format!("({trimmed})")
 }
 
+/// Check if a dimension string is an expression (not a simple column reference).
+/// Expressions contain function calls, operators, or CASE expressions.
+fn is_expression_dim(dim: &str) -> bool {
+    let trimmed = dim.trim();
+    let upper = trimmed.to_uppercase();
+    trimmed.contains('(')
+        || trimmed.contains("||")
+        || trimmed.contains(" + ")
+        || trimmed.contains(" - ")
+        || trimmed.contains(" * ")
+        || trimmed.contains(" / ")
+        || upper.starts_with("CASE ")
+        || upper.contains(" CASE ")
+}
+
 fn correlation_exprs_for_dim(
     dim: &str,
     dimension_exprs: &HashMap<String, String>,
@@ -3951,7 +3966,9 @@ fn correlation_exprs_for_dim(
         return (inner_expr, outer_expr);
     }
 
-    if dim_trim.contains('(') {
+    // Expression dimensions (function calls, operators, CASE): qualify individual column
+    // references and wrap outer side in ANY_VALUE so DuckDB accepts it in grouped context.
+    if is_expression_dim(dim_trim) {
         let inner_expr = qualify_where_for_inner(dim_trim);
         let outer_expr = outer_alias
             .map(|alias| format!("ANY_VALUE({})", qualify_where_for_outer(dim_trim, alias)))
@@ -5259,8 +5276,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         group_by_cols.clone()
     };
 
-    let has_expression_dimensions = original_dim_cols.iter().any(|col| col.contains('('));
-
+    let has_expression_dimensions = original_dim_cols.iter().any(|col| is_expression_dim(col));
     // Check if query needs an explicit outer alias for correlation handling.
     let needs_outer_alias = has_expression_dimensions
         || at_patterns.iter().any(|(_, modifiers, _, _)| {
@@ -7538,5 +7554,64 @@ GROUP BY s.year";
         assert!(result.expanded_sql.contains(
             "FROM (SELECT * FROM (SELECT year, region FROM a UNION ALL SELECT year, region FROM b)) _inner"
         ));
+    }
+
+    #[test]
+    fn test_is_expression_dim() {
+        // Simple column references
+        assert!(!is_expression_dim("region"));
+        assert!(!is_expression_dim("t.region"));
+        assert!(!is_expression_dim("year"));
+        // Expression dimensions
+        assert!(is_expression_dim("region || 'foo'"));
+        assert!(is_expression_dim("amount + 1"));
+        assert!(is_expression_dim("price * quantity"));
+        assert!(is_expression_dim("a - b"));
+        assert!(is_expression_dim("x / y"));
+        assert!(is_expression_dim("MONTH(date)"));
+        assert!(is_expression_dim("CASE WHEN x = 1 THEN 'a' ELSE 'b' END"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_expression_dimension_correlation() {
+        // Test that expression dimensions (e.g., region || 'foo') generate valid
+        // correlation using ANY_VALUE on the outer side (issue #29)
+        clear_measure_views();
+        store_measure_view(
+            "sales_v",
+            vec![ViewMeasure {
+                column_name: "revenue".to_string(),
+                expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
+            }],
+            "SELECT year, region, SUM(amount) AS revenue FROM sales GROUP BY ALL",
+            Some("sales".to_string()),
+        );
+
+        let sql = "SELECT region || 'foo' as regionfoo, AGGREGATE(revenue) FROM sales_v";
+        let result = expand_aggregate_with_at(sql);
+
+        eprintln!("Expanded SQL: {}", result.expanded_sql);
+        assert!(result.had_aggregate);
+        assert!(result.error.is_none());
+        // Should use ANY_VALUE for the outer expression reference
+        assert!(
+            result.expanded_sql.contains("ANY_VALUE("),
+            "Expected ANY_VALUE wrapper for expression dimension, got: {}",
+            result.expanded_sql
+        );
+        // Should have _outer alias since expression dimension needs correlation
+        assert!(
+            result.expanded_sql.contains("_outer"),
+            "Expected _outer alias for expression dimension, got: {}",
+            result.expanded_sql
+        );
+        // Should NOT produce bare table.column references that fail GROUP BY
+        assert!(
+            !result.expanded_sql.contains("sales_v.region ||"),
+            "Should not have unqualified sales_v.region in expression, got: {}",
+            result.expanded_sql
+        );
     }
 }
