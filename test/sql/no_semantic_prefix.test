@@ -1843,3 +1843,31 @@ query I
 SELECT list_aggr([100, 200], 'sum');
 ----
 300
+
+# =============================================================================
+# Test: Quoted measure names work with AGGREGATE
+# =============================================================================
+
+statement ok
+CREATE TABLE quoted_sales (year INT, amount DOUBLE);
+
+statement ok
+INSERT INTO quoted_sales VALUES (2022, 100), (2023, 200);
+
+statement ok
+CREATE VIEW quoted_v AS
+SELECT year, SUM(amount) AS MEASURE total_revenue
+FROM quoted_sales;
+
+# Quoted identifier referencing a measure should be recognized
+query IR rowsort
+SELECT year, AGGREGATE("total_revenue") FROM quoted_v;
+----
+2022	100.0
+2023	200.0
+
+statement ok
+DROP VIEW quoted_v;
+
+statement ok
+DROP TABLE quoted_sales;

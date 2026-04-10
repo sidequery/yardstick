@@ -354,9 +354,48 @@ fn parse_simple_measure_ref(expr: &str) -> Option<(Option<String>, String)> {
         return None;
     }
 
-    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '`' || c == '[' || c == ']';
-    if !trimmed.chars().all(allowed) {
-        return None;
+    // Validate that the expression is a simple identifier or qualifier.identifier.
+    // Allow any characters inside matched quotes (e.g. "total revenue").
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => {
+                // Skip quoted identifier contents (any characters allowed inside)
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None; // unmatched quote
+                }
+                i += 1;
+            }
+            '`' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '`' {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None;
+                }
+                i += 1;
+            }
+            '[' => {
+                i += 1;
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None;
+                }
+                i += 1;
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '.' => {
+                i += 1;
+            }
+            _ => return None, // disallowed character outside quotes (commas, parens, etc.)
+        }
     }
 
     let parts: Vec<&str> = trimmed.split('.').collect();
