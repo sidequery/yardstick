@@ -1789,3 +1789,10 @@ SEMANTIC SELECT year + 1 AS next_year, AGGREGATE(revenue) FROM sales_v;
 ----
 2023	150.0
 2024	225.0
+
+# Expression dimension with qualified column reference
+query TR rowsort
+SEMANTIC SELECT sales_v.region || 'foo' AS regionfoo, AGGREGATE(revenue) FROM sales_v;
+----
+EUfoo	125.0
+USfoo	250.0

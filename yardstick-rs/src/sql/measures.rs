@@ -3945,6 +3945,48 @@ fn is_expression_dim(dim: &str) -> bool {
         || upper.contains(" CASE ")
 }
 
+/// Strip table qualifiers from column references in an expression so it can be
+/// re-qualified with `_inner` or an outer alias.
+/// e.g., `sales_v.region || 'foo'` -> `region || 'foo'`
+fn strip_column_qualifiers(expr: &str) -> String {
+    let mut result = String::new();
+    let mut chars = expr.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if c.is_alphabetic() || c == '_' {
+            let mut ident = String::from(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' {
+                    ident.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+            if chars.peek() == Some(&'.') {
+                chars.next(); // consume the dot, drop the qualifier
+            } else {
+                result.push_str(&ident);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 fn correlation_exprs_for_dim(
     dim: &str,
     dimension_exprs: &HashMap<String, String>,
@@ -3966,12 +4008,14 @@ fn correlation_exprs_for_dim(
         return (inner_expr, outer_expr);
     }
 
-    // Expression dimensions (function calls, operators, CASE): qualify individual column
-    // references and wrap outer side in ANY_VALUE so DuckDB accepts it in grouped context.
+    // Expression dimensions (function calls, operators, CASE): strip existing table
+    // qualifiers, then qualify column references for inner/outer. The outer side is
+    // wrapped in ANY_VALUE so DuckDB accepts it in grouped context.
     if is_expression_dim(dim_trim) {
-        let inner_expr = qualify_where_for_inner(dim_trim);
+        let unqualified = strip_column_qualifiers(dim_trim);
+        let inner_expr = qualify_where_for_inner(&unqualified);
         let outer_expr = outer_alias
-            .map(|alias| format!("ANY_VALUE({})", qualify_where_for_outer(dim_trim, alias)))
+            .map(|alias| format!("ANY_VALUE({})", qualify_where_for_outer(&unqualified, alias)))
             .unwrap_or_else(|| dim_trim.to_string());
         return (inner_expr, outer_expr);
     }
@@ -5276,7 +5320,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         group_by_cols.clone()
     };
 
-    let has_expression_dimensions = original_dim_cols.iter().any(|col| is_expression_dim(col));
+    let has_expression_dimensions = original_dim_cols.iter().any(|col| col.contains('('));
     // Check if query needs an explicit outer alias for correlation handling.
     let needs_outer_alias = has_expression_dimensions
         || at_patterns.iter().any(|(_, modifiers, _, _)| {
@@ -7570,6 +7614,16 @@ GROUP BY s.year";
         assert!(is_expression_dim("x / y"));
         assert!(is_expression_dim("MONTH(date)"));
         assert!(is_expression_dim("CASE WHEN x = 1 THEN 'a' ELSE 'b' END"));
+    }
+
+    #[test]
+    fn test_strip_column_qualifiers() {
+        assert_eq!(strip_column_qualifiers("sales_v.region || 'foo'"), "region || 'foo'");
+        assert_eq!(strip_column_qualifiers("t.year + 1"), "year + 1");
+        assert_eq!(strip_column_qualifiers("region || 'foo'"), "region || 'foo'");
+        assert_eq!(strip_column_qualifiers("year"), "year");
+        // String literals with dots are preserved
+        assert_eq!(strip_column_qualifiers("region || 'a.b'"), "region || 'a.b'");
     }
 
     #[test]
