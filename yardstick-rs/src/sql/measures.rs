@@ -7454,6 +7454,16 @@ GROUP BY s.year";
             qualify_where_for_inner_fallback("id in (select id from t where x in (select x from t2))"),
             "_inner.id in (select id from t where x in (select x from t2))"
         );
+
+        // Identifiers starting with "select" or "with" should NOT be treated as subqueries
+        assert_eq!(
+            qualify_where_for_inner_fallback("(select1 > 0)"),
+            "(_inner.select1 > 0)"
+        );
+        assert_eq!(
+            qualify_where_for_inner_fallback("(with_flag = 1)"),
+            "(_inner.with_flag = 1)"
+        );
     }
 
     // =========================================================================
