@@ -1205,8 +1205,10 @@ pub fn extract_all_aggregate_calls(sql: &str) -> Vec<(String, usize, usize)> {
         let start = search_pos + agg_offset;
 
         if let Ok((remaining, (measure, modifiers))) = aggregate_with_at(&sql[start..]) {
-            // Only include calls WITHOUT AT modifier
-            if modifiers.is_empty() {
+            // Only include calls WITHOUT AT modifier, and only when the argument
+            // is a simple identifier (measure name). This avoids intercepting
+            // DuckDB's built-in aggregate([list], 'fn') list function.
+            if modifiers.is_empty() && parse_simple_measure_ref(measure).is_some() {
                 let end = sql.len() - remaining.len();
                 results.push((measure.to_string(), start, end));
             }

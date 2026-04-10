@@ -422,6 +422,109 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
     return ParserExtensionParseResult();
 }
 
+//=============================================================================
+// PARSER OVERRIDE: intercepts ALL queries before DuckDB's native parser
+//=============================================================================
+
+ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
+                                                const std::string &query,
+                                                ParserOptions &options) {
+    // Strip SEMANTIC prefix if present (backwards compatibility)
+    std::string sql_to_check = query;
+    std::string semantic_stripped;
+    bool had_semantic_prefix = StartsWithSemantic(query, semantic_stripped);
+    if (had_semantic_prefix) {
+        sql_to_check = semantic_stripped;
+    }
+
+    // Check for DROP VIEW on measure views
+    if (yardstick_drop_measure_view_from_sql(sql_to_check.c_str())) {
+        // Catalog cleanup done; let DuckDB handle the actual DROP
+        return ParserOverrideResult();
+    }
+
+    // Check for AGGREGATE() function
+    if (yardstick_has_aggregate(sql_to_check.c_str())) {
+        YardstickAggregateResult result = yardstick_expand_aggregate(sql_to_check.c_str());
+
+        if (result.error) {
+            // Expansion failed: this might not be a yardstick AGGREGATE() call
+            // (e.g. DuckDB's built-in list aggregate function). Fall through to
+            // the native parser in case it can handle the query.
+            yardstick_free_aggregate_result(result);
+            return ParserOverrideResult();
+        }
+
+        if (result.had_aggregate) {
+            string expanded_sql(result.expanded_sql);
+            yardstick_free_aggregate_result(result);
+
+            // Validate the expanded SQL parses. If expansion produced garbage
+            // (e.g. because AGGREGATE() was actually DuckDB's list aggregate
+            // function, not a yardstick measure), fall through to the native parser.
+            try {
+                Parser validation_parser;
+                validation_parser.ParseQuery(expanded_sql);
+            } catch (...) {
+                return ParserOverrideResult();
+            }
+
+            // Escape single quotes for embedding in string literal
+            string escaped_sql;
+            for (char c : expanded_sql) {
+                if (c == '\'') {
+                    escaped_sql += "''";
+                } else {
+                    escaped_sql += c;
+                }
+            }
+
+            // Wrap in table function call and parse with DuckDB's native parser
+            string wrapper_sql = "SELECT * FROM yardstick('" + escaped_sql + "')";
+
+            Parser parser;
+            parser.ParseQuery(wrapper_sql);
+            return ParserOverrideResult(std::move(parser.statements));
+        }
+
+        yardstick_free_aggregate_result(result);
+    }
+
+    // Check for CREATE VIEW with AS MEASURE
+    if (yardstick_has_as_measure(sql_to_check.c_str())) {
+        std::string rewritten_query = RewritePercentileWithinGroup(query);
+        YardstickCreateViewResult result = yardstick_process_create_view(rewritten_query.c_str());
+
+        if (result.error) {
+            string error_msg(result.error);
+            yardstick_free_create_view_result(result);
+            try {
+                throw ParserException(error_msg);
+            } catch (std::exception &e) {
+                return ParserOverrideResult(e);
+            }
+        }
+
+        if (result.is_measure_view) {
+            string clean_sql = RewritePercentileWithinGroup(result.clean_sql);
+            yardstick_free_create_view_result(result);
+
+            try {
+                Parser parser;
+                parser.ParseQuery(clean_sql);
+                return ParserOverrideResult(std::move(parser.statements));
+            } catch (std::exception &e) {
+                return ParserOverrideResult(e);
+            }
+        }
+
+        yardstick_free_create_view_result(result);
+    }
+
+    // Not a yardstick query; fall through to DuckDB's native parser
+    return ParserOverrideResult();
+}
+
 ParserExtensionPlanResult yardstick_plan(ParserExtensionInfo *,
                                           ClientContext &context,
                                           unique_ptr<ParserExtensionParseData> parse_data) {
@@ -530,6 +633,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
     auto &db = loader.GetDatabaseInstance();
     auto &config = DBConfig::GetConfig(db);
+
+    // Enable parser_override so yardstick intercepts queries before DuckDB's native parser.
+    // FALLBACK mode: if our override doesn't handle the query, DuckDB's parser takes over.
+    config.SetOptionByName("allow_parser_override_extension", Value("fallback"));
 
     // Register parser extension
     YardstickParserExtension parser;

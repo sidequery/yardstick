@@ -28,6 +28,10 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
 ParserExtensionPlanResult yardstick_plan(ParserExtensionInfo *, ClientContext &,
                                           unique_ptr<ParserExtensionParseData>);
 
+ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
+                                                const std::string &query,
+                                                ParserOptions &options);
+
 // Operator extension: handles binding after parsing
 struct YardstickOperatorExtension : public OperatorExtension {
     YardstickOperatorExtension() : OperatorExtension() { Bind = yardstick_bind; }
@@ -39,10 +43,14 @@ struct YardstickOperatorExtension : public OperatorExtension {
 };
 
 // Parser extension: intercepts query strings
+// parser_override runs BEFORE DuckDB's native parser, handling all statement types.
+// parse_function/plan_function are kept as fallback for when the native parser fails
+// (e.g., AT(...) syntax that is not valid SQL).
 struct YardstickParserExtension : public ParserExtension {
     YardstickParserExtension() : ParserExtension() {
         parse_function = yardstick_parse;
         plan_function = yardstick_plan;
+        parser_override = yardstick_parser_override;
     }
 };
 
