@@ -2991,6 +2991,8 @@ fn qualify_where_for_inner_fallback(where_clause: &str) -> String {
     let mut chars = where_clause.chars().peekable();
     let mut previous_was_dot = false;
     let mut previous_was_as = false;
+    // Track interval state: 0=normal, 1=saw INTERVAL keyword, 2=saw INTERVAL + string literal
+    let mut interval_state: u8 = 0;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -3016,13 +3018,20 @@ fn qualify_where_for_inner_fallback(where_clause: &str) -> String {
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
             let is_type_context = previous_was_as;
             let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
+            let is_date_part = interval_state == 2 && is_interval_date_part_keyword(&ident);
 
-            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context && !is_date_part {
                 result.push_str("_inner.");
             }
             result.push_str(&ident);
             previous_was_dot = false;
             previous_was_as = ident.eq_ignore_ascii_case("AS");
+            // Update interval state
+            if ident.eq_ignore_ascii_case("INTERVAL") && is_typed_literal {
+                interval_state = 1;
+            } else {
+                interval_state = 0;
+            }
         } else if c == '\'' {
             // String literal - copy as-is until closing quote
             result.push(c);
@@ -3038,9 +3047,16 @@ fn qualify_where_for_inner_fallback(where_clause: &str) -> String {
                     }
                 }
             }
+            if interval_state == 1 {
+                interval_state = 2;
+            }
         } else {
             result.push(c);
             previous_was_dot = c == '.';
+            // Non-whitespace after interval string means no date part follows
+            if interval_state == 2 && !c.is_whitespace() {
+                interval_state = 0;
+            }
         }
     }
 
@@ -3059,6 +3075,7 @@ fn qualify_where_for_outer_fallback(where_clause: &str, outer_alias: &str) -> St
     let mut chars = where_clause.chars().peekable();
     let mut previous_was_dot = false;
     let mut previous_was_as = false;
+    let mut interval_state: u8 = 0;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -3081,14 +3098,20 @@ fn qualify_where_for_outer_fallback(where_clause: &str, outer_alias: &str) -> St
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
             let is_type_context = previous_was_as;
             let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
+            let is_date_part = interval_state == 2 && is_interval_date_part_keyword(&ident);
 
-            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context && !is_date_part {
                 result.push_str(outer_alias);
                 result.push('.');
             }
             result.push_str(&ident);
             previous_was_dot = false;
             previous_was_as = ident.eq_ignore_ascii_case("AS");
+            if ident.eq_ignore_ascii_case("INTERVAL") && is_typed_literal {
+                interval_state = 1;
+            } else {
+                interval_state = 0;
+            }
         } else if c == '\'' {
             result.push(c);
             previous_was_dot = false;
@@ -3102,9 +3125,15 @@ fn qualify_where_for_outer_fallback(where_clause: &str, outer_alias: &str) -> St
                     }
                 }
             }
+            if interval_state == 1 {
+                interval_state = 2;
+            }
         } else {
             result.push(c);
             previous_was_dot = c == '.';
+            if interval_state == 2 && !c.is_whitespace() {
+                interval_state = 0;
+            }
         }
     }
 
@@ -3297,6 +3326,7 @@ fn qualify_where_for_inner_with_dimensions(
     let mut chars = where_clause.chars().peekable();
     let mut previous_was_dot = false;
     let mut previous_was_as = false;
+    let mut interval_state: u8 = 0;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -3319,14 +3349,16 @@ fn qualify_where_for_inner_with_dimensions(
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
             let is_type_context = previous_was_as;
             let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
+            let is_date_part = interval_state == 2 && is_interval_date_part_keyword(&ident);
 
-            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context && !is_date_part {
                 let key = normalize_dimension_key(&ident);
                 if let Some(expr) = dimension_exprs.get(&key) {
                     let inner_expr = qualify_where_for_inner(expr);
                     result.push('(');
                     result.push_str(&inner_expr);
                     result.push(')');
+                    interval_state = 0;
                     continue;
                 }
                 result.push_str("_inner.");
@@ -3334,6 +3366,11 @@ fn qualify_where_for_inner_with_dimensions(
             result.push_str(&ident);
             previous_was_dot = false;
             previous_was_as = ident.eq_ignore_ascii_case("AS");
+            if ident.eq_ignore_ascii_case("INTERVAL") && is_typed_literal {
+                interval_state = 1;
+            } else {
+                interval_state = 0;
+            }
         } else if c == '\'' {
             result.push(c);
             previous_was_dot = false;
@@ -3347,9 +3384,15 @@ fn qualify_where_for_inner_with_dimensions(
                     }
                 }
             }
+            if interval_state == 1 {
+                interval_state = 2;
+            }
         } else {
             result.push(c);
             previous_was_dot = c == '.';
+            if interval_state == 2 && !c.is_whitespace() {
+                interval_state = 0;
+            }
         }
     }
 
@@ -3379,6 +3422,19 @@ fn is_typed_literal_keyword(
     }
 
     matches!(lookahead.peek(), Some(&'\''))
+}
+
+/// Check if an identifier is an interval date-part keyword (e.g. DAYS, MONTHS, YEARS).
+/// These follow the SQL-standard INTERVAL '<value>' <datepart> syntax and should not
+/// be qualified as column references when they appear after an interval literal.
+fn is_interval_date_part_keyword(ident: &str) -> bool {
+    let parts = [
+        "DAY", "DAYS", "HOUR", "HOURS", "MINUTE", "MINUTES",
+        "SECOND", "SECONDS", "MONTH", "MONTHS", "YEAR", "YEARS",
+        "WEEK", "WEEKS", "MICROSECOND", "MICROSECONDS",
+        "MILLISECOND", "MILLISECONDS",
+    ];
+    parts.iter().any(|p| p.eq_ignore_ascii_case(ident))
 }
 
 // =============================================================================
@@ -7198,6 +7254,34 @@ GROUP BY s.year";
             qualify_where_for_inner("duration > interval '1 day'"),
             "_inner.duration > interval '1 day'"
         );
+
+        // Interval with date part OUTSIDE the string literal (SQL standard syntax)
+        assert_eq!(
+            qualify_where_for_inner("col > interval '30' days"),
+            "_inner.col > interval '30' days"
+        );
+        assert_eq!(
+            qualify_where_for_inner("make_date(year,1,1) between '2023-01-01' and '2023-01-01' + interval '30' days"),
+            "make_date(_inner.year,1,1) between '2023-01-01' and '2023-01-01' + interval '30' days"
+        );
+        // Various date parts
+        assert_eq!(
+            qualify_where_for_inner("col + interval '2' hours"),
+            "_inner.col + interval '2' hours"
+        );
+        assert_eq!(
+            qualify_where_for_inner("col + interval '1' year"),
+            "_inner.col + interval '1' year"
+        );
+        assert_eq!(
+            qualify_where_for_inner("col + interval '6' months"),
+            "_inner.col + interval '6' months"
+        );
+        // year as column name should still be qualified
+        assert_eq!(
+            qualify_where_for_inner("year > 2020 AND col + interval '1' year < col2"),
+            "_inner.year > 2020 AND _inner.col + interval '1' year < _inner.col2"
+        );
     }
 
     #[test]
@@ -7213,6 +7297,11 @@ GROUP BY s.year";
         assert_eq!(
             qualify_where_for_outer("cast(order_date as date) = date '2023-01-01'", "o"),
             "cast(o.order_date as date) = date '2023-01-01'"
+        );
+        // Interval with date part outside string literal
+        assert_eq!(
+            qualify_where_for_outer("col + interval '30' days > col2", "o"),
+            "o.col + interval '30' days > o.col2"
         );
     }
 
