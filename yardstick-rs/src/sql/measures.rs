@@ -5177,23 +5177,23 @@ fn extract_subquery_aliases_from_select(sql: &str) -> Vec<String> {
     let bytes = select_text.as_bytes();
     let mut depth: i32 = 0;
     let mut item_start = 0;
+    let mut i = 0;
 
-    for i in 0..select_text.len() {
+    while i < select_text.len() {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => depth -= 1,
             b'\'' => {
-                // Skip single-quoted strings
-                let mut j = i + 1;
-                while j < select_text.len() {
-                    if bytes[j] == b'\'' {
-                        if j + 1 < select_text.len() && bytes[j + 1] == b'\'' {
-                            j += 2;
+                i += 1;
+                while i < select_text.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < select_text.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
                         } else {
                             break;
                         }
                     } else {
-                        j += 1;
+                        i += 1;
                     }
                 }
             }
@@ -5205,6 +5205,7 @@ fn extract_subquery_aliases_from_select(sql: &str) -> Vec<String> {
             }
             _ => {}
         }
+        i += 1;
     }
     // Last item
     if let Some(alias) = subquery_alias_from_item(&select_text[item_start..]) {
@@ -5254,20 +5255,23 @@ fn subquery_alias_from_item(item: &str) -> Option<String> {
     }
 }
 
-/// Check if an identifier appears as a whole word in text (case-insensitive).
+/// Check if an identifier appears as a whole word in text (case-insensitive),
+/// skipping string literals and comments.
 fn identifier_appears_in(text: &str, ident: &str) -> bool {
-    let text_upper = text.to_uppercase();
+    // Strip string literals and comments before scanning for the identifier.
+    let stripped = strip_literals_and_comments(text);
+    let stripped_upper = stripped.to_uppercase();
     let ident_upper = ident.to_uppercase();
     let mut search_from = 0;
-    while let Some(pos) = text_upper[search_from..].find(&ident_upper) {
+    while let Some(pos) = stripped_upper[search_from..].find(&ident_upper) {
         let abs = search_from + pos;
         let before_ok = abs == 0 || {
-            let c = text.as_bytes()[abs - 1];
+            let c = stripped.as_bytes()[abs - 1];
             !c.is_ascii_alphanumeric() && c != b'_' && c != b'.'
         };
         let after_pos = abs + ident_upper.len();
-        let after_ok = after_pos >= text_upper.len() || {
-            let c = text.as_bytes()[after_pos];
+        let after_ok = after_pos >= stripped_upper.len() || {
+            let c = stripped.as_bytes()[after_pos];
             !c.is_ascii_alphanumeric() && c != b'_'
         };
         if before_ok && after_ok {
@@ -5276,6 +5280,60 @@ fn identifier_appears_in(text: &str, ident: &str) -> bool {
         search_from = abs + 1;
     }
     false
+}
+
+/// Replace string literals and comments with spaces to avoid false matches.
+fn strip_literals_and_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = text.to_string().into_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                out[i] = b' ';
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            out[i] = b' ';
+                            out[i + 1] = b' ';
+                            i += 2;
+                        } else {
+                            out[i] = b' ';
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        out[i] = b' ';
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    out[i] = b' ';
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        out[i] = b' ';
+                        out[i + 1] = b' ';
+                        i += 2;
+                        break;
+                    }
+                    out[i] = b' ';
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
 /// Expand AGGREGATE() with AT modifiers in SQL
@@ -7696,5 +7754,21 @@ GROUP BY s.year";
         assert!(identifier_appears_in("year_total DESC", "year_total"));
         assert!(identifier_appears_in(" year_total", "year_total"));
         assert!(!identifier_appears_in("o.prodName", "year_total"));
+        // Should not match inside string literals
+        assert!(!identifier_appears_in("'year_total'", "year_total"));
+        assert!(!identifier_appears_in("'contains year_total inside'", "year_total"));
+        // Should not match inside comments
+        assert!(!identifier_appears_in("-- year_total\nrevenue", "year_total"));
+        assert!(!identifier_appears_in("/* year_total */ revenue", "year_total"));
+        // Should still match real identifiers alongside literals
+        assert!(identifier_appears_in("'literal' || year_total", "year_total"));
+    }
+
+    #[test]
+    fn test_extract_subquery_aliases_with_string_in_item() {
+        // Comma inside a string literal should not split the item
+        let sql = "SELECT 'a,b' || (SELECT 1) AS x FROM t";
+        let aliases = extract_subquery_aliases_from_select(sql);
+        assert_eq!(aliases, vec!["x"]);
     }
 }
