@@ -32,7 +32,8 @@ This matrix tracks parity for the core language semantics described in sections 
 | Listing 12 (queries 1-4) | correlated subquery, self-join, window, and measure forms return same rows | Covered | `test/sql/measures.test:1614`, `test/sql/measures.test:1624`, `test/sql/measures.test:1637`, `test/sql/measures.test:1652` |
 | §5.1 claim | `AT` can access rows excluded by outer `WHERE` (more expressive than `OVER`) | Covered | `test/sql/measures.test:962` |
 | §5.4 composability | derived measures referencing measures in same `SELECT` | Covered | `test/sql/measures.test:772`, `test/sql/measures.test:1499` |
-| §5.3 wide-table safety direction | joins with measures avoid double counting in tested cases | Partial | `test/sql/measures.test:889`, `test/sql/measures.test:1473` |
+| §3.6/§5.3 join fan-out prevention | measures immune to join fan-out across all aggregate types, join cardinalities (1:N, M:N, LEFT), and query shapes (grouped, filtered) | Covered | `test/sql/measures.test:949-1355` (20 tests) |
+| §5.3 wide-table safety direction | joins with measures avoid double counting in tested cases | Covered | `test/sql/measures.test:889`, `test/sql/measures.test:1473`, `test/sql/measures.test:982` |
 | §5.5 security model | measure views preserve SQL security boundaries | Gap | no privilege-based test in suite |
 | §3.4 call-site breadth | explicit use in `HAVING` parity path | Covered | `test/sql/measures.test:1548` |
 
