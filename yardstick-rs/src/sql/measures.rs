@@ -5593,12 +5593,46 @@ fn subquery_alias_from_item(item: &str) -> Option<String> {
         return None;
     }
     // Find the last top-level alias (not inside parentheses).
+    // Skip string literals and comments so quoted parens don't corrupt depth.
     let bytes = item.as_bytes();
     let mut depth: i32 = 0;
     let mut last_alias_start: Option<usize> = None;
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
             b'(' => depth += 1,
             b')' => {
                 depth -= 1;
