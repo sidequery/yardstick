@@ -1094,7 +1094,7 @@ statement ok
 CREATE TABLE fanout_minmax_people (id INT, age INT);
 
 statement ok
-INSERT INTO fanout_minmax_people VALUES (1, 30), (2, 25), (3, 40), (4, 15);
+INSERT INTO fanout_minmax_people VALUES (1, 30), (2, 25), (3, 35), (4, 15), (5, 50);
 
 statement ok
 CREATE TABLE fanout_minmax_tasks (id INT, task TEXT);
@@ -1107,15 +1107,15 @@ CREATE VIEW fanout_minmax_v AS
 SELECT *, MIN(age) AS MEASURE youngest, MAX(age) AS MEASURE oldest
 FROM fanout_minmax_people;
 
-# Correct: MIN=15 (id=4, no tasks), MAX=40
-# Joined-only (wrong): MIN=25, MAX=40
+# Correct: MIN=15 (id=4, unmatched), MAX=50 (id=5, unmatched)
+# Joined-only (wrong): MIN=25, MAX=35
 
 query II
 SEMANTIC SELECT AGGREGATE(youngest), AGGREGATE(oldest)
 FROM fanout_minmax_v p
 JOIN fanout_minmax_tasks t ON p.id = t.id;
 ----
-15	40
+15	50
 
 # -- Test 9: non-additive (ratio) measure immune to fan-out --
 # A ratio measure cannot be re-aggregated by summing. The measure must
@@ -1156,33 +1156,36 @@ JOIN fanout_product_regions pr ON p.product = pr.product;
 0.5222222222222223
 
 # -- Test 10: COUNT DISTINCT measure immune to fan-out --
-# Join orders to a line-items table that fans out the order rows.
-# Each order has 1-3 line items, so orders are duplicated in the join.
-# COUNT(DISTINCT product) must still be 3, not affected by duplication.
+# Add an order with a unique product from a customer not in the join target.
+# If the measure evaluates over joined rows only, that product is lost.
 
 statement ok
-CREATE TABLE fanout_line_items (order_id INT, line TEXT);
+CREATE TABLE fanout_cd_orders (order_id INT, cust_id INT, product TEXT);
 
 statement ok
-INSERT INTO fanout_line_items VALUES
-    (101, 'L1'), (101, 'L2'),
-    (102, 'L1'),
-    (103, 'L1'), (103, 'L2'), (103, 'L3'),
-    (104, 'L1'),
-    (105, 'L1'), (105, 'L2'),
-    (106, 'L1');
+INSERT INTO fanout_cd_orders VALUES
+    (1, 1, 'Widget'), (2, 1, 'Gadget'),
+    (3, 2, 'Widget'),
+    (4, 99, 'Thingamajig');
 
 statement ok
-CREATE VIEW fanout_orders_cd_v AS
+CREATE TABLE fanout_cd_custs (cust_id INT, name TEXT);
+
+statement ok
+INSERT INTO fanout_cd_custs VALUES (1, 'Alice'), (1, 'Alice2'), (2, 'Bob');
+
+statement ok
+CREATE VIEW fanout_cd_orders_v AS
 SELECT *, COUNT(DISTINCT product) AS MEASURE distinct_products
-FROM fanout_orders;
+FROM fanout_cd_orders;
 
-# 11 joined rows from 6 orders, but distinct products stays 3.
+# Correct: 3 distinct products (Widget, Gadget, Thingamajig)
+# Joined-only (wrong): 2 (Widget, Gadget -- cust_id=99 has no match)
 
 query I
 SEMANTIC SELECT AGGREGATE(distinct_products)
-FROM fanout_orders_cd_v o
-JOIN fanout_line_items li ON o.order_id = li.order_id;
+FROM fanout_cd_orders_v o
+JOIN fanout_cd_custs c ON o.cust_id = c.cust_id;
 ----
 3
 
