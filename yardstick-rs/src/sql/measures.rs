@@ -5527,27 +5527,42 @@ fn subquery_alias_from_item(item: &str) -> Option<String> {
     if !item.to_uppercase().contains("(SELECT ") {
         return None;
     }
-    // Find the last top-level " AS " (not inside parentheses).
-    // Compare directly on `item` using case-insensitive matching to avoid
-    // byte-offset mismatches between `item` and its uppercase form.
+    // Find the last top-level whitespace-AS-whitespace (not inside parentheses).
+    // Handles spaces, tabs, and newlines around AS.
+    let bytes = item.as_bytes();
     let mut depth: i32 = 0;
-    let mut last_as_pos: Option<usize> = None;
-    for (i, ch) in item.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ' ' if depth == 0 => {
-                if item[i..].len() >= 4
-                    && item[i..].as_bytes()[1..4].eq_ignore_ascii_case(b"AS ")
-                {
-                    last_as_pos = Some(i + 4);
+    let mut last_as_end: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            c if depth == 0 && c.is_ascii_whitespace() => {
+                // Skip leading whitespace
+                let ws_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
                 }
+                // Check for "AS" followed by whitespace
+                if i + 2 <= bytes.len()
+                    && bytes[i..i + 2].eq_ignore_ascii_case(b"AS")
+                    && (i + 2 >= bytes.len() || bytes[i + 2].is_ascii_whitespace())
+                {
+                    let _ = ws_start;
+                    let mut end = i + 2;
+                    while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+                        end += 1;
+                    }
+                    last_as_end = Some(end);
+                }
+                continue; // already advanced i past whitespace
             }
             _ => {}
         }
+        i += 1;
     }
-    let as_pos = last_as_pos?;
-    let alias = item[as_pos..].trim();
+    let as_end = last_as_end?;
+    let alias = item[as_end..].trim();
     // Extract identifier: alphanumeric, underscore, or quoted
     let alias = alias
         .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '"' && c != '`')
@@ -5590,7 +5605,13 @@ fn identifier_appears_in(text: &str, ident: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
+        // Advance past the current match start, staying on a char boundary
         search_from = abs + 1;
+        while search_from < stripped_upper.len()
+            && !stripped_upper.is_char_boundary(search_from)
+        {
+            search_from += 1;
+        }
     }
     false
 }
@@ -8202,6 +8223,19 @@ GROUP BY s.year";
         let item = " (SELECT 1) || '\u{00e9}' AS year_total";
         let alias = subquery_alias_from_item(item);
         assert_eq!(alias, Some("year_total".to_string()));
+    }
+
+    #[test]
+    fn test_subquery_alias_from_item_whitespace_variants() {
+        // Tab between AS and alias
+        let item = " (SELECT 1) AS\tyear_total";
+        assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
+        // Newline between AS and alias
+        let item = " (SELECT 1) AS\nyear_total";
+        assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
+        // Multiple spaces
+        let item = " (SELECT 1)  AS  year_total";
+        assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
     }
 
     #[test]
