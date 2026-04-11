@@ -5528,25 +5528,60 @@ fn item_has_subquery(item: &str) -> bool {
     let bytes = item.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'(' {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
             }
-            if j + 6 <= bytes.len()
-                && bytes[j..j + 6].eq_ignore_ascii_case(b"SELECT")
-                && (j + 6 >= bytes.len() || !bytes[j + 6].is_ascii_alphanumeric() && bytes[j + 6] != b'_')
-            {
-                return true;
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
             }
-            if j + 4 <= bytes.len()
-                && bytes[j..j + 4].eq_ignore_ascii_case(b"WITH")
-                && (j + 4 >= bytes.len() || !bytes[j + 4].is_ascii_alphanumeric() && bytes[j + 4] != b'_')
-            {
-                return true;
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
             }
+            b'(' => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j + 6 <= bytes.len()
+                    && bytes[j..j + 6].eq_ignore_ascii_case(b"SELECT")
+                    && (j + 6 >= bytes.len()
+                        || !bytes[j + 6].is_ascii_alphanumeric() && bytes[j + 6] != b'_')
+                {
+                    return true;
+                }
+                if j + 4 <= bytes.len()
+                    && bytes[j..j + 4].eq_ignore_ascii_case(b"WITH")
+                    && (j + 4 >= bytes.len()
+                        || !bytes[j + 4].is_ascii_alphanumeric() && bytes[j + 4] != b'_')
+                {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
         }
-        i += 1;
     }
     false
 }
