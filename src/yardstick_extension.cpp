@@ -462,29 +462,37 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
             // Validate the expanded SQL parses. If expansion produced garbage
             // (e.g. because AGGREGATE() was actually DuckDB's list aggregate
             // function, not a yardstick measure), fall through to the native parser.
+            Parser validation_parser;
             try {
-                Parser validation_parser;
                 validation_parser.ParseQuery(expanded_sql);
             } catch (...) {
                 return ParserOverrideResult();
             }
 
-            // Escape single quotes for embedding in string literal
-            string escaped_sql;
-            for (char c : expanded_sql) {
-                if (c == '\'') {
-                    escaped_sql += "''";
-                } else {
-                    escaped_sql += c;
+            // For SELECT statements, wrap in yardstick() table function so that
+            // any remaining AGGREGATE() calls get a second expansion pass.
+            // For non-SELECT (CTAS, INSERT...SELECT), return parsed statements
+            // directly to preserve the caller's transaction context.
+            bool is_select = !validation_parser.statements.empty() &&
+                             validation_parser.statements[0]->type == StatementType::SELECT_STATEMENT;
+
+            if (is_select) {
+                string escaped_sql;
+                for (char c : expanded_sql) {
+                    if (c == '\'') {
+                        escaped_sql += "''";
+                    } else {
+                        escaped_sql += c;
+                    }
                 }
+
+                string wrapper_sql = "SELECT * FROM yardstick('" + escaped_sql + "')";
+                Parser parser;
+                parser.ParseQuery(wrapper_sql);
+                return ParserOverrideResult(std::move(parser.statements));
             }
 
-            // Wrap in table function call and parse with DuckDB's native parser
-            string wrapper_sql = "SELECT * FROM yardstick('" + escaped_sql + "')";
-
-            Parser parser;
-            parser.ParseQuery(wrapper_sql);
-            return ParserOverrideResult(std::move(parser.statements));
+            return ParserOverrideResult(std::move(validation_parser.statements));
         }
 
         yardstick_free_aggregate_result(result);
