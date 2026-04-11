@@ -52,8 +52,7 @@ SELECT
 FROM sales;
 
 -- Query with AGGREGATE() and AT modifiers
--- SEMANTIC is required for AGGREGATE() without AT, optional for AT queries
-SEMANTIC SELECT
+SELECT
     year,
     region,
     AGGREGATE(revenue) AS revenue,
@@ -62,7 +61,7 @@ SEMANTIC SELECT
 FROM sales_v;
 
 -- Variance from the global average
-SEMANTIC SELECT
+SELECT
     region,
     AGGREGATE(revenue) AS revenue,
     AGGREGATE(revenue) AT (ALL) / 4.0 AS expected_if_equal,  -- 4 regions
@@ -70,7 +69,7 @@ SEMANTIC SELECT
 FROM sales_v;
 
 -- Nested percentages (% of year, and that year's % of total)
-SEMANTIC SELECT
+SELECT
     year,
     region,
     AGGREGATE(revenue) AS revenue,
@@ -79,7 +78,7 @@ SEMANTIC SELECT
 FROM sales_v;
 
 -- Compare 2024 performance to 2023 baseline for each region
-SEMANTIC SELECT
+SELECT
     region,
     AGGREGATE(revenue) AT (SET year = 2024) AS rev_2024,
     AGGREGATE(revenue) AT (SET year = 2023) AS rev_2023,
@@ -87,7 +86,7 @@ SEMANTIC SELECT
 FROM sales_v;
 
 -- Filter to specific segments
-SEMANTIC SELECT
+SELECT
     year,
     AGGREGATE(revenue) AS total_revenue,
     AGGREGATE(revenue) AT (SET region = 'North') AS north_revenue,
@@ -127,21 +126,14 @@ Yardstick automatically handles the grouping. All DuckDB aggregate functions are
 
 ### Querying Measures
 
-Queries using `AGGREGATE()` without AT modifiers must use the `SEMANTIC` prefix. If an `AT (...)` modifier is present, the query can run without `SEMANTIC` because the AT syntax routes the statement through the extension parser.
-
 ```sql
-SEMANTIC SELECT
+SELECT
     dimensions,
     AGGREGATE(measure_name) [AT modifier]
 FROM view_name;
 ```
 
-```sql
-SELECT
-    dimensions,
-    AGGREGATE(measure_name) AT (ALL)
-FROM view_name;
-```
+On DuckDB 1.5+, queries containing `AGGREGATE()` are automatically intercepted by the extension's parser override, so no special prefix is needed. On older versions, the `SEMANTIC` prefix is still supported as a fallback.
 
 ### AT Modifiers
 
