@@ -976,7 +976,7 @@ INSERT INTO fanout_orders VALUES
 
 statement ok
 CREATE VIEW fanout_customers_v AS
-SELECT *, AVG(age) AS MEASURE avg_age, SUM(age) AS MEASURE sum_age, COUNT(age) AS MEASURE cust_count
+SELECT *, AVG(age) AS MEASURE avg_cust_age, SUM(age) AS MEASURE sum_age, COUNT(age) AS MEASURE cust_count
 FROM fanout_customers;
 
 # -- Test 1: AVG measure immune to one-to-many fan-out --
@@ -985,7 +985,7 @@ FROM fanout_customers;
 # Correct: (30+25+40)/3 = 31.666...
 
 query R
-SEMANTIC SELECT AGGREGATE(avg_age)
+SEMANTIC SELECT AGGREGATE(avg_cust_age)
 FROM fanout_customers_v c
 JOIN fanout_orders o ON c.cust_id = o.cust_id;
 ----
@@ -1016,7 +1016,7 @@ JOIN fanout_orders o ON c.cust_id = o.cust_id;
 # aggregate, not be distorted by order-count differences.
 
 query TIIR rowsort
-SEMANTIC SELECT c.name, c.age, COUNT(*) AS order_rows, AGGREGATE(avg_age)
+SEMANTIC SELECT c.name, c.age, COUNT(*) AS order_rows, AGGREGATE(avg_cust_age)
 FROM fanout_customers_v c
 JOIN fanout_orders o ON c.cust_id = o.cust_id
 GROUP BY c.name, c.age;
@@ -1028,7 +1028,7 @@ Carol	40	2	40.0
 # -- Test 5: WHERE filter with fan-out join --
 
 query RI
-SEMANTIC SELECT AGGREGATE(avg_age), AGGREGATE(cust_count)
+SEMANTIC SELECT AGGREGATE(avg_cust_age), AGGREGATE(cust_count)
 FROM fanout_customers_v c
 JOIN fanout_orders o ON c.cust_id = o.cust_id
 WHERE c.name = 'Alice';
@@ -1042,7 +1042,7 @@ statement ok
 INSERT INTO fanout_customers VALUES (4, 'Dave', 35);
 
 query IR
-SEMANTIC SELECT AGGREGATE(cust_count), AGGREGATE(avg_age)
+SEMANTIC SELECT AGGREGATE(cust_count), AGGREGATE(avg_cust_age)
 FROM fanout_customers_v c
 LEFT JOIN fanout_orders o ON c.cust_id = o.cust_id;
 ----
@@ -1319,10 +1319,10 @@ JOIN fanout_orders o ON c.cust_id = o.cust_id;
 [25, 30, 35, 40]
 
 # -- Test 20: BOOL_AND / BOOL_OR measures immune to fan-out --
-# All ages > 20 (true for both), but BOOL_OR(age > 34) differs:
-# Correct: true (Dave=35, Carol=40). Fanned-out: also true (Carol=40).
-# Use age > 32 for BOOL_AND to distinguish: correct false (25<32), fanned-out false too.
-# Better: use a view with a boolean condition that fan-out changes.
+# Dave (cust_id=4) has no orders, so the join excludes him.
+# He is the only non-premium and the only trial user. Without fan-out
+# prevention (evaluating only joined rows), BOOL_AND would flip to true
+# and BOOL_OR would flip to false.
 
 statement ok
 CREATE TABLE fanout_flags (cust_id INT, is_premium BOOLEAN, is_trial BOOLEAN);
@@ -1330,9 +1330,9 @@ CREATE TABLE fanout_flags (cust_id INT, is_premium BOOLEAN, is_trial BOOLEAN);
 statement ok
 INSERT INTO fanout_flags VALUES
     (1, true, false),
-    (2, false, true),
+    (2, true, false),
     (3, true, false),
-    (4, true, false);
+    (4, false, true);
 
 statement ok
 CREATE VIEW fanout_flags_v AS
@@ -1341,10 +1341,8 @@ SELECT *,
     BOOL_OR(is_trial) AS MEASURE any_trial
 FROM fanout_flags;
 
-# all_premium: correct = false (Bob is not premium)
-# any_trial: correct = true (Bob is trial)
-# Fan-out wouldn't change these with this data, but the measure must still
-# evaluate against the defining table, not the joined rows.
+# Correct (all 4 rows): all_premium = false (Dave), any_trial = true (Dave)
+# Fanned-out (only joined 3): all_premium = true (WRONG), any_trial = false (WRONG)
 
 query TT
 SEMANTIC SELECT AGGREGATE(all_premium), AGGREGATE(any_trial)
