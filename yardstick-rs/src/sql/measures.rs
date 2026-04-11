@@ -3945,10 +3945,13 @@ fn is_expression_dim(dim: &str) -> bool {
         || upper.contains(" CASE ")
 }
 
-/// Strip table qualifiers from column references in an expression so it can be
-/// re-qualified with `_inner` or an outer alias.
-/// e.g., `sales_v.region || 'foo'` -> `region || 'foo'`
-fn strip_column_qualifiers(expr: &str) -> String {
+/// Strip a specific table qualifier from column references in an expression so
+/// it can be re-qualified with `_inner` or an outer alias.
+/// Only removes `table_name.` prefixes; schema-qualified functions and struct
+/// field dereferences with other qualifiers are preserved.
+/// e.g., `strip_table_qualifier("sales_v.region || 'foo'", "sales_v")` -> `"region || 'foo'"`
+/// but  `strip_table_qualifier("my_schema.bucket(ts)", "sales_v")` -> `"my_schema.bucket(ts)"`
+fn strip_table_qualifier(expr: &str, table_name: &str) -> String {
     let mut result = String::new();
     let mut chars = expr.chars().peekable();
 
@@ -3974,8 +3977,8 @@ fn strip_column_qualifiers(expr: &str) -> String {
                     break;
                 }
             }
-            if chars.peek() == Some(&'.') {
-                chars.next(); // consume the dot, drop the qualifier
+            if chars.peek() == Some(&'.') && ident.eq_ignore_ascii_case(table_name) {
+                chars.next(); // consume the dot, drop this specific qualifier
             } else {
                 result.push_str(&ident);
             }
@@ -4008,11 +4011,13 @@ fn correlation_exprs_for_dim(
         return (inner_expr, outer_expr);
     }
 
-    // Expression dimensions (function calls, operators, CASE): strip existing table
-    // qualifiers, then qualify column references for inner/outer. The outer side is
-    // wrapped in ANY_VALUE so DuckDB accepts it in grouped context.
+    // Expression dimensions (function calls, operators, CASE): strip the source
+    // table qualifier so inner/outer qualification works, then wrap the outer side
+    // in ANY_VALUE so DuckDB accepts it in grouped context. Only the known table
+    // name is stripped; schema qualifiers and struct field access are preserved.
     if is_expression_dim(dim_trim) {
-        let unqualified = strip_column_qualifiers(dim_trim);
+        let table_to_strip = outer_alias.unwrap_or("");
+        let unqualified = strip_table_qualifier(dim_trim, table_to_strip);
         let inner_expr = qualify_where_for_inner(&unqualified);
         let outer_expr = outer_alias
             .map(|alias| format!("ANY_VALUE({})", qualify_where_for_outer(&unqualified, alias)))
@@ -7617,13 +7622,20 @@ GROUP BY s.year";
     }
 
     #[test]
-    fn test_strip_column_qualifiers() {
-        assert_eq!(strip_column_qualifiers("sales_v.region || 'foo'"), "region || 'foo'");
-        assert_eq!(strip_column_qualifiers("t.year + 1"), "year + 1");
-        assert_eq!(strip_column_qualifiers("region || 'foo'"), "region || 'foo'");
-        assert_eq!(strip_column_qualifiers("year"), "year");
+    fn test_strip_table_qualifier() {
+        // Strips the specified table qualifier
+        assert_eq!(strip_table_qualifier("sales_v.region || 'foo'", "sales_v"), "region || 'foo'");
+        assert_eq!(strip_table_qualifier("t.year + 1", "t"), "year + 1");
+        // No-op when no qualifier or doesn't match
+        assert_eq!(strip_table_qualifier("region || 'foo'", "sales_v"), "region || 'foo'");
+        assert_eq!(strip_table_qualifier("year", "t"), "year");
         // String literals with dots are preserved
-        assert_eq!(strip_column_qualifiers("region || 'a.b'"), "region || 'a.b'");
+        assert_eq!(strip_table_qualifier("region || 'a.b'", "sales_v"), "region || 'a.b'");
+        // Preserves non-matching qualifiers (schema-qualified, struct field access)
+        assert_eq!(strip_table_qualifier("my_schema.bucket(ts)", "sales_v"), "my_schema.bucket(ts)");
+        assert_eq!(strip_table_qualifier("payload.city || 'x'", "sales_v"), "payload.city || 'x'");
+        // Case insensitive match
+        assert_eq!(strip_table_qualifier("Sales_V.region || 'foo'", "sales_v"), "region || 'foo'");
     }
 
     #[test]
