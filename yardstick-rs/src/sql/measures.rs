@@ -5221,23 +5221,23 @@ fn subquery_alias_from_item(item: &str) -> Option<String> {
     if !upper.contains("(SELECT ") {
         return None;
     }
-    // Find the last top-level " AS " (not inside parentheses)
-    let bytes = item.as_bytes();
+    // Find the last top-level " AS " (not inside parentheses).
+    // Use char_indices to stay on valid UTF-8 boundaries.
     let mut depth: i32 = 0;
     let mut last_as_pos: Option<usize> = None;
-    let mut i = 0;
-    while i < item.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            _ if depth == 0 => {
-                if i + 4 <= item.len() && upper[i..].starts_with(" AS ") {
+    for (i, ch) in item.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if depth == 0 && ch == ' ' => {
+                if upper[i..].starts_with(" AS ")
+                    && item.is_char_boundary(i + 4)
+                {
                     last_as_pos = Some(i + 4);
                 }
             }
             _ => {}
         }
-        i += 1;
     }
     let as_pos = last_as_pos?;
     let alias = item[as_pos..].trim();
@@ -5267,7 +5267,7 @@ fn identifier_appears_in(text: &str, ident: &str) -> bool {
         let abs = search_from + pos;
         let before_ok = abs == 0 || {
             let c = stripped.as_bytes()[abs - 1];
-            !c.is_ascii_alphanumeric() && c != b'_' && c != b'.'
+            !c.is_ascii_alphanumeric() && c != b'_' && c != b'.' && c != b'"' && c != b'`'
         };
         let after_pos = abs + ident_upper.len();
         let after_ok = after_pos >= stripped_upper.len() || {
@@ -7762,6 +7762,9 @@ GROUP BY s.year";
         assert!(!identifier_appears_in("/* year_total */ revenue", "year_total"));
         // Should still match real identifiers alongside literals
         assert!(identifier_appears_in("'literal' || year_total", "year_total"));
+        // Should not match quoted qualified names like o."year_total"
+        assert!(!identifier_appears_in(r#"o."year_total""#, "year_total"));
+        assert!(!identifier_appears_in(r#"o.`year_total`"#, "year_total"));
     }
 
     #[test]
@@ -7770,5 +7773,13 @@ GROUP BY s.year";
         let sql = "SELECT 'a,b' || (SELECT 1) AS x FROM t";
         let aliases = extract_subquery_aliases_from_select(sql);
         assert_eq!(aliases, vec!["x"]);
+    }
+
+    #[test]
+    fn test_subquery_alias_from_item_multibyte() {
+        // Should not panic on multibyte UTF-8 characters
+        let item = " (SELECT 1) || '\u{00e9}' AS year_total";
+        let alias = subquery_alias_from_item(item);
+        assert_eq!(alias, Some("year_total".to_string()));
     }
 }
