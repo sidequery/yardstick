@@ -354,17 +354,56 @@ fn parse_simple_measure_ref(expr: &str) -> Option<(Option<String>, String)> {
         return None;
     }
 
-    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '`' || c == '[' || c == ']';
-    if !trimmed.chars().all(allowed) {
-        return None;
+    // Validate that the expression is a simple identifier or qualifier.identifier.
+    // Allow any characters inside matched quotes (e.g. "total revenue").
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => {
+                // Skip quoted identifier contents (any characters allowed inside)
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None; // unmatched quote
+                }
+                i += 1;
+            }
+            '`' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '`' {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None;
+                }
+                i += 1;
+            }
+            '[' => {
+                i += 1;
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None;
+                }
+                i += 1;
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c.is_ascii_whitespace() => {
+                i += 1;
+            }
+            _ => return None, // disallowed character outside quotes (commas, parens, etc.)
+        }
     }
 
     let parts: Vec<&str> = trimmed.split('.').collect();
     match parts.as_slice() {
-        [measure] => Some((None, normalize_identifier_name(measure))),
+        [measure] => Some((None, normalize_identifier_name(measure.trim()))),
         [qualifier, measure] => Some((
-            Some(normalize_identifier_name(qualifier)),
-            normalize_identifier_name(measure),
+            Some(normalize_identifier_name(qualifier.trim())),
+            normalize_identifier_name(measure.trim()),
         )),
         _ => None,
     }
@@ -1205,8 +1244,10 @@ pub fn extract_all_aggregate_calls(sql: &str) -> Vec<(String, usize, usize)> {
         let start = search_pos + agg_offset;
 
         if let Ok((remaining, (measure, modifiers))) = aggregate_with_at(&sql[start..]) {
-            // Only include calls WITHOUT AT modifier
-            if modifiers.is_empty() {
+            // Only include calls WITHOUT AT modifier, and only when the argument
+            // is a simple identifier (measure name). This avoids intercepting
+            // DuckDB's built-in aggregate([list], 'fn') list function.
+            if modifiers.is_empty() && parse_simple_measure_ref(measure).is_some() {
                 let end = sql.len() - remaining.len();
                 results.push((measure.to_string(), start, end));
             }
