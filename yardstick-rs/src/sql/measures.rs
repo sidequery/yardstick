@@ -3947,10 +3947,9 @@ fn is_expression_dim(dim: &str) -> bool {
 
 /// Strip a specific table qualifier from column references in an expression so
 /// it can be re-qualified with `_inner` or an outer alias.
-/// Only removes `table_name.` prefixes; schema-qualified functions and struct
-/// field dereferences with other qualifiers are preserved.
-/// e.g., `strip_table_qualifier("sales_v.region || 'foo'", "sales_v")` -> `"region || 'foo'"`
-/// but  `strip_table_qualifier("my_schema.bucket(ts)", "sales_v")` -> `"my_schema.bucket(ts)"`
+/// Only removes `table_name.column` prefixes where the target is a plain column;
+/// schema-qualified function calls (`s.bucket(ts)`) and struct field
+/// dereferences are preserved even when the qualifier matches `table_name`.
 fn strip_table_qualifier(expr: &str, table_name: &str) -> String {
     let mut result = String::new();
     let mut chars = expr.chars().peekable();
@@ -3978,7 +3977,30 @@ fn strip_table_qualifier(expr: &str, table_name: &str) -> String {
                 }
             }
             if chars.peek() == Some(&'.') && ident.eq_ignore_ascii_case(table_name) {
-                chars.next(); // consume the dot, drop this specific qualifier
+                // Peek past the dot to see what follows. If the next token
+                // is a function call (identifier immediately followed by '('),
+                // this is a schema-qualified function, not a table.column
+                // reference, so preserve the qualifier.
+                chars.next(); // consume the dot
+                // Collect the next identifier (if any) to check for '('
+                let mut next_ident = String::new();
+                while let Some(&next) = chars.peek() {
+                    if next.is_alphanumeric() || next == '_' {
+                        next_ident.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                let is_function_call = chars.peek() == Some(&'(');
+                if is_function_call {
+                    // Schema-qualified function: restore qualifier.dot.name
+                    result.push_str(&ident);
+                    result.push('.');
+                    result.push_str(&next_ident);
+                } else {
+                    // Table-qualified column: drop qualifier, keep column
+                    result.push_str(&next_ident);
+                }
             } else {
                 result.push_str(&ident);
             }
@@ -7623,7 +7645,7 @@ GROUP BY s.year";
 
     #[test]
     fn test_strip_table_qualifier() {
-        // Strips the specified table qualifier
+        // Strips the specified table qualifier from columns
         assert_eq!(strip_table_qualifier("sales_v.region || 'foo'", "sales_v"), "region || 'foo'");
         assert_eq!(strip_table_qualifier("t.year + 1", "t"), "year + 1");
         // No-op when no qualifier or doesn't match
@@ -7636,6 +7658,9 @@ GROUP BY s.year";
         assert_eq!(strip_table_qualifier("payload.city || 'x'", "sales_v"), "payload.city || 'x'");
         // Case insensitive match
         assert_eq!(strip_table_qualifier("Sales_V.region || 'foo'", "sales_v"), "region || 'foo'");
+        // Preserves schema-qualified function even when qualifier matches table name
+        assert_eq!(strip_table_qualifier("s.bucket(ts)", "s"), "s.bucket(ts)");
+        assert_eq!(strip_table_qualifier("s.year + s.bucket(ts)", "s"), "year + s.bucket(ts)");
     }
 
     #[test]
