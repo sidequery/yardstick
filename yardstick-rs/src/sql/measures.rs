@@ -5524,21 +5524,21 @@ fn extract_subquery_aliases_from_select(sql: &str) -> Vec<String> {
 
 /// Check if a single SELECT item contains a `(SELECT ...)` subquery and has an AS alias.
 fn subquery_alias_from_item(item: &str) -> Option<String> {
-    let upper = item.to_uppercase();
-    if !upper.contains("(SELECT ") {
+    if !item.to_uppercase().contains("(SELECT ") {
         return None;
     }
     // Find the last top-level " AS " (not inside parentheses).
-    // Use char_indices to stay on valid UTF-8 boundaries.
+    // Compare directly on `item` using case-insensitive matching to avoid
+    // byte-offset mismatches between `item` and its uppercase form.
     let mut depth: i32 = 0;
     let mut last_as_pos: Option<usize> = None;
     for (i, ch) in item.char_indices() {
         match ch {
             '(' => depth += 1,
             ')' => depth -= 1,
-            _ if depth == 0 && ch == ' ' => {
-                if upper[i..].starts_with(" AS ")
-                    && item.is_char_boundary(i + 4)
+            ' ' if depth == 0 => {
+                if item[i..].len() >= 4
+                    && item[i..].as_bytes()[1..4].eq_ignore_ascii_case(b"AS ")
                 {
                     last_as_pos = Some(i + 4);
                 }
@@ -5574,7 +5574,13 @@ fn identifier_appears_in(text: &str, ident: &str) -> bool {
         let abs = search_from + pos;
         let before_ok = abs == 0 || {
             let c = stripped.as_bytes()[abs - 1];
-            !c.is_ascii_alphanumeric() && c != b'_' && c != b'.' && c != b'"' && c != b'`'
+            if c == b'"' || c == b'`' {
+                // Bare quoted identifier like "year_total" is OK;
+                // qualified like o."year_total" (dot before quote) is not.
+                abs < 2 || stripped.as_bytes()[abs - 2] != b'.'
+            } else {
+                !c.is_ascii_alphanumeric() && c != b'_' && c != b'.'
+            }
         };
         let after_pos = abs + ident_upper.len();
         let after_ok = after_pos >= stripped_upper.len() || {
@@ -8174,9 +8180,12 @@ GROUP BY s.year";
         assert!(!identifier_appears_in("/* year_total */ revenue", "year_total"));
         // Should still match real identifiers alongside literals
         assert!(identifier_appears_in("'literal' || year_total", "year_total"));
-        // Should not match quoted qualified names like o."year_total"
+        // Should not match qualified quoted names like o."year_total"
         assert!(!identifier_appears_in(r#"o."year_total""#, "year_total"));
         assert!(!identifier_appears_in(r#"o.`year_total`"#, "year_total"));
+        // But bare quoted aliases like "year_total" should match
+        assert!(identifier_appears_in(r#""year_total""#, "year_total"));
+        assert!(identifier_appears_in(r#"`year_total`"#, "year_total"));
     }
 
     #[test]
