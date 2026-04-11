@@ -5545,48 +5545,71 @@ fn item_has_subquery(item: &str) -> bool {
     false
 }
 
-/// Check if a single SELECT item contains a `(SELECT ...)` subquery and has an AS alias.
+/// Check if a single SELECT item contains a `(SELECT ...)` subquery and has an alias.
+/// Supports both explicit (`AS alias`) and implicit (`(SELECT ...) alias`) forms.
 fn subquery_alias_from_item(item: &str) -> Option<String> {
     if !item_has_subquery(item) {
         return None;
     }
-    // Find the last top-level whitespace-AS-whitespace (not inside parentheses).
-    // Handles spaces, tabs, and newlines around AS.
+    // Find the last top-level alias (not inside parentheses).
     let bytes = item.as_bytes();
     let mut depth: i32 = 0;
-    let mut last_as_end: Option<usize> = None;
+    let mut last_alias_start: Option<usize> = None;
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'(' => depth += 1,
-            b')' => depth -= 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // After closing paren at depth 0, check for trailing alias
+                    let mut j = i + 1;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < bytes.len() {
+                        // Check for explicit "AS" keyword
+                        if j + 2 <= bytes.len()
+                            && bytes[j..j + 2].eq_ignore_ascii_case(b"AS")
+                            && (j + 2 >= bytes.len() || bytes[j + 2].is_ascii_whitespace())
+                        {
+                            let mut end = j + 2;
+                            while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+                                end += 1;
+                            }
+                            last_alias_start = Some(end);
+                        } else if bytes[j].is_ascii_alphabetic() || bytes[j] == b'_'
+                            || bytes[j] == b'"' || bytes[j] == b'`'
+                        {
+                            // Implicit alias (no AS keyword)
+                            last_alias_start = Some(j);
+                        }
+                    }
+                }
+            }
             c if depth == 0 && c.is_ascii_whitespace() => {
-                // Skip leading whitespace
-                let ws_start = i;
+                // Also check for AS keyword in non-subquery trailing context
                 while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                     i += 1;
                 }
-                // Check for "AS" followed by whitespace
                 if i + 2 <= bytes.len()
                     && bytes[i..i + 2].eq_ignore_ascii_case(b"AS")
                     && (i + 2 >= bytes.len() || bytes[i + 2].is_ascii_whitespace())
                 {
-                    let _ = ws_start;
                     let mut end = i + 2;
                     while end < bytes.len() && bytes[end].is_ascii_whitespace() {
                         end += 1;
                     }
-                    last_as_end = Some(end);
+                    last_alias_start = Some(end);
                 }
-                continue; // already advanced i past whitespace
+                continue;
             }
             _ => {}
         }
         i += 1;
     }
-    let as_end = last_as_end?;
-    let alias = item[as_end..].trim();
-    // Extract identifier: alphanumeric, underscore, or quoted
+    let alias_start = last_alias_start?;
+    let alias = item[alias_start..].trim();
     let alias = alias
         .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '"' && c != '`')
         .next()
@@ -5600,32 +5623,18 @@ fn subquery_alias_from_item(item: &str) -> Option<String> {
     }
 }
 
-/// Check if an identifier appears as a top-level whole word in text (case-insensitive),
-/// skipping string literals, comments, and content inside parentheses.
+/// Check if an identifier appears as a whole word in text (case-insensitive),
+/// skipping string literals and comments. Matches at any parenthesis depth
+/// so that `COALESCE(year_total, 0)` still triggers wrapping.
 fn identifier_appears_in(text: &str, ident: &str) -> bool {
     let stripped = strip_literals_and_comments(text);
     let stripped_upper = stripped.to_uppercase();
     let ident_upper = ident.to_uppercase();
-
-    // Pre-compute parenthesis depth at each byte position
     let bytes = stripped.as_bytes();
-    let mut depths = vec![0i32; bytes.len()];
-    let mut depth: i32 = 0;
-    for i in 0..bytes.len() {
-        if bytes[i] == b'(' {
-            depth += 1;
-        }
-        depths[i] = depth;
-        if bytes[i] == b')' {
-            depth -= 1;
-        }
-    }
 
     let mut search_from = 0;
     while let Some(pos) = stripped_upper[search_from..].find(&ident_upper) {
         let abs = search_from + pos;
-        // Only match at top level (outside parentheses)
-        let at_top_level = depths[abs] == 0;
         let before_ok = abs == 0 || {
             let c = bytes[abs - 1];
             if c == b'"' || c == b'`' {
@@ -5639,7 +5648,7 @@ fn identifier_appears_in(text: &str, ident: &str) -> bool {
             let c = bytes[after_pos];
             !c.is_ascii_alphanumeric() && c != b'_'
         };
-        if at_top_level && before_ok && after_ok {
+        if before_ok && after_ok {
             return true;
         }
         search_from = abs + 1;
@@ -8243,10 +8252,10 @@ GROUP BY s.year";
         // But bare quoted aliases like "year_total" should match
         assert!(identifier_appears_in(r#""year_total""#, "year_total"));
         assert!(identifier_appears_in(r#"`year_total`"#, "year_total"));
-        // Should not match inside parentheses (e.g., function arguments)
-        assert!(!identifier_appears_in("EXTRACT(YEAR FROM o.ts)", "year"));
-        assert!(!identifier_appears_in("COALESCE(year_total, 0)", "year_total"));
-        // But top-level references should still match
+        // Should match inside parentheses (e.g., COALESCE(year_total, 0))
+        assert!(identifier_appears_in("COALESCE(year_total, 0)", "year_total"));
+        assert!(identifier_appears_in("(year_total)", "year_total"));
+        // Top-level references should still match
         assert!(identifier_appears_in("year_total + COALESCE(x, 0)", "year_total"));
     }
 
@@ -8285,6 +8294,12 @@ GROUP BY s.year";
         assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
         // CTE subquery: (WITH ... SELECT ...)
         let item = " (WITH cte AS (SELECT 1) SELECT * FROM cte) AS year_total";
+        assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
+        // Implicit alias (no AS keyword)
+        let item = " (SELECT 1) year_total";
+        assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
+        // Quoted implicit alias
+        let item = r#" (SELECT 1) "year_total""#;
         assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
     }
 
