@@ -3956,6 +3956,7 @@ fn strip_table_qualifier(expr: &str, table_name: &str) -> String {
 
     while let Some(c) = chars.next() {
         if c == '\'' {
+            // Single-quoted string literal: copy verbatim
             result.push(c);
             while let Some(next) = chars.next() {
                 result.push(next);
@@ -3967,16 +3968,30 @@ fn strip_table_qualifier(expr: &str, table_name: &str) -> String {
                     }
                 }
             }
-        } else if c.is_alphabetic() || c == '_' {
-            let mut ident = String::from(c);
-            while let Some(&next) = chars.peek() {
-                if next.is_alphanumeric() || next == '_' {
-                    ident.push(chars.next().unwrap());
-                } else {
-                    break;
+        } else if c == '"' || c.is_alphabetic() || c == '_' {
+            // Collect identifier (possibly double-quoted)
+            let is_quoted = c == '"';
+            let mut ident_raw = String::from(c); // full text including quotes
+            let ident_name; // unquoted name for comparison
+            if is_quoted {
+                while let Some(next) = chars.next() {
+                    ident_raw.push(next);
+                    if next == '"' {
+                        break;
+                    }
                 }
+                ident_name = ident_raw[1..ident_raw.len().saturating_sub(1).max(1)].to_string();
+            } else {
+                while let Some(&next) = chars.peek() {
+                    if next.is_alphanumeric() || next == '_' {
+                        ident_raw.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                ident_name = ident_raw.clone();
             }
-            if chars.peek() == Some(&'.') && ident.eq_ignore_ascii_case(table_name) {
+            if chars.peek() == Some(&'.') && ident_name.eq_ignore_ascii_case(table_name) {
                 // Peek past the dot to see what follows. If the next token
                 // is a function call (identifier immediately followed by '('),
                 // this is a schema-qualified function, not a table.column
@@ -3984,17 +3999,25 @@ fn strip_table_qualifier(expr: &str, table_name: &str) -> String {
                 chars.next(); // consume the dot
                 // Collect the next identifier (if any) to check for '('
                 let mut next_ident = String::new();
-                while let Some(&next) = chars.peek() {
-                    if next.is_alphanumeric() || next == '_' {
-                        next_ident.push(chars.next().unwrap());
-                    } else {
-                        break;
+                if chars.peek() == Some(&'"') {
+                    next_ident.push(chars.next().unwrap());
+                    while let Some(next) = chars.next() {
+                        next_ident.push(next);
+                        if next == '"' { break; }
+                    }
+                } else {
+                    while let Some(&next) = chars.peek() {
+                        if next.is_alphanumeric() || next == '_' {
+                            next_ident.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
                     }
                 }
                 let is_function_call = chars.peek() == Some(&'(');
                 if is_function_call {
                     // Schema-qualified function: restore qualifier.dot.name
-                    result.push_str(&ident);
+                    result.push_str(&ident_raw);
                     result.push('.');
                     result.push_str(&next_ident);
                 } else {
@@ -4002,7 +4025,7 @@ fn strip_table_qualifier(expr: &str, table_name: &str) -> String {
                     result.push_str(&next_ident);
                 }
             } else {
-                result.push_str(&ident);
+                result.push_str(&ident_raw);
             }
         } else {
             result.push(c);
@@ -7661,6 +7684,11 @@ GROUP BY s.year";
         // Preserves schema-qualified function even when qualifier matches table name
         assert_eq!(strip_table_qualifier("s.bucket(ts)", "s"), "s.bucket(ts)");
         assert_eq!(strip_table_qualifier("s.year + s.bucket(ts)", "s"), "year + s.bucket(ts)");
+        // Quoted table qualifiers
+        assert_eq!(strip_table_qualifier(r#""s".region || 'foo'"#, "s"), "region || 'foo'");
+        assert_eq!(strip_table_qualifier(r#""Sales_V".region || 'x'"#, "sales_v"), "region || 'x'");
+        // Quoted column after qualifier
+        assert_eq!(strip_table_qualifier(r#"s."Region" || 'x'"#, "s"), r#""Region" || 'x'"#);
     }
 
     #[test]
