@@ -5522,9 +5522,32 @@ fn extract_subquery_aliases_from_select(sql: &str) -> Vec<String> {
     aliases
 }
 
+/// Check if text contains a parenthesized subquery: `(SELECT ...)` or `(WITH ... SELECT ...)`,
+/// tolerating whitespace between `(` and the keyword.
+fn item_has_subquery(item: &str) -> bool {
+    let bytes = item.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j + 6 <= bytes.len() && bytes[j..j + 6].eq_ignore_ascii_case(b"SELECT") {
+                return true;
+            }
+            if j + 4 <= bytes.len() && bytes[j..j + 4].eq_ignore_ascii_case(b"WITH") {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Check if a single SELECT item contains a `(SELECT ...)` subquery and has an AS alias.
 fn subquery_alias_from_item(item: &str) -> Option<String> {
-    if !item.to_uppercase().contains("(SELECT ") {
+    if !item_has_subquery(item) {
         return None;
     }
     // Find the last top-level whitespace-AS-whitespace (not inside parentheses).
@@ -5577,35 +5600,48 @@ fn subquery_alias_from_item(item: &str) -> Option<String> {
     }
 }
 
-/// Check if an identifier appears as a whole word in text (case-insensitive),
-/// skipping string literals and comments.
+/// Check if an identifier appears as a top-level whole word in text (case-insensitive),
+/// skipping string literals, comments, and content inside parentheses.
 fn identifier_appears_in(text: &str, ident: &str) -> bool {
-    // Strip string literals and comments before scanning for the identifier.
     let stripped = strip_literals_and_comments(text);
     let stripped_upper = stripped.to_uppercase();
     let ident_upper = ident.to_uppercase();
+
+    // Pre-compute parenthesis depth at each byte position
+    let bytes = stripped.as_bytes();
+    let mut depths = vec![0i32; bytes.len()];
+    let mut depth: i32 = 0;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'(' {
+            depth += 1;
+        }
+        depths[i] = depth;
+        if bytes[i] == b')' {
+            depth -= 1;
+        }
+    }
+
     let mut search_from = 0;
     while let Some(pos) = stripped_upper[search_from..].find(&ident_upper) {
         let abs = search_from + pos;
+        // Only match at top level (outside parentheses)
+        let at_top_level = depths[abs] == 0;
         let before_ok = abs == 0 || {
-            let c = stripped.as_bytes()[abs - 1];
+            let c = bytes[abs - 1];
             if c == b'"' || c == b'`' {
-                // Bare quoted identifier like "year_total" is OK;
-                // qualified like o."year_total" (dot before quote) is not.
-                abs < 2 || stripped.as_bytes()[abs - 2] != b'.'
+                abs < 2 || bytes[abs - 2] != b'.'
             } else {
                 !c.is_ascii_alphanumeric() && c != b'_' && c != b'.'
             }
         };
         let after_pos = abs + ident_upper.len();
         let after_ok = after_pos >= stripped_upper.len() || {
-            let c = stripped.as_bytes()[after_pos];
+            let c = bytes[after_pos];
             !c.is_ascii_alphanumeric() && c != b'_'
         };
-        if before_ok && after_ok {
+        if at_top_level && before_ok && after_ok {
             return true;
         }
-        // Advance past the current match start, staying on a char boundary
         search_from = abs + 1;
         while search_from < stripped_upper.len()
             && !stripped_upper.is_char_boundary(search_from)
@@ -8207,6 +8243,11 @@ GROUP BY s.year";
         // But bare quoted aliases like "year_total" should match
         assert!(identifier_appears_in(r#""year_total""#, "year_total"));
         assert!(identifier_appears_in(r#"`year_total`"#, "year_total"));
+        // Should not match inside parentheses (e.g., function arguments)
+        assert!(!identifier_appears_in("EXTRACT(YEAR FROM o.ts)", "year"));
+        assert!(!identifier_appears_in("COALESCE(year_total, 0)", "year_total"));
+        // But top-level references should still match
+        assert!(identifier_appears_in("year_total + COALESCE(x, 0)", "year_total"));
     }
 
     #[test]
@@ -8235,6 +8276,15 @@ GROUP BY s.year";
         assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
         // Multiple spaces
         let item = " (SELECT 1)  AS  year_total";
+        assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
+        // Space after opening paren: ( SELECT ...)
+        let item = " ( SELECT 1) AS year_total";
+        assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
+        // Newline after opening paren
+        let item = " (\nSELECT 1) AS year_total";
+        assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
+        // CTE subquery: (WITH ... SELECT ...)
+        let item = " (WITH cte AS (SELECT 1) SELECT * FROM cte) AS year_total";
         assert_eq!(subquery_alias_from_item(item), Some("year_total".to_string()));
     }
 
