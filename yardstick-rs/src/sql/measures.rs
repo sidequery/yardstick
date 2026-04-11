@@ -5533,10 +5533,16 @@ fn item_has_subquery(item: &str) -> bool {
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
             }
-            if j + 6 <= bytes.len() && bytes[j..j + 6].eq_ignore_ascii_case(b"SELECT") {
+            if j + 6 <= bytes.len()
+                && bytes[j..j + 6].eq_ignore_ascii_case(b"SELECT")
+                && (j + 6 >= bytes.len() || !bytes[j + 6].is_ascii_alphanumeric() && bytes[j + 6] != b'_')
+            {
                 return true;
             }
-            if j + 4 <= bytes.len() && bytes[j..j + 4].eq_ignore_ascii_case(b"WITH") {
+            if j + 4 <= bytes.len()
+                && bytes[j..j + 4].eq_ignore_ascii_case(b"WITH")
+                && (j + 4 >= bytes.len() || !bytes[j + 4].is_ascii_alphanumeric() && bytes[j + 4] != b'_')
+            {
                 return true;
             }
         }
