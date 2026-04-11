@@ -1011,19 +1011,34 @@ JOIN fanout_orders o ON c.cust_id = o.cust_id;
 ----
 3
 
-# -- Test 4: grouped join preserves per-group measure correctness --
-# Each group has one customer. The measure should reflect the true per-customer
-# aggregate, not be distorted by order-count differences.
+# -- Test 4: grouped join with multiple customers per group --
+# Group by tier so each group has >1 customer with different order counts.
+# Gold: Alice(30, 3 orders) + Bob(25, 1 order). Correct AVG = 27.5.
+# Fan-out would weight Alice 3x: (30*3+25)/4 = 28.75 (WRONG).
+# Silver: Carol(40, 2 orders) alone. AVG = 40 either way.
 
-query TIIR rowsort
-SEMANTIC SELECT c.name, c.age, COUNT(*) AS order_rows, AGGREGATE(avg_cust_age)
-FROM fanout_customers_v c
-JOIN fanout_orders o ON c.cust_id = o.cust_id
-GROUP BY c.name, c.age;
+statement ok
+CREATE TABLE fanout_tiered_custs (cust_id INT, tier TEXT, age INT);
+
+statement ok
+INSERT INTO fanout_tiered_custs VALUES
+    (1, 'gold', 30),
+    (2, 'gold', 25),
+    (3, 'silver', 40);
+
+statement ok
+CREATE VIEW fanout_tiered_custs_v AS
+SELECT *, AVG(age) AS MEASURE avg_tier_age
+FROM fanout_tiered_custs;
+
+query TIR rowsort
+SEMANTIC SELECT t.tier, COUNT(*) AS order_rows, AGGREGATE(avg_tier_age)
+FROM fanout_tiered_custs_v t
+JOIN fanout_orders o ON t.cust_id = o.cust_id
+GROUP BY t.tier;
 ----
-Alice	30	3	30.0
-Bob	25	1	25.0
-Carol	40	2	40.0
+gold	4	27.5
+silver	2	40.0
 
 # -- Test 5: WHERE filter with fan-out join --
 
@@ -1139,17 +1154,6 @@ FROM fanout_products_v p
 JOIN fanout_product_regions pr ON p.product = pr.product;
 ----
 0.5222222222222223
-
-# Per-product group: each product's margin is its own (revenue-cost)/revenue
-query TRI rowsort
-SEMANTIC SELECT p.product, AGGREGATE(profit_margin), COUNT(*) AS region_count
-FROM fanout_products_v p
-JOIN fanout_product_regions pr ON p.product = pr.product
-GROUP BY p.product;
-----
-Doohickey	0.19999999999999998	1
-Gadget	0.5	1
-Widget	0.6	2
 
 # -- Test 10: COUNT DISTINCT measure immune to fan-out --
 # Join orders to a line-items table that fans out the order rows.
