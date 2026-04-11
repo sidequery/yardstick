@@ -1072,22 +1072,35 @@ JOIN fanout_orders o ON c.cust_id = o.cust_id;
 4
 
 # -- Test 8: MIN/MAX measures immune to fan-out --
-# Semi-additive aggregates: MIN/MAX should not be affected by row duplication.
-# Without fan-out prevention, MIN/MAX happen to be idempotent on duplicates,
-# but the measure should still evaluate against the defining table only.
+# Add a customer with the global min age who has no orders.
+# If the measure incorrectly evaluates over joined rows only, MIN changes.
 
 statement ok
-CREATE VIEW fanout_customers_minmax_v AS
-SELECT *, MIN(age) AS MEASURE youngest, MAX(age) AS MEASURE oldest
-FROM fanout_customers;
+CREATE TABLE fanout_minmax_people (id INT, age INT);
 
-# youngest=25 (Bob), oldest=40 (Carol) -- Dave is 35, included after test 6 insert
+statement ok
+INSERT INTO fanout_minmax_people VALUES (1, 30), (2, 25), (3, 40), (4, 15);
+
+statement ok
+CREATE TABLE fanout_minmax_tasks (id INT, task TEXT);
+
+statement ok
+INSERT INTO fanout_minmax_tasks VALUES (1, 'A'), (2, 'B'), (3, 'C');
+
+statement ok
+CREATE VIEW fanout_minmax_v AS
+SELECT *, MIN(age) AS MEASURE youngest, MAX(age) AS MEASURE oldest
+FROM fanout_minmax_people;
+
+# Correct: MIN=15 (id=4, no tasks), MAX=40
+# Joined-only (wrong): MIN=25, MAX=40
+
 query II
 SEMANTIC SELECT AGGREGATE(youngest), AGGREGATE(oldest)
-FROM fanout_customers_minmax_v c
-JOIN fanout_orders o ON c.cust_id = o.cust_id;
+FROM fanout_minmax_v p
+JOIN fanout_minmax_tasks t ON p.id = t.id;
 ----
-25	40
+15	40
 
 # -- Test 9: non-additive (ratio) measure immune to fan-out --
 # A ratio measure cannot be re-aggregated by summing. The measure must
@@ -1139,18 +1152,33 @@ Gadget	0.5	1
 Widget	0.6	2
 
 # -- Test 10: COUNT DISTINCT measure immune to fan-out --
+# Join orders to a line-items table that fans out the order rows.
+# Each order has 1-3 line items, so orders are duplicated in the join.
+# COUNT(DISTINCT product) must still be 3, not affected by duplication.
+
+statement ok
+CREATE TABLE fanout_line_items (order_id INT, line TEXT);
+
+statement ok
+INSERT INTO fanout_line_items VALUES
+    (101, 'L1'), (101, 'L2'),
+    (102, 'L1'),
+    (103, 'L1'), (103, 'L2'), (103, 'L3'),
+    (104, 'L1'),
+    (105, 'L1'), (105, 'L2'),
+    (106, 'L1');
 
 statement ok
 CREATE VIEW fanout_orders_cd_v AS
 SELECT *, COUNT(DISTINCT product) AS MEASURE distinct_products
 FROM fanout_orders;
 
-# There are 3 distinct products (Widget, Gadget, Doohickey), not inflated by customer join.
+# 11 joined rows from 6 orders, but distinct products stays 3.
 
 query I
 SEMANTIC SELECT AGGREGATE(distinct_products)
 FROM fanout_orders_cd_v o
-JOIN fanout_customers c ON o.cust_id = c.cust_id;
+JOIN fanout_line_items li ON o.order_id = li.order_id;
 ----
 3
 
@@ -1205,37 +1233,33 @@ JOIN fanout_orders o ON c.cust_id = o.cust_id;
 Alice,Bob,Carol,Dave
 
 # -- Test 14: MODE measure immune to fan-out --
-# Need duplicates in the base data so MODE is deterministic.
+# Base data: (10, 20, 20, 30) -> mode=20 (20 appears twice)
+# id=1 (age=10) has 3 orders, so fan-out produces (10,10,10,20,20,30) -> mode=10
+# Correct answer is 20; a fan-out bug would return 10.
 
 statement ok
-CREATE TABLE fanout_ages (id INT, age INT);
+CREATE TABLE fanout_mode_data (id INT, age INT);
 
 statement ok
-INSERT INTO fanout_ages VALUES (1, 30), (2, 30), (3, 25), (4, 40);
+INSERT INTO fanout_mode_data VALUES (1, 10), (2, 20), (3, 20), (4, 30);
 
 statement ok
-CREATE TABLE fanout_age_orders (id INT, order_id INT);
+CREATE TABLE fanout_mode_orders (id INT, order_id INT);
 
 statement ok
-INSERT INTO fanout_age_orders VALUES (1, 1), (1, 2), (1, 3), (3, 4);
-
-# Correct mode of (30,30,25,40) = 30 (30 appears twice)
-# Fanned-out (30,30,30,30,30,30,25) would still be 30, but for the wrong reason.
-# Use id=3 (age=25) having 1 order vs id=1 (age=30) having 3 orders.
-# Fan-out produces (30,30,30,30,30,30,25,40) vs correct (30,30,25,40).
-# Both give mode=30 but the measure evaluates against the base table.
+INSERT INTO fanout_mode_orders VALUES (1, 1), (1, 2), (1, 3), (2, 4), (3, 5), (4, 6);
 
 statement ok
-CREATE VIEW fanout_ages_mode_v AS
+CREATE VIEW fanout_mode_v AS
 SELECT *, MODE(age) AS MEASURE mode_age
-FROM fanout_ages;
+FROM fanout_mode_data;
 
 query I
 SEMANTIC SELECT AGGREGATE(mode_age)
-FROM fanout_ages_mode_v a
-JOIN fanout_age_orders ao ON a.id = ao.id;
+FROM fanout_mode_v a
+JOIN fanout_mode_orders ao ON a.id = ao.id;
 ----
-30
+20
 
 # -- Test 15: PRODUCT measure immune to fan-out --
 # Fanned-out product of (30^3 * 25 * 40^2) = 1,080,000,000
