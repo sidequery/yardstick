@@ -3498,6 +3498,28 @@ fn try_consume_subquery_parens(
                     }
                 }
             }
+            '-' if chars.peek() == Some(&'-') => {
+                // Line comment: skip until end of line
+                content.push(chars.next().unwrap()); // consume second '-'
+                while let Some(next) = chars.next() {
+                    content.push(next);
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                // Block comment: skip until closing */
+                content.push(chars.next().unwrap()); // consume '*'
+                let mut prev = ' ';
+                while let Some(next) = chars.next() {
+                    content.push(next);
+                    if prev == '*' && next == '/' {
+                        break;
+                    }
+                    prev = next;
+                }
+            }
             _ => {}
         }
     }
@@ -7469,6 +7491,18 @@ GROUP BY s.year";
         assert_eq!(
             qualify_where_for_inner_fallback(r#"id in (select "a)" from t) AND region = 'US'"#),
             r#"_inner.id in (select "a)" from t) AND _inner.region = 'US'"#
+        );
+
+        // Block comments containing parens should not break depth tracking
+        assert_eq!(
+            qualify_where_for_inner_fallback("id in (select id /* ) */ from t) AND region = 'US'"),
+            "_inner.id in (select id /* ) */ from t) AND _inner.region = 'US'"
+        );
+
+        // Line comments containing parens should not break depth tracking
+        assert_eq!(
+            qualify_where_for_inner_fallback("id in (select id -- )\nfrom t) AND region = 'US'"),
+            "_inner.id in (select id -- )\nfrom t) AND _inner.region = 'US'"
         );
     }
 
