@@ -3050,6 +3050,14 @@ fn qualify_where_for_inner_fallback(where_clause: &str) -> String {
             if interval_state == 1 {
                 interval_state = 2;
             }
+        } else if c == '(' {
+            // Check if this opens a subquery; if so, emit it verbatim
+            if let Some(subquery) = try_consume_subquery_parens(&mut chars) {
+                result.push_str(&subquery);
+            } else {
+                result.push(c);
+            }
+            previous_was_dot = false;
         } else {
             result.push(c);
             previous_was_dot = c == '.';
@@ -3128,6 +3136,13 @@ fn qualify_where_for_outer_fallback(where_clause: &str, outer_alias: &str) -> St
             if interval_state == 1 {
                 interval_state = 2;
             }
+        } else if c == '(' {
+            if let Some(subquery) = try_consume_subquery_parens(&mut chars) {
+                result.push_str(&subquery);
+            } else {
+                result.push(c);
+            }
+            previous_was_dot = false;
         } else {
             result.push(c);
             previous_was_dot = c == '.';
@@ -3387,6 +3402,13 @@ fn qualify_where_for_inner_with_dimensions(
             if interval_state == 1 {
                 interval_state = 2;
             }
+        } else if c == '(' {
+            if let Some(subquery) = try_consume_subquery_parens(&mut chars) {
+                result.push_str(&subquery);
+            } else {
+                result.push(c);
+            }
+            previous_was_dot = false;
         } else {
             result.push(c);
             previous_was_dot = c == '.';
@@ -3397,6 +3419,112 @@ fn qualify_where_for_inner_with_dimensions(
     }
 
     result
+}
+
+/// After encountering '(', check if it starts a subquery (SELECT/WITH).
+/// If so, consume everything up to and including the matching ')' from the
+/// original iterator and return the full subquery text including outer parens.
+/// If not a subquery, return None and leave the iterator unchanged.
+fn try_consume_subquery_parens(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<String> {
+    // Clone the iterator to peek ahead without consuming
+    let mut lookahead = chars.clone();
+
+    // Skip whitespace
+    while let Some(&c) = lookahead.peek() {
+        if c.is_whitespace() {
+            lookahead.next();
+        } else {
+            break;
+        }
+    }
+
+    // Collect first token (include digits so e.g. "select1" is not confused with "SELECT")
+    let mut first_token = String::new();
+    while let Some(&c) = lookahead.peek() {
+        if c.is_alphanumeric() || c == '_' {
+            first_token.push(c);
+            lookahead.next();
+        } else {
+            break;
+        }
+    }
+
+    // Only treat as subquery if it starts with SELECT or WITH
+    if !first_token.eq_ignore_ascii_case("SELECT") && !first_token.eq_ignore_ascii_case("WITH") {
+        return None;
+    }
+
+    // It's a subquery: consume everything from the original iterator until the
+    // matching closing paren. We already consumed the opening '(' before this
+    // function was called, so we start at depth 1.
+    let mut content = String::from("(");
+    let mut depth = 1;
+
+    while let Some(c) = chars.next() {
+        content.push(c);
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(content);
+                }
+            }
+            '\'' => {
+                // Handle single-quoted string literals
+                while let Some(next) = chars.next() {
+                    content.push(next);
+                    if next == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            content.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '"' => {
+                // Handle double-quoted identifiers (may contain parens)
+                while let Some(next) = chars.next() {
+                    content.push(next);
+                    if next == '"' {
+                        if chars.peek() == Some(&'"') {
+                            content.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                // Line comment: skip until end of line
+                content.push(chars.next().unwrap()); // consume second '-'
+                while let Some(next) = chars.next() {
+                    content.push(next);
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                // Block comment: skip until closing */
+                content.push(chars.next().unwrap()); // consume '*'
+                let mut prev = ' ';
+                while let Some(next) = chars.next() {
+                    content.push(next);
+                    if prev == '*' && next == '/' {
+                        break;
+                    }
+                    prev = next;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(content)
 }
 
 fn is_typed_literal_keyword(
@@ -7302,6 +7430,79 @@ GROUP BY s.year";
         assert_eq!(
             qualify_where_for_outer("col + interval '30' days > col2", "o"),
             "o.col + interval '30' days > o.col2"
+        );
+    }
+
+    #[test]
+    fn test_qualify_where_subquery_in_clause() {
+        // Subquery in WHERE clause should be passed through verbatim
+        assert_eq!(
+            qualify_where_for_inner_fallback("year in (select year from sales)"),
+            "_inner.year in (select year from sales)"
+        );
+
+        // WITH-based subquery
+        assert_eq!(
+            qualify_where_for_inner_fallback("year in (with cte as (select 2023) select * from cte)"),
+            "_inner.year in (with cte as (select 2023) select * from cte)"
+        );
+
+        // Subquery with whitespace before SELECT
+        assert_eq!(
+            qualify_where_for_inner_fallback("year in ( select year from sales )"),
+            "_inner.year in ( select year from sales )"
+        );
+
+        // Non-subquery parens should still qualify inner columns
+        assert_eq!(
+            qualify_where_for_inner_fallback("(year > 2020 AND region = 'US')"),
+            "(_inner.year > 2020 AND _inner.region = 'US')"
+        );
+
+        // outer fallback
+        assert_eq!(
+            qualify_where_for_outer_fallback("year in (select year from sales)", "_outer"),
+            "_outer.year in (select year from sales)"
+        );
+
+        // Mixed: regular conditions + subquery
+        assert_eq!(
+            qualify_where_for_inner_fallback("region = 'US' AND year in (select year from sales)"),
+            "_inner.region = 'US' AND _inner.year in (select year from sales)"
+        );
+
+        // Nested subquery
+        assert_eq!(
+            qualify_where_for_inner_fallback("id in (select id from t where x in (select x from t2))"),
+            "_inner.id in (select id from t where x in (select x from t2))"
+        );
+
+        // Identifiers starting with "select" or "with" should NOT be treated as subqueries
+        assert_eq!(
+            qualify_where_for_inner_fallback("(select1 > 0)"),
+            "(_inner.select1 > 0)"
+        );
+        assert_eq!(
+            qualify_where_for_inner_fallback("(with_flag = 1)"),
+            "(_inner.with_flag = 1)"
+        );
+
+        // Double-quoted identifiers containing parens should not break depth tracking
+        assert_eq!(
+            qualify_where_for_inner_fallback(r#"id in (select "a)" from t) AND region = 'US'"#),
+            r#"_inner.id in (select "a)" from t) AND _inner.region = 'US'"#
+        );
+
+        // Block comments containing parens should not break depth tracking
+        assert_eq!(
+            qualify_where_for_inner_fallback("id in (select id /* ) */ from t) AND region = 'US'"),
+            "_inner.id in (select id /* ) */ from t) AND _inner.region = 'US'"
+        );
+
+        // Line comments containing parens should not break depth tracking
+        assert_eq!(
+            qualify_where_for_inner_fallback("id in (select id -- )\nfrom t) AND region = 'US'"),
+            "_inner.id in (select id -- )\nfrom t) AND _inner.region = 'US'"
         );
     }
 
