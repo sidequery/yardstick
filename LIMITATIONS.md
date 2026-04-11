@@ -33,13 +33,13 @@ SELECT year,
 FROM t;
 
 -- Supported: direct query and AGGREGATE() without AT
-SEMANTIC SELECT year, AGGREGATE(running_total)
+SELECT year, AGGREGATE(running_total)
 FROM v
 GROUP BY year;
 
 -- Supported: AT modifiers when the evaluated window result is single-valued
-SEMANTIC SELECT AGGREGATE(running_total) AT (WHERE year = 2024) FROM v;
+SELECT AGGREGATE(running_total) AT (WHERE year = 2024) FROM v;
 
 -- Error: AT context produced multiple distinct window values
-SEMANTIC SELECT year, AGGREGATE(running_total) AT (ALL) FROM v GROUP BY year;
+SELECT year, AGGREGATE(running_total) AT (ALL) FROM v GROUP BY year;
 ```
