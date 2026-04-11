@@ -391,7 +391,7 @@ fn parse_simple_measure_ref(expr: &str) -> Option<(Option<String>, String)> {
                 }
                 i += 1;
             }
-            c if c.is_ascii_alphanumeric() || c == '_' || c == '.' => {
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c.is_ascii_whitespace() => {
                 i += 1;
             }
             _ => return None, // disallowed character outside quotes (commas, parens, etc.)
@@ -400,10 +400,10 @@ fn parse_simple_measure_ref(expr: &str) -> Option<(Option<String>, String)> {
 
     let parts: Vec<&str> = trimmed.split('.').collect();
     match parts.as_slice() {
-        [measure] => Some((None, normalize_identifier_name(measure))),
+        [measure] => Some((None, normalize_identifier_name(measure.trim()))),
         [qualifier, measure] => Some((
-            Some(normalize_identifier_name(qualifier)),
-            normalize_identifier_name(measure),
+            Some(normalize_identifier_name(qualifier.trim())),
+            normalize_identifier_name(measure.trim()),
         )),
         _ => None,
     }

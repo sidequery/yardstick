@@ -1871,3 +1871,27 @@ DROP VIEW quoted_v;
 
 statement ok
 DROP TABLE quoted_sales;
+
+# =============================================================================
+# Test: Spaced qualified refs like AGGREGATE(s . revenue)
+# =============================================================================
+
+query IR rowsort
+SELECT s.year, AGGREGATE(s.revenue) FROM sales_v s GROUP BY 1;
+----
+2022	150.0
+2023	225.0
+
+# Spaces around the dot
+query IR rowsort
+SELECT s . year, AGGREGATE(s . revenue) FROM sales_v s GROUP BY 1;
+----
+2022	150.0
+2023	225.0
+
+# Space only after dot
+query IR rowsort
+SELECT s.year, AGGREGATE(s. revenue) FROM sales_v s GROUP BY 1;
+----
+2022	150.0
+2023	225.0
