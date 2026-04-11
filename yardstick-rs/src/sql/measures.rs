@@ -2991,6 +2991,8 @@ fn qualify_where_for_inner_fallback(where_clause: &str) -> String {
     let mut chars = where_clause.chars().peekable();
     let mut previous_was_dot = false;
     let mut previous_was_as = false;
+    // Track interval state: 0=normal, 1=saw INTERVAL keyword, 2=saw INTERVAL + string literal
+    let mut interval_state: u8 = 0;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -3016,13 +3018,20 @@ fn qualify_where_for_inner_fallback(where_clause: &str) -> String {
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
             let is_type_context = previous_was_as;
             let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
+            let is_date_part = interval_state == 2 && is_interval_date_part_keyword(&ident);
 
-            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context && !is_date_part {
                 result.push_str("_inner.");
             }
             result.push_str(&ident);
             previous_was_dot = false;
             previous_was_as = ident.eq_ignore_ascii_case("AS");
+            // Update interval state
+            if ident.eq_ignore_ascii_case("INTERVAL") && is_typed_literal {
+                interval_state = 1;
+            } else {
+                interval_state = 0;
+            }
         } else if c == '\'' {
             // String literal - copy as-is until closing quote
             result.push(c);
@@ -3038,9 +3047,24 @@ fn qualify_where_for_inner_fallback(where_clause: &str) -> String {
                     }
                 }
             }
+            if interval_state == 1 {
+                interval_state = 2;
+            }
+        } else if c == '(' {
+            // Check if this opens a subquery; if so, emit it verbatim
+            if let Some(subquery) = try_consume_subquery_parens(&mut chars) {
+                result.push_str(&subquery);
+            } else {
+                result.push(c);
+            }
+            previous_was_dot = false;
         } else {
             result.push(c);
             previous_was_dot = c == '.';
+            // Non-whitespace after interval string means no date part follows
+            if interval_state == 2 && !c.is_whitespace() {
+                interval_state = 0;
+            }
         }
     }
 
@@ -3059,6 +3083,7 @@ fn qualify_where_for_outer_fallback(where_clause: &str, outer_alias: &str) -> St
     let mut chars = where_clause.chars().peekable();
     let mut previous_was_dot = false;
     let mut previous_was_as = false;
+    let mut interval_state: u8 = 0;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -3081,14 +3106,20 @@ fn qualify_where_for_outer_fallback(where_clause: &str, outer_alias: &str) -> St
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
             let is_type_context = previous_was_as;
             let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
+            let is_date_part = interval_state == 2 && is_interval_date_part_keyword(&ident);
 
-            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context && !is_date_part {
                 result.push_str(outer_alias);
                 result.push('.');
             }
             result.push_str(&ident);
             previous_was_dot = false;
             previous_was_as = ident.eq_ignore_ascii_case("AS");
+            if ident.eq_ignore_ascii_case("INTERVAL") && is_typed_literal {
+                interval_state = 1;
+            } else {
+                interval_state = 0;
+            }
         } else if c == '\'' {
             result.push(c);
             previous_was_dot = false;
@@ -3102,9 +3133,22 @@ fn qualify_where_for_outer_fallback(where_clause: &str, outer_alias: &str) -> St
                     }
                 }
             }
+            if interval_state == 1 {
+                interval_state = 2;
+            }
+        } else if c == '(' {
+            if let Some(subquery) = try_consume_subquery_parens(&mut chars) {
+                result.push_str(&subquery);
+            } else {
+                result.push(c);
+            }
+            previous_was_dot = false;
         } else {
             result.push(c);
             previous_was_dot = c == '.';
+            if interval_state == 2 && !c.is_whitespace() {
+                interval_state = 0;
+            }
         }
     }
 
@@ -3297,6 +3341,7 @@ fn qualify_where_for_inner_with_dimensions(
     let mut chars = where_clause.chars().peekable();
     let mut previous_was_dot = false;
     let mut previous_was_as = false;
+    let mut interval_state: u8 = 0;
 
     while let Some(c) = chars.next() {
         if c.is_alphabetic() || c == '_' {
@@ -3319,14 +3364,16 @@ fn qualify_where_for_inner_with_dimensions(
             let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
             let is_type_context = previous_was_as;
             let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
+            let is_date_part = interval_state == 2 && is_interval_date_part_keyword(&ident);
 
-            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context {
+            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context && !is_date_part {
                 let key = normalize_dimension_key(&ident);
                 if let Some(expr) = dimension_exprs.get(&key) {
                     let inner_expr = qualify_where_for_inner(expr);
                     result.push('(');
                     result.push_str(&inner_expr);
                     result.push(')');
+                    interval_state = 0;
                     continue;
                 }
                 result.push_str("_inner.");
@@ -3334,6 +3381,11 @@ fn qualify_where_for_inner_with_dimensions(
             result.push_str(&ident);
             previous_was_dot = false;
             previous_was_as = ident.eq_ignore_ascii_case("AS");
+            if ident.eq_ignore_ascii_case("INTERVAL") && is_typed_literal {
+                interval_state = 1;
+            } else {
+                interval_state = 0;
+            }
         } else if c == '\'' {
             result.push(c);
             previous_was_dot = false;
@@ -3347,13 +3399,132 @@ fn qualify_where_for_inner_with_dimensions(
                     }
                 }
             }
+            if interval_state == 1 {
+                interval_state = 2;
+            }
+        } else if c == '(' {
+            if let Some(subquery) = try_consume_subquery_parens(&mut chars) {
+                result.push_str(&subquery);
+            } else {
+                result.push(c);
+            }
+            previous_was_dot = false;
         } else {
             result.push(c);
             previous_was_dot = c == '.';
+            if interval_state == 2 && !c.is_whitespace() {
+                interval_state = 0;
+            }
         }
     }
 
     result
+}
+
+/// After encountering '(', check if it starts a subquery (SELECT/WITH).
+/// If so, consume everything up to and including the matching ')' from the
+/// original iterator and return the full subquery text including outer parens.
+/// If not a subquery, return None and leave the iterator unchanged.
+fn try_consume_subquery_parens(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<String> {
+    // Clone the iterator to peek ahead without consuming
+    let mut lookahead = chars.clone();
+
+    // Skip whitespace
+    while let Some(&c) = lookahead.peek() {
+        if c.is_whitespace() {
+            lookahead.next();
+        } else {
+            break;
+        }
+    }
+
+    // Collect first token (include digits so e.g. "select1" is not confused with "SELECT")
+    let mut first_token = String::new();
+    while let Some(&c) = lookahead.peek() {
+        if c.is_alphanumeric() || c == '_' {
+            first_token.push(c);
+            lookahead.next();
+        } else {
+            break;
+        }
+    }
+
+    // Only treat as subquery if it starts with SELECT or WITH
+    if !first_token.eq_ignore_ascii_case("SELECT") && !first_token.eq_ignore_ascii_case("WITH") {
+        return None;
+    }
+
+    // It's a subquery: consume everything from the original iterator until the
+    // matching closing paren. We already consumed the opening '(' before this
+    // function was called, so we start at depth 1.
+    let mut content = String::from("(");
+    let mut depth = 1;
+
+    while let Some(c) = chars.next() {
+        content.push(c);
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(content);
+                }
+            }
+            '\'' => {
+                // Handle single-quoted string literals
+                while let Some(next) = chars.next() {
+                    content.push(next);
+                    if next == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            content.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '"' => {
+                // Handle double-quoted identifiers (may contain parens)
+                while let Some(next) = chars.next() {
+                    content.push(next);
+                    if next == '"' {
+                        if chars.peek() == Some(&'"') {
+                            content.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                // Line comment: skip until end of line
+                content.push(chars.next().unwrap()); // consume second '-'
+                while let Some(next) = chars.next() {
+                    content.push(next);
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                // Block comment: skip until closing */
+                content.push(chars.next().unwrap()); // consume '*'
+                let mut prev = ' ';
+                while let Some(next) = chars.next() {
+                    content.push(next);
+                    if prev == '*' && next == '/' {
+                        break;
+                    }
+                    prev = next;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(content)
 }
 
 fn is_typed_literal_keyword(
@@ -3379,6 +3550,19 @@ fn is_typed_literal_keyword(
     }
 
     matches!(lookahead.peek(), Some(&'\''))
+}
+
+/// Check if an identifier is an interval date-part keyword (e.g. DAYS, MONTHS, YEARS).
+/// These follow the SQL-standard INTERVAL '<value>' <datepart> syntax and should not
+/// be qualified as column references when they appear after an interval literal.
+fn is_interval_date_part_keyword(ident: &str) -> bool {
+    let parts = [
+        "DAY", "DAYS", "HOUR", "HOURS", "MINUTE", "MINUTES",
+        "SECOND", "SECONDS", "MONTH", "MONTHS", "YEAR", "YEARS",
+        "WEEK", "WEEKS", "MICROSECOND", "MICROSECONDS",
+        "MILLISECOND", "MILLISECONDS",
+    ];
+    parts.iter().any(|p| p.eq_ignore_ascii_case(ident))
 }
 
 // =============================================================================
@@ -3930,6 +4114,123 @@ fn base_relation_for_subquery(base_relation_sql: &str) -> String {
     format!("({trimmed})")
 }
 
+/// Check if a dimension string is an expression (not a simple column reference).
+/// Expressions contain function calls, operators, or CASE expressions.
+fn is_expression_dim(dim: &str) -> bool {
+    let trimmed = dim.trim();
+    let upper = trimmed.to_uppercase();
+    trimmed.contains('(')
+        || trimmed.contains("||")
+        || trimmed.contains(" + ")
+        || trimmed.contains(" - ")
+        || trimmed.contains(" * ")
+        || trimmed.contains(" / ")
+        || upper.starts_with("CASE ")
+        || upper.contains(" CASE ")
+}
+
+/// Strip a specific table qualifier from column references in an expression so
+/// it can be re-qualified with `_inner` or an outer alias.
+/// Only removes `table_name.column` prefixes where the target is a plain column;
+/// schema-qualified function calls (`s.bucket(ts)`) and struct field
+/// dereferences are preserved even when the qualifier matches `table_name`.
+fn strip_table_qualifier(expr: &str, table_name: &str) -> String {
+    let mut result = String::new();
+    let mut chars = expr.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            // Single-quoted string literal: copy verbatim
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if c == '"' || c.is_alphabetic() || c == '_' {
+            // Collect identifier (possibly double-quoted)
+            let is_quoted = c == '"';
+            let mut ident_raw = String::from(c); // full text including quotes
+            let ident_name; // unquoted name for comparison
+            if is_quoted {
+                while let Some(next) = chars.next() {
+                    ident_raw.push(next);
+                    if next == '"' {
+                        break;
+                    }
+                }
+                ident_name = ident_raw[1..ident_raw.len().saturating_sub(1).max(1)].to_string();
+            } else {
+                while let Some(&next) = chars.peek() {
+                    if next.is_alphanumeric() || next == '_' {
+                        ident_raw.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                ident_name = ident_raw.clone();
+            }
+            if chars.peek() == Some(&'.') && ident_name.eq_ignore_ascii_case(table_name) {
+                // Peek past the dot to see what follows. If the next token
+                // is a function call (identifier immediately followed by '('),
+                // this is a schema-qualified function, not a table.column
+                // reference, so preserve the qualifier.
+                chars.next(); // consume the dot
+                // Collect the next identifier (if any) to check for '('
+                let mut next_ident = String::new();
+                if chars.peek() == Some(&'"') {
+                    next_ident.push(chars.next().unwrap());
+                    while let Some(next) = chars.next() {
+                        next_ident.push(next);
+                        if next == '"' { break; }
+                    }
+                } else {
+                    while let Some(&next) = chars.peek() {
+                        if next.is_alphanumeric() || next == '_' {
+                            next_ident.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                // Skip whitespace before checking for '(' so that
+                // `s.bucket (ts)` is recognized as a function call.
+                let mut ws_after = String::new();
+                while let Some(&next) = chars.peek() {
+                    if next == ' ' || next == '\t' || next == '\n' || next == '\r' {
+                        ws_after.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                let is_function_call = chars.peek() == Some(&'(');
+                if is_function_call {
+                    // Schema-qualified function: restore qualifier.dot.name(ws)
+                    result.push_str(&ident_raw);
+                    result.push('.');
+                    result.push_str(&next_ident);
+                    result.push_str(&ws_after);
+                } else {
+                    // Table-qualified column: drop qualifier, keep column
+                    result.push_str(&next_ident);
+                    result.push_str(&ws_after);
+                }
+            } else {
+                result.push_str(&ident_raw);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 fn correlation_exprs_for_dim(
     dim: &str,
     dimension_exprs: &HashMap<String, String>,
@@ -3951,10 +4252,16 @@ fn correlation_exprs_for_dim(
         return (inner_expr, outer_expr);
     }
 
-    if dim_trim.contains('(') {
-        let inner_expr = qualify_where_for_inner(dim_trim);
+    // Expression dimensions (function calls, operators, CASE): strip the source
+    // table qualifier so inner/outer qualification works, then wrap the outer side
+    // in ANY_VALUE so DuckDB accepts it in grouped context. Only the known table
+    // name is stripped; schema qualifiers and struct field access are preserved.
+    if is_expression_dim(dim_trim) {
+        let table_to_strip = outer_alias.unwrap_or("");
+        let unqualified = strip_table_qualifier(dim_trim, table_to_strip);
+        let inner_expr = qualify_where_for_inner(&unqualified);
         let outer_expr = outer_alias
-            .map(|alias| format!("ANY_VALUE({})", qualify_where_for_outer(dim_trim, alias)))
+            .map(|alias| format!("ANY_VALUE({})", qualify_where_for_outer(&unqualified, alias)))
             .unwrap_or_else(|| dim_trim.to_string());
         return (inner_expr, outer_expr);
     }
@@ -5429,7 +5736,6 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     };
 
     let has_expression_dimensions = original_dim_cols.iter().any(|col| col.contains('('));
-
     // Check if query needs an explicit outer alias for correlation handling.
     let needs_outer_alias = has_expression_dimensions
         || at_patterns.iter().any(|(_, modifiers, _, _)| {
@@ -7390,6 +7696,34 @@ GROUP BY s.year";
             qualify_where_for_inner("duration > interval '1 day'"),
             "_inner.duration > interval '1 day'"
         );
+
+        // Interval with date part OUTSIDE the string literal (SQL standard syntax)
+        assert_eq!(
+            qualify_where_for_inner("col > interval '30' days"),
+            "_inner.col > interval '30' days"
+        );
+        assert_eq!(
+            qualify_where_for_inner("make_date(year,1,1) between '2023-01-01' and '2023-01-01' + interval '30' days"),
+            "make_date(_inner.year,1,1) between '2023-01-01' and '2023-01-01' + interval '30' days"
+        );
+        // Various date parts
+        assert_eq!(
+            qualify_where_for_inner("col + interval '2' hours"),
+            "_inner.col + interval '2' hours"
+        );
+        assert_eq!(
+            qualify_where_for_inner("col + interval '1' year"),
+            "_inner.col + interval '1' year"
+        );
+        assert_eq!(
+            qualify_where_for_inner("col + interval '6' months"),
+            "_inner.col + interval '6' months"
+        );
+        // year as column name should still be qualified
+        assert_eq!(
+            qualify_where_for_inner("year > 2020 AND col + interval '1' year < col2"),
+            "_inner.year > 2020 AND _inner.col + interval '1' year < _inner.col2"
+        );
     }
 
     #[test]
@@ -7405,6 +7739,84 @@ GROUP BY s.year";
         assert_eq!(
             qualify_where_for_outer("cast(order_date as date) = date '2023-01-01'", "o"),
             "cast(o.order_date as date) = date '2023-01-01'"
+        );
+        // Interval with date part outside string literal
+        assert_eq!(
+            qualify_where_for_outer("col + interval '30' days > col2", "o"),
+            "o.col + interval '30' days > o.col2"
+        );
+    }
+
+    #[test]
+    fn test_qualify_where_subquery_in_clause() {
+        // Subquery in WHERE clause should be passed through verbatim
+        assert_eq!(
+            qualify_where_for_inner_fallback("year in (select year from sales)"),
+            "_inner.year in (select year from sales)"
+        );
+
+        // WITH-based subquery
+        assert_eq!(
+            qualify_where_for_inner_fallback("year in (with cte as (select 2023) select * from cte)"),
+            "_inner.year in (with cte as (select 2023) select * from cte)"
+        );
+
+        // Subquery with whitespace before SELECT
+        assert_eq!(
+            qualify_where_for_inner_fallback("year in ( select year from sales )"),
+            "_inner.year in ( select year from sales )"
+        );
+
+        // Non-subquery parens should still qualify inner columns
+        assert_eq!(
+            qualify_where_for_inner_fallback("(year > 2020 AND region = 'US')"),
+            "(_inner.year > 2020 AND _inner.region = 'US')"
+        );
+
+        // outer fallback
+        assert_eq!(
+            qualify_where_for_outer_fallback("year in (select year from sales)", "_outer"),
+            "_outer.year in (select year from sales)"
+        );
+
+        // Mixed: regular conditions + subquery
+        assert_eq!(
+            qualify_where_for_inner_fallback("region = 'US' AND year in (select year from sales)"),
+            "_inner.region = 'US' AND _inner.year in (select year from sales)"
+        );
+
+        // Nested subquery
+        assert_eq!(
+            qualify_where_for_inner_fallback("id in (select id from t where x in (select x from t2))"),
+            "_inner.id in (select id from t where x in (select x from t2))"
+        );
+
+        // Identifiers starting with "select" or "with" should NOT be treated as subqueries
+        assert_eq!(
+            qualify_where_for_inner_fallback("(select1 > 0)"),
+            "(_inner.select1 > 0)"
+        );
+        assert_eq!(
+            qualify_where_for_inner_fallback("(with_flag = 1)"),
+            "(_inner.with_flag = 1)"
+        );
+
+        // Double-quoted identifiers containing parens should not break depth tracking
+        assert_eq!(
+            qualify_where_for_inner_fallback(r#"id in (select "a)" from t) AND region = 'US'"#),
+            r#"_inner.id in (select "a)" from t) AND _inner.region = 'US'"#
+        );
+
+        // Block comments containing parens should not break depth tracking
+        assert_eq!(
+            qualify_where_for_inner_fallback("id in (select id /* ) */ from t) AND region = 'US'"),
+            "_inner.id in (select id /* ) */ from t) AND _inner.region = 'US'"
+        );
+
+        // Line comments containing parens should not break depth tracking
+        assert_eq!(
+            qualify_where_for_inner_fallback("id in (select id -- )\nfrom t) AND region = 'US'"),
+            "_inner.id in (select id -- )\nfrom t) AND _inner.region = 'US'"
         );
     }
 
@@ -7781,5 +8193,91 @@ GROUP BY s.year";
         let item = " (SELECT 1) || '\u{00e9}' AS year_total";
         let alias = subquery_alias_from_item(item);
         assert_eq!(alias, Some("year_total".to_string()));
+    }
+
+    #[test]
+    fn test_is_expression_dim() {
+        // Simple column references
+        assert!(!is_expression_dim("region"));
+        assert!(!is_expression_dim("t.region"));
+        assert!(!is_expression_dim("year"));
+        // Expression dimensions
+        assert!(is_expression_dim("region || 'foo'"));
+        assert!(is_expression_dim("amount + 1"));
+        assert!(is_expression_dim("price * quantity"));
+        assert!(is_expression_dim("a - b"));
+        assert!(is_expression_dim("x / y"));
+        assert!(is_expression_dim("MONTH(date)"));
+        assert!(is_expression_dim("CASE WHEN x = 1 THEN 'a' ELSE 'b' END"));
+    }
+
+    #[test]
+    fn test_strip_table_qualifier() {
+        // Strips the specified table qualifier from columns
+        assert_eq!(strip_table_qualifier("sales_v.region || 'foo'", "sales_v"), "region || 'foo'");
+        assert_eq!(strip_table_qualifier("t.year + 1", "t"), "year + 1");
+        // No-op when no qualifier or doesn't match
+        assert_eq!(strip_table_qualifier("region || 'foo'", "sales_v"), "region || 'foo'");
+        assert_eq!(strip_table_qualifier("year", "t"), "year");
+        // String literals with dots are preserved
+        assert_eq!(strip_table_qualifier("region || 'a.b'", "sales_v"), "region || 'a.b'");
+        // Preserves non-matching qualifiers (schema-qualified, struct field access)
+        assert_eq!(strip_table_qualifier("my_schema.bucket(ts)", "sales_v"), "my_schema.bucket(ts)");
+        assert_eq!(strip_table_qualifier("payload.city || 'x'", "sales_v"), "payload.city || 'x'");
+        // Case insensitive match
+        assert_eq!(strip_table_qualifier("Sales_V.region || 'foo'", "sales_v"), "region || 'foo'");
+        // Preserves schema-qualified function even when qualifier matches table name
+        assert_eq!(strip_table_qualifier("s.bucket(ts)", "s"), "s.bucket(ts)");
+        assert_eq!(strip_table_qualifier("s.year + s.bucket(ts)", "s"), "year + s.bucket(ts)");
+        // Preserves schema-qualified function with space before paren
+        assert_eq!(strip_table_qualifier("s.bucket (ts)", "s"), "s.bucket (ts)");
+        // Quoted table qualifiers
+        assert_eq!(strip_table_qualifier(r#""s".region || 'foo'"#, "s"), "region || 'foo'");
+        assert_eq!(strip_table_qualifier(r#""Sales_V".region || 'x'"#, "sales_v"), "region || 'x'");
+        // Quoted column after qualifier
+        assert_eq!(strip_table_qualifier(r#"s."Region" || 'x'"#, "s"), r#""Region" || 'x'"#);
+    }
+
+    #[test]
+    #[serial]
+    fn test_expression_dimension_correlation() {
+        // Test that expression dimensions (e.g., region || 'foo') generate valid
+        // correlation using ANY_VALUE on the outer side (issue #29)
+        clear_measure_views();
+        store_measure_view(
+            "sales_v",
+            vec![ViewMeasure {
+                column_name: "revenue".to_string(),
+                expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
+            }],
+            "SELECT year, region, SUM(amount) AS revenue FROM sales GROUP BY ALL",
+            Some("sales".to_string()),
+        );
+
+        let sql = "SELECT region || 'foo' as regionfoo, AGGREGATE(revenue) FROM sales_v";
+        let result = expand_aggregate_with_at(sql);
+
+        eprintln!("Expanded SQL: {}", result.expanded_sql);
+        assert!(result.had_aggregate);
+        assert!(result.error.is_none());
+        // Should use ANY_VALUE for the outer expression reference
+        assert!(
+            result.expanded_sql.contains("ANY_VALUE("),
+            "Expected ANY_VALUE wrapper for expression dimension, got: {}",
+            result.expanded_sql
+        );
+        // Should have _outer alias since expression dimension needs correlation
+        assert!(
+            result.expanded_sql.contains("_outer"),
+            "Expected _outer alias for expression dimension, got: {}",
+            result.expanded_sql
+        );
+        // Should NOT produce bare table.column references that fail GROUP BY
+        assert!(
+            !result.expanded_sql.contains("sales_v.region ||"),
+            "Should not have unqualified sales_v.region in expression, got: {}",
+            result.expanded_sql
+        );
     }
 }
