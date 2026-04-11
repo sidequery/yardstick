@@ -7464,6 +7464,12 @@ GROUP BY s.year";
             qualify_where_for_inner_fallback("(with_flag = 1)"),
             "(_inner.with_flag = 1)"
         );
+
+        // Double-quoted identifiers containing parens should not break depth tracking
+        assert_eq!(
+            qualify_where_for_inner_fallback(r#"id in (select "a)" from t) AND region = 'US'"#),
+            r#"_inner.id in (select "a)" from t) AND _inner.region = 'US'"#
+        );
     }
 
     // =========================================================================
