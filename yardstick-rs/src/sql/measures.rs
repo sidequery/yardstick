@@ -4014,15 +4014,27 @@ fn strip_table_qualifier(expr: &str, table_name: &str) -> String {
                         }
                     }
                 }
+                // Skip whitespace before checking for '(' so that
+                // `s.bucket (ts)` is recognized as a function call.
+                let mut ws_after = String::new();
+                while let Some(&next) = chars.peek() {
+                    if next == ' ' || next == '\t' || next == '\n' || next == '\r' {
+                        ws_after.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
                 let is_function_call = chars.peek() == Some(&'(');
                 if is_function_call {
-                    // Schema-qualified function: restore qualifier.dot.name
+                    // Schema-qualified function: restore qualifier.dot.name(ws)
                     result.push_str(&ident_raw);
                     result.push('.');
                     result.push_str(&next_ident);
+                    result.push_str(&ws_after);
                 } else {
                     // Table-qualified column: drop qualifier, keep column
                     result.push_str(&next_ident);
+                    result.push_str(&ws_after);
                 }
             } else {
                 result.push_str(&ident_raw);
@@ -7684,6 +7696,8 @@ GROUP BY s.year";
         // Preserves schema-qualified function even when qualifier matches table name
         assert_eq!(strip_table_qualifier("s.bucket(ts)", "s"), "s.bucket(ts)");
         assert_eq!(strip_table_qualifier("s.year + s.bucket(ts)", "s"), "year + s.bucket(ts)");
+        // Preserves schema-qualified function with space before paren
+        assert_eq!(strip_table_qualifier("s.bucket (ts)", "s"), "s.bucket (ts)");
         // Quoted table qualifiers
         assert_eq!(strip_table_qualifier(r#""s".region || 'foo'"#, "s"), "region || 'foo'");
         assert_eq!(strip_table_qualifier(r#""Sales_V".region || 'x'"#, "sales_v"), "region || 'x'");
