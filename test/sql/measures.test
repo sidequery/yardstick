@@ -946,6 +946,443 @@ FROM fact_orders_v o JOIN fact_returns_v r ON o.year = r.year AND o.region = r.r
 2023	US	150.0	225.0
 
 # =============================================================================
+# Test: Join fan-out prevention (§3.6, §5.3)
+# =============================================================================
+# Measures evaluate via correlated scalar subquery against their defining table,
+# so a one-to-many join should NOT inflate measure values via row duplication.
+
+# -- Setup: customers (1 side) and orders (N side) --
+
+statement ok
+CREATE TABLE fanout_customers (cust_id INT, name TEXT, age INT);
+
+statement ok
+INSERT INTO fanout_customers VALUES
+    (1, 'Alice', 30),
+    (2, 'Bob', 25),
+    (3, 'Carol', 40);
+
+statement ok
+CREATE TABLE fanout_orders (order_id INT, cust_id INT, product TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO fanout_orders VALUES
+    (101, 1, 'Widget', 100),
+    (102, 1, 'Gadget', 200),
+    (103, 1, 'Doohickey', 50),
+    (104, 2, 'Widget', 75),
+    (105, 3, 'Gadget', 300),
+    (106, 3, 'Widget', 150);
+
+statement ok
+CREATE VIEW fanout_customers_v AS
+SELECT *, AVG(age) AS MEASURE avg_cust_age, SUM(age) AS MEASURE sum_age, COUNT(age) AS MEASURE cust_count
+FROM fanout_customers;
+
+# -- Test 1: AVG measure immune to one-to-many fan-out --
+# Alice has 3 orders, Bob 1, Carol 2. Without fan-out prevention, AVG(age)
+# would weight Alice 3x and Carol 2x: (30*3+25+40*2)/6 = 32.5 (WRONG).
+# Correct: (30+25+40)/3 = 31.666...
+
+query R
+SEMANTIC SELECT AGGREGATE(avg_cust_age)
+FROM fanout_customers_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+31.666666666666668
+
+# -- Test 2: SUM measure immune to fan-out --
+# sum_age should be 30+25+40=95, not 30*3+25+40*2=195
+
+query R
+SEMANTIC SELECT AGGREGATE(sum_age)
+FROM fanout_customers_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+95.0
+
+# -- Test 3: COUNT measure immune to fan-out --
+# cust_count should be 3, not 6
+
+query I
+SEMANTIC SELECT AGGREGATE(cust_count)
+FROM fanout_customers_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+3
+
+# -- Test 4: grouped join with multiple customers per group --
+# Group by tier so each group has >1 customer with different order counts.
+# Gold: Alice(30, 3 orders) + Bob(25, 1 order). Correct AVG = 27.5.
+# Fan-out would weight Alice 3x: (30*3+25)/4 = 28.75 (WRONG).
+# Silver: Carol(40, 2 orders) alone. AVG = 40 either way.
+
+statement ok
+CREATE TABLE fanout_tiered_custs (cust_id INT, tier TEXT, age INT);
+
+statement ok
+INSERT INTO fanout_tiered_custs VALUES
+    (1, 'gold', 30),
+    (2, 'gold', 25),
+    (3, 'silver', 40);
+
+statement ok
+CREATE VIEW fanout_tiered_custs_v AS
+SELECT *, AVG(age) AS MEASURE avg_tier_age
+FROM fanout_tiered_custs;
+
+query TIR rowsort
+SEMANTIC SELECT t.tier, COUNT(*) AS order_rows, AGGREGATE(avg_tier_age)
+FROM fanout_tiered_custs_v t
+JOIN fanout_orders o ON t.cust_id = o.cust_id
+GROUP BY t.tier;
+----
+gold	4	27.5
+silver	2	40.0
+
+# -- Test 5: WHERE filter with fan-out join --
+
+query RI
+SEMANTIC SELECT AGGREGATE(avg_cust_age), AGGREGATE(cust_count)
+FROM fanout_customers_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id
+WHERE c.name = 'Alice';
+----
+30.0	1
+
+# -- Test 6: LEFT JOIN with unmatched rows --
+# Add a customer with no orders. Measure should still count all customers.
+
+statement ok
+INSERT INTO fanout_customers VALUES (4, 'Dave', 35);
+
+query IR
+SEMANTIC SELECT AGGREGATE(cust_count), AGGREGATE(avg_cust_age)
+FROM fanout_customers_v c
+LEFT JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+4	32.5
+
+# -- Test 7: many-to-many fan-out through bridge table --
+# Alice: 2 tags * 3 orders = 6 joined rows
+# Bob:   1 tag  * 1 order  = 1 joined row
+# Carol: 1 tag  * 2 orders = 2 joined rows
+# Total: 9 joined rows, but cust_count measure must still be 4.
+
+statement ok
+CREATE TABLE fanout_cust_tags (cust_id INT, tag_id INT);
+
+statement ok
+INSERT INTO fanout_cust_tags VALUES
+    (1, 1), (1, 2),
+    (2, 2),
+    (3, 1);
+
+query I
+SEMANTIC SELECT AGGREGATE(cust_count)
+FROM fanout_customers_v c
+JOIN fanout_cust_tags ct ON c.cust_id = ct.cust_id
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+4
+
+# -- Test 8: MIN/MAX measures immune to fan-out --
+# Add a customer with the global min age who has no orders.
+# If the measure incorrectly evaluates over joined rows only, MIN changes.
+
+statement ok
+CREATE TABLE fanout_minmax_people (id INT, age INT);
+
+statement ok
+INSERT INTO fanout_minmax_people VALUES (1, 30), (2, 25), (3, 35), (4, 15), (5, 50);
+
+statement ok
+CREATE TABLE fanout_minmax_tasks (id INT, task TEXT);
+
+statement ok
+INSERT INTO fanout_minmax_tasks VALUES (1, 'A'), (2, 'B'), (3, 'C');
+
+statement ok
+CREATE VIEW fanout_minmax_v AS
+SELECT *, MIN(age) AS MEASURE youngest, MAX(age) AS MEASURE oldest
+FROM fanout_minmax_people;
+
+# Correct: MIN=15 (id=4, unmatched), MAX=50 (id=5, unmatched)
+# Joined-only (wrong): MIN=25, MAX=35
+
+query II
+SEMANTIC SELECT AGGREGATE(youngest), AGGREGATE(oldest)
+FROM fanout_minmax_v p
+JOIN fanout_minmax_tasks t ON p.id = t.id;
+----
+15	50
+
+# -- Test 9: non-additive (ratio) measure immune to fan-out --
+# A ratio measure cannot be re-aggregated by summing. The measure must
+# evaluate the formula against the defining table, not the fanned-out rows.
+
+statement ok
+CREATE TABLE fanout_products (product TEXT, revenue DOUBLE, cost DOUBLE);
+
+statement ok
+INSERT INTO fanout_products VALUES
+    ('Widget', 500, 200),
+    ('Gadget', 300, 150),
+    ('Doohickey', 100, 80);
+
+statement ok
+CREATE VIEW fanout_products_v AS
+SELECT *, (SUM(revenue) - SUM(cost)) / SUM(revenue) AS MEASURE profit_margin
+FROM fanout_products;
+
+# Overall profit margin: (500+300+100 - 200+150+80) / (500+300+100) = 470/900 = 0.5222...
+
+statement ok
+CREATE TABLE fanout_product_regions (product TEXT, region TEXT);
+
+statement ok
+INSERT INTO fanout_product_regions VALUES
+    ('Widget', 'US'), ('Widget', 'EU'),
+    ('Gadget', 'US'),
+    ('Doohickey', 'EU');
+
+# Widget appears in 2 regions -> 2 joined rows, but profit_margin must not double-count.
+
+query R
+SEMANTIC SELECT AGGREGATE(profit_margin)
+FROM fanout_products_v p
+JOIN fanout_product_regions pr ON p.product = pr.product;
+----
+0.5222222222222223
+
+# -- Test 10: COUNT DISTINCT measure immune to fan-out --
+# Add an order with a unique product from a customer not in the join target.
+# If the measure evaluates over joined rows only, that product is lost.
+
+statement ok
+CREATE TABLE fanout_cd_orders (order_id INT, cust_id INT, product TEXT);
+
+statement ok
+INSERT INTO fanout_cd_orders VALUES
+    (1, 1, 'Widget'), (2, 1, 'Gadget'),
+    (3, 2, 'Widget'),
+    (4, 99, 'Thingamajig');
+
+statement ok
+CREATE TABLE fanout_cd_custs (cust_id INT, name TEXT);
+
+statement ok
+INSERT INTO fanout_cd_custs VALUES (1, 'Alice'), (1, 'Alice2'), (2, 'Bob');
+
+statement ok
+CREATE VIEW fanout_cd_orders_v AS
+SELECT *, COUNT(DISTINCT product) AS MEASURE distinct_products
+FROM fanout_cd_orders;
+
+# Correct: 3 distinct products (Widget, Gadget, Thingamajig)
+# Joined-only (wrong): 2 (Widget, Gadget -- cust_id=99 has no match)
+
+query I
+SEMANTIC SELECT AGGREGATE(distinct_products)
+FROM fanout_cd_orders_v o
+JOIN fanout_cd_custs c ON o.cust_id = c.cust_id;
+----
+3
+
+# -- Test 11: STDDEV_SAMP measure immune to fan-out --
+# Fanned-out stddev of (30,30,30,25,40,40) = 6.1237
+# Correct stddev of (25,30,35,40) = 6.4550 (includes Dave)
+
+statement ok
+CREATE VIEW fanout_customers_stats_v AS
+SELECT *,
+    STDDEV_SAMP(age) AS MEASURE age_stddev,
+    VARIANCE(age) AS MEASURE age_variance
+FROM fanout_customers;
+
+query RR
+SEMANTIC SELECT AGGREGATE(age_stddev), AGGREGATE(age_variance)
+FROM fanout_customers_stats_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+6.454972243679028	41.666666666666664
+
+# -- Test 12: MEDIAN measure immune to fan-out --
+# Fanned-out median of (25,30,30,30,40,40) = 30.0
+# Correct median of (25,30,35,40) = 32.5 (includes Dave)
+
+statement ok
+CREATE VIEW fanout_customers_median_v AS
+SELECT *, MEDIAN(age) AS MEASURE median_age
+FROM fanout_customers;
+
+query R
+SEMANTIC SELECT AGGREGATE(median_age)
+FROM fanout_customers_median_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+32.5
+
+# -- Test 13: STRING_AGG measure immune to fan-out --
+# Fanned-out: Alice,Alice,Alice,Bob,Carol,Carol
+# Correct: Alice,Bob,Carol,Dave
+
+statement ok
+CREATE VIEW fanout_customers_str_v AS
+SELECT *, STRING_AGG(name, ',' ORDER BY name) AS MEASURE all_names
+FROM fanout_customers;
+
+query T
+SEMANTIC SELECT AGGREGATE(all_names)
+FROM fanout_customers_str_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+Alice,Bob,Carol,Dave
+
+# -- Test 14: MODE measure immune to fan-out --
+# Base data: (10, 20, 20, 30) -> mode=20 (20 appears twice)
+# id=1 (age=10) has 3 orders, so fan-out produces (10,10,10,20,20,30) -> mode=10
+# Correct answer is 20; a fan-out bug would return 10.
+
+statement ok
+CREATE TABLE fanout_mode_data (id INT, age INT);
+
+statement ok
+INSERT INTO fanout_mode_data VALUES (1, 10), (2, 20), (3, 20), (4, 30);
+
+statement ok
+CREATE TABLE fanout_mode_orders (id INT, order_id INT);
+
+statement ok
+INSERT INTO fanout_mode_orders VALUES (1, 1), (1, 2), (1, 3), (2, 4), (3, 5), (4, 6);
+
+statement ok
+CREATE VIEW fanout_mode_v AS
+SELECT *, MODE(age) AS MEASURE mode_age
+FROM fanout_mode_data;
+
+query I
+SEMANTIC SELECT AGGREGATE(mode_age)
+FROM fanout_mode_v a
+JOIN fanout_mode_orders ao ON a.id = ao.id;
+----
+20
+
+# -- Test 15: PRODUCT measure immune to fan-out --
+# Fanned-out product of (30^3 * 25 * 40^2) = 1,080,000,000
+# Correct product of (25 * 30 * 35 * 40) = 1,050,000
+
+statement ok
+CREATE VIEW fanout_customers_prod_v AS
+SELECT *, PRODUCT(age) AS MEASURE age_product
+FROM fanout_customers;
+
+query R
+SEMANTIC SELECT AGGREGATE(age_product)
+FROM fanout_customers_prod_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+1050000.0
+
+# -- Test 16: BIT_XOR measure immune to fan-out --
+# XOR is its own inverse: duplicates cancel. Fanned-out = 7, correct = 12.
+
+statement ok
+CREATE VIEW fanout_customers_xor_v AS
+SELECT *, BIT_XOR(age) AS MEASURE age_xor
+FROM fanout_customers;
+
+query I
+SEMANTIC SELECT AGGREGATE(age_xor)
+FROM fanout_customers_xor_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+12
+
+# -- Test 17: KURTOSIS and SKEWNESS measures immune to fan-out --
+# Correct: kurtosis=-1.2, skewness=0.0 (symmetric uniform-like)
+# Fanned-out: kurtosis=-1.47, skewness=0.49 (right-skewed by Alice duplication)
+
+statement ok
+CREATE VIEW fanout_customers_moments_v AS
+SELECT *,
+    KURTOSIS(age) AS MEASURE age_kurtosis,
+    SKEWNESS(age) AS MEASURE age_skewness
+FROM fanout_customers;
+
+query RR
+SEMANTIC SELECT AGGREGATE(age_kurtosis), AGGREGATE(age_skewness)
+FROM fanout_customers_moments_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+-1.200000000000001	0.0
+
+# -- Test 18: ENTROPY measure immune to fan-out --
+# Correct: 2.0 (4 distinct values, uniform)
+# Fanned-out: 1.46 (duplicates reduce entropy)
+
+statement ok
+CREATE VIEW fanout_customers_entropy_v AS
+SELECT *, ENTROPY(age) AS MEASURE age_entropy
+FROM fanout_customers;
+
+query R
+SEMANTIC SELECT AGGREGATE(age_entropy)
+FROM fanout_customers_entropy_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+2.0
+
+# -- Test 19: LIST measure immune to fan-out --
+# Fanned-out: [25,30,30,30,40,40]
+# Correct: [25,30,35,40]
+
+statement ok
+CREATE VIEW fanout_customers_list_v AS
+SELECT *, LIST(age ORDER BY age) AS MEASURE age_list
+FROM fanout_customers;
+
+query T
+SEMANTIC SELECT AGGREGATE(age_list)
+FROM fanout_customers_list_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+[25, 30, 35, 40]
+
+# -- Test 20: BOOL_AND / BOOL_OR measures immune to fan-out --
+# Dave (cust_id=4) has no orders, so the join excludes him.
+# He is the only non-premium and the only trial user. Without fan-out
+# prevention (evaluating only joined rows), BOOL_AND would flip to true
+# and BOOL_OR would flip to false.
+
+statement ok
+CREATE TABLE fanout_flags (cust_id INT, is_premium BOOLEAN, is_trial BOOLEAN);
+
+statement ok
+INSERT INTO fanout_flags VALUES
+    (1, true, false),
+    (2, true, false),
+    (3, true, false),
+    (4, false, true);
+
+statement ok
+CREATE VIEW fanout_flags_v AS
+SELECT *,
+    BOOL_AND(is_premium) AS MEASURE all_premium,
+    BOOL_OR(is_trial) AS MEASURE any_trial
+FROM fanout_flags;
+
+# Correct (all 4 rows): all_premium = false (Dave), any_trial = true (Dave)
+# Fanned-out (only joined 3): all_premium = true (WRONG), any_trial = false (WRONG)
+
+query TT
+SEMANTIC SELECT AGGREGATE(all_premium), AGGREGATE(any_trial)
+FROM fanout_flags_v f
+JOIN fanout_orders o ON f.cust_id = o.cust_id;
+----
+false	true
+
+# =============================================================================
 # Test: JOIN with extra dimension from second table
 # =============================================================================
 
