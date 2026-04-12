@@ -5716,13 +5716,15 @@ fn subquery_alias_from_item(item: &str) -> Option<String> {
 }
 
 /// Check if an identifier appears as a whole word in text (case-insensitive),
-/// skipping string literals and comments. Matches at any parenthesis depth
-/// so that `COALESCE(year_total, 0)` still triggers wrapping.
+/// skipping string literals, comments, and nested subqueries.
+/// Matches inside regular function calls (e.g. `COALESCE(year_total, 0)`)
+/// but not inside `(SELECT ...)` subquery scopes.
 fn identifier_appears_in(text: &str, ident: &str) -> bool {
     let stripped = strip_literals_and_comments(text);
-    let stripped_upper = stripped.to_uppercase();
+    let cleaned = strip_nested_subqueries(&stripped);
+    let stripped_upper = cleaned.to_uppercase();
     let ident_upper = ident.to_uppercase();
-    let bytes = stripped.as_bytes();
+    let bytes = cleaned.as_bytes();
 
     let mut search_from = 0;
     while let Some(pos) = stripped_upper[search_from..].find(&ident_upper) {
@@ -5803,6 +5805,48 @@ fn strip_literals_and_comments(text: &str) -> String {
             }
             _ => i += 1,
         }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
+/// Replace content inside `(SELECT ...)` and `(WITH ...)` subquery blocks with spaces.
+/// Regular function-call parentheses are left intact.
+fn strip_nested_subqueries(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = text.to_string().into_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let is_subquery = (j + 6 <= bytes.len()
+                && bytes[j..j + 6].eq_ignore_ascii_case(b"SELECT")
+                && (j + 6 >= bytes.len()
+                    || !bytes[j + 6].is_ascii_alphanumeric() && bytes[j + 6] != b'_'))
+                || (j + 4 <= bytes.len()
+                    && bytes[j..j + 4].eq_ignore_ascii_case(b"WITH")
+                    && (j + 4 >= bytes.len()
+                        || !bytes[j + 4].is_ascii_alphanumeric() && bytes[j + 4] != b'_'));
+            if is_subquery {
+                // Blank out everything from ( to matching )
+                let mut depth = 1;
+                out[i] = b' ';
+                i += 1;
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    out[i] = b' ';
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        i += 1;
     }
     String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
@@ -8344,11 +8388,14 @@ GROUP BY s.year";
         // But bare quoted aliases like "year_total" should match
         assert!(identifier_appears_in(r#""year_total""#, "year_total"));
         assert!(identifier_appears_in(r#"`year_total`"#, "year_total"));
-        // Should match inside parentheses (e.g., COALESCE(year_total, 0))
+        // Should match inside regular function call parentheses
         assert!(identifier_appears_in("COALESCE(year_total, 0)", "year_total"));
         assert!(identifier_appears_in("(year_total)", "year_total"));
         // Top-level references should still match
         assert!(identifier_appears_in("year_total + COALESCE(x, 0)", "year_total"));
+        // Should NOT match inside nested subqueries
+        assert!(!identifier_appears_in("(SELECT year_total FROM aux)", "year_total"));
+        assert!(!identifier_appears_in("(SELECT year_total FROM aux), o.col", "year_total"));
     }
 
     #[test]
