@@ -5504,6 +5504,23 @@ fn extract_subquery_aliases_from_select(sql: &str) -> Vec<String> {
                     }
                 }
             }
+            b'-' if i + 1 < select_text.len() && bytes[i + 1] == b'-' => {
+                while i < select_text.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if i + 1 < select_text.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < select_text.len() {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
             b',' if depth == 0 => {
                 if let Some(alias) = subquery_alias_from_item(&select_text[item_start..i]) {
                     aliases.push(alias);
