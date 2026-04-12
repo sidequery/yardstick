@@ -5722,12 +5722,14 @@ fn subquery_alias_from_item(item: &str) -> Option<String> {
 fn identifier_appears_in(text: &str, ident: &str) -> bool {
     let stripped = strip_literals_and_comments(text);
     let cleaned = strip_nested_subqueries(&stripped);
-    let stripped_upper = cleaned.to_uppercase();
+    // Perform all searching and boundary checks on the uppercased string
+    // to avoid byte-offset mismatches between the original and uppercased forms.
+    let upper = cleaned.to_uppercase();
     let ident_upper = ident.to_uppercase();
-    let bytes = cleaned.as_bytes();
+    let bytes = upper.as_bytes();
 
     let mut search_from = 0;
-    while let Some(pos) = stripped_upper[search_from..].find(&ident_upper) {
+    while let Some(pos) = upper[search_from..].find(&ident_upper) {
         let abs = search_from + pos;
         let before_ok = abs == 0 || {
             let c = bytes[abs - 1];
@@ -5738,7 +5740,7 @@ fn identifier_appears_in(text: &str, ident: &str) -> bool {
             }
         };
         let after_pos = abs + ident_upper.len();
-        let after_ok = after_pos >= stripped_upper.len() || {
+        let after_ok = after_pos >= bytes.len() || {
             let c = bytes[after_pos];
             !c.is_ascii_alphanumeric() && c != b'_'
         };
@@ -5746,9 +5748,7 @@ fn identifier_appears_in(text: &str, ident: &str) -> bool {
             return true;
         }
         search_from = abs + 1;
-        while search_from < stripped_upper.len()
-            && !stripped_upper.is_char_boundary(search_from)
-        {
+        while search_from < bytes.len() && !upper.is_char_boundary(search_from) {
             search_from += 1;
         }
     }
