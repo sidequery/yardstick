@@ -5603,6 +5603,28 @@ fn item_has_subquery(item: &str) -> bool {
     false
 }
 
+/// Check if position `pos` in `text` starts a SQL keyword (followed by a non-identifier char).
+fn is_sql_keyword_at(text: &str, pos: usize) -> bool {
+    const KEYWORDS: &[&[u8]] = &[
+        b"IS", b"IN", b"OR", b"ON", b"AND", b"NOT", b"THEN", b"ELSE", b"END",
+        b"WHEN", b"LIKE", b"BETWEEN", b"FROM", b"WHERE", b"GROUP", b"ORDER",
+        b"HAVING", b"LIMIT", b"OFFSET", b"UNION", b"EXCEPT", b"INTERSECT",
+        b"JOIN", b"LEFT", b"RIGHT", b"INNER", b"OUTER", b"CROSS", b"FULL",
+        b"NULL", b"TRUE", b"FALSE", b"CASE", b"CAST", b"OVER", b"ASC", b"DESC",
+    ];
+    let bytes = text.as_bytes();
+    for kw in KEYWORDS {
+        let end = pos + kw.len();
+        if end <= bytes.len()
+            && bytes[pos..end].eq_ignore_ascii_case(kw)
+            && (end >= bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check if a single SELECT item contains a `(SELECT ...)` subquery and has an alias.
 /// Supports both explicit (`AS alias`) and implicit (`(SELECT ...) alias`) forms.
 fn subquery_alias_from_item(item: &str) -> Option<String> {
@@ -5670,11 +5692,14 @@ fn subquery_alias_from_item(item: &str) -> Option<String> {
                                 end += 1;
                             }
                             last_alias_start = Some(end);
-                        } else if bytes[j].is_ascii_alphabetic() || bytes[j] == b'_'
-                            || bytes[j] == b'"' || bytes[j] == b'`'
-                        {
-                            // Implicit alias (no AS keyword)
+                        } else if bytes[j] == b'"' || bytes[j] == b'`' {
+                            // Quoted implicit alias
                             last_alias_start = Some(j);
+                        } else if bytes[j].is_ascii_alphabetic() || bytes[j] == b'_' {
+                            // Unquoted implicit alias: exclude SQL keywords that can follow a subquery
+                            if !is_sql_keyword_at(item, j) {
+                                last_alias_start = Some(j);
+                            }
                         }
                     }
                 }
