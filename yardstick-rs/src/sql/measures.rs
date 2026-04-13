@@ -6283,13 +6283,25 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     if let Some(order_pos) = find_top_level_keyword(&result_sql, "ORDER BY", 0) {
         let subquery_aliases = extract_subquery_aliases_from_select(&result_sql);
         if !subquery_aliases.is_empty() {
+            // Skip past "ORDER", whitespace, and "BY" to find the expression start
+            let mut expr_start = order_pos + 5; // skip "ORDER"
+            while expr_start < result_sql.len()
+                && result_sql.as_bytes()[expr_start].is_ascii_whitespace()
+            {
+                expr_start += 1;
+            }
+            if expr_start + 2 <= result_sql.len()
+                && result_sql.as_bytes()[expr_start..expr_start + 2].eq_ignore_ascii_case(b"BY")
+            {
+                expr_start += 2;
+            }
             let order_end = find_first_top_level_keyword(
                 &result_sql,
-                order_pos + 8,
+                expr_start,
                 &["LIMIT", "OFFSET"],
             )
             .unwrap_or(result_sql.len());
-            let order_text = &result_sql[order_pos + 8..order_end];
+            let order_text = &result_sql[expr_start..order_end];
             let needs_wrap = subquery_aliases
                 .iter()
                 .any(|alias| identifier_appears_in(order_text, alias));
