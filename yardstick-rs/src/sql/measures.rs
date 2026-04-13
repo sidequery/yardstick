@@ -5734,7 +5734,12 @@ fn identifier_appears_in(text: &str, ident: &str) -> bool {
         let before_ok = abs == 0 || {
             let c = bytes[abs - 1];
             if c == b'"' || c == b'`' {
-                abs < 2 || bytes[abs - 2] != b'.'
+                // Scan backwards past whitespace to check for a dot (e.g. o . "alias")
+                let mut k = abs.saturating_sub(2);
+                while k > 0 && bytes[k].is_ascii_whitespace() {
+                    k -= 1;
+                }
+                abs < 2 || bytes[k] != b'.'
             } else {
                 !c.is_ascii_alphanumeric() && c != b'_' && c != b'.'
             }
@@ -8397,6 +8402,9 @@ GROUP BY s.year";
         // Should not match qualified quoted names like o."year_total"
         assert!(!identifier_appears_in(r#"o."year_total""#, "year_total"));
         assert!(!identifier_appears_in(r#"o.`year_total`"#, "year_total"));
+        // Should not match spaced qualified quoted names like o . "year_total"
+        assert!(!identifier_appears_in(r#"o . "year_total""#, "year_total"));
+        assert!(!identifier_appears_in(r#"o .  `year_total`"#, "year_total"));
         // But bare quoted aliases like "year_total" should match
         assert!(identifier_appears_in(r#""year_total""#, "year_total"));
         assert!(identifier_appears_in(r#"`year_total`"#, "year_total"));
