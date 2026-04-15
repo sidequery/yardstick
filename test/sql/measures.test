@@ -2209,6 +2209,49 @@ WHERE year = 2023;
 ----
 150.0
 
+# ORDER BY with named aggregate that expands to a subquery (GH #28)
+query IIRR
+SEMANTIC SELECT
+    year,
+    region,
+    AGGREGATE(revenue) AS revenue,
+    AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+ORDER BY revenue/year_total, year, region;
+----
+2022	EU	50.0	150.0
+2023	EU	75.0	225.0
+2022	US	100.0	150.0
+2023	US	150.0	225.0
+
+# ORDER BY with simple alias of subquery expression (GH #28)
+query IIR
+SEMANTIC SELECT
+    year,
+    region,
+    AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+ORDER BY year_total, year, region;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
+# ORDER BY DESC with subquery alias (GH #28)
+query IIR
+SEMANTIC SELECT
+    year,
+    region,
+    AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+ORDER BY year_total DESC, year, region;
+----
+2023	EU	225.0
+2023	US	225.0
+2022	EU	150.0
+2022	US	150.0
+
 # =============================================================================
 # Test: Expression dimensions (issue #29)
 # =============================================================================
