@@ -5758,15 +5758,24 @@ fn identifier_appears_in(text: &str, ident: &str) -> bool {
         let abs = search_from + pos;
         let before_ok = abs == 0 || {
             let c = bytes[abs - 1];
-            if c == b'"' || c == b'`' {
+            if c == b'.' {
+                false // directly after dot = qualified
+            } else if c == b'"' || c == b'`' {
                 // Scan backwards past whitespace to check for a dot (e.g. o . "alias")
                 let mut k = abs.saturating_sub(2);
                 while k > 0 && bytes[k].is_ascii_whitespace() {
                     k -= 1;
                 }
                 abs < 2 || bytes[k] != b'.'
+            } else if c.is_ascii_whitespace() {
+                // Scan backwards past whitespace to check for a dot (e.g. o . year_total)
+                let mut k = abs - 1;
+                while k > 0 && bytes[k].is_ascii_whitespace() {
+                    k -= 1;
+                }
+                bytes[k] != b'.'
             } else {
-                !c.is_ascii_alphanumeric() && c != b'_' && c != b'.'
+                !c.is_ascii_alphanumeric() && c != b'_'
             }
         };
         let after_pos = abs + ident_upper.len();
@@ -5866,6 +5875,26 @@ fn strip_nested_subqueries(text: &str) -> String {
                 i += 1;
                 while i < bytes.len() && depth > 0 {
                     match bytes[i] {
+                        b'\'' => {
+                            out[i] = b' ';
+                            i += 1;
+                            while i < bytes.len() {
+                                if bytes[i] == b'\'' {
+                                    out[i] = b' ';
+                                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                                        out[i + 1] = b' ';
+                                        i += 2;
+                                    } else {
+                                        i += 1;
+                                        break;
+                                    }
+                                } else {
+                                    out[i] = b' ';
+                                    i += 1;
+                                }
+                            }
+                            continue;
+                        }
                         b'(' => depth += 1,
                         b')' => depth -= 1,
                         _ => {}
@@ -8430,6 +8459,9 @@ GROUP BY s.year";
         // Should not match spaced qualified quoted names like o . "year_total"
         assert!(!identifier_appears_in(r#"o . "year_total""#, "year_total"));
         assert!(!identifier_appears_in(r#"o .  `year_total`"#, "year_total"));
+        // Should not match spaced qualified unquoted names like o . year_total
+        assert!(!identifier_appears_in("o . year_total", "year_total"));
+        assert!(!identifier_appears_in("o .  year_total", "year_total"));
         // But bare quoted aliases like "year_total" should match
         assert!(identifier_appears_in(r#""year_total""#, "year_total"));
         assert!(identifier_appears_in(r#"`year_total`"#, "year_total"));
