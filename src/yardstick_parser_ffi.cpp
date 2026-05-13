@@ -39,6 +39,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace duckdb;
 
@@ -63,12 +64,21 @@ static std::string NormalizeAliasName(const std::string &alias) {
     return StringUtil::Lower(alias);
 }
 
-static bool IsPotentialOrderAliasRef(const ColumnRefExpression &colref, std::string &alias_name) {
+using TableQualifierSet = std::unordered_set<std::string>;
+
+static bool IsPotentialOrderAliasRef(
+    const ColumnRefExpression &colref,
+    const TableQualifierSet &from_qualifiers,
+    std::string &alias_name
+) {
     if (!colref.IsQualified()) {
         alias_name = colref.GetColumnName();
         return true;
     }
     if (colref.column_names.size() == 2 && StringUtil::CIEquals(colref.GetTableName(), "alias")) {
+        if (from_qualifiers.find(NormalizeAliasName(colref.GetTableName())) != from_qualifiers.end()) {
+            return false;
+        }
         alias_name = colref.GetColumnName();
         return true;
     }
@@ -1246,7 +1256,42 @@ struct SelectAliasEntry {
 
 using SelectAliasMap = std::unordered_map<std::string, SelectAliasEntry>;
 
+static void AddTableQualifier(TableQualifierSet &qualifiers, const std::string &name) {
+    if (!name.empty()) {
+        qualifiers.insert(NormalizeAliasName(name));
+    }
+}
+
+static void CollectTableQualifiers(const TableRef *ref, TableQualifierSet &qualifiers) {
+    if (!ref) {
+        return;
+    }
+
+    AddTableQualifier(qualifiers, ref->alias);
+
+    switch (ref->type) {
+        case TableReferenceType::BASE_TABLE: {
+            auto *base = static_cast<const BaseTableRef*>(ref);
+            if (ref->alias.empty()) {
+                AddTableQualifier(qualifiers, base->table_name);
+            }
+            break;
+        }
+
+        case TableReferenceType::JOIN: {
+            auto *join = static_cast<const JoinRef*>(ref);
+            CollectTableQualifiers(join->left.get(), qualifiers);
+            CollectTableQualifiers(join->right.get(), qualifiers);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
 static bool FindSelectAliasRef(const ParsedExpression &expr, const SelectAliasMap &aliases,
+                               const TableQualifierSet &from_qualifiers,
                                SelectAliasMap::const_iterator &alias_entry) {
     if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
         return false;
@@ -1254,7 +1299,7 @@ static bool FindSelectAliasRef(const ParsedExpression &expr, const SelectAliasMa
 
     std::string alias_name;
     auto &colref = expr.Cast<ColumnRefExpression>();
-    if (!IsPotentialOrderAliasRef(colref, alias_name)) {
+    if (!IsPotentialOrderAliasRef(colref, from_qualifiers, alias_name)) {
         return false;
     }
 
@@ -1262,9 +1307,13 @@ static bool FindSelectAliasRef(const ParsedExpression &expr, const SelectAliasMa
     return alias_entry != aliases.end();
 }
 
-static bool IsSimpleSelectAliasOrder(const ParsedExpression &expr, const SelectAliasMap &aliases) {
+static bool IsSimpleSelectAliasOrder(
+    const ParsedExpression &expr,
+    const SelectAliasMap &aliases,
+    const TableQualifierSet &from_qualifiers
+) {
     SelectAliasMap::const_iterator alias_entry;
-    return FindSelectAliasRef(expr, aliases, alias_entry);
+    return FindSelectAliasRef(expr, aliases, from_qualifiers, alias_entry);
 }
 
 static void EnumerateOrderAliasScopeChildren(
@@ -1297,28 +1346,36 @@ static void EnumerateOrderAliasScopeChildren(
     ParsedExpressionIterator::EnumerateChildren(expr, callback);
 }
 
-static bool ReferencesSubqueryAlias(const ParsedExpression &expr, const SelectAliasMap &aliases) {
+static bool ReferencesSubqueryAlias(
+    const ParsedExpression &expr,
+    const SelectAliasMap &aliases,
+    const TableQualifierSet &from_qualifiers
+) {
     SelectAliasMap::const_iterator alias_entry;
-    if (FindSelectAliasRef(expr, aliases, alias_entry) && alias_entry->second.has_subquery) {
+    if (FindSelectAliasRef(expr, aliases, from_qualifiers, alias_entry) && alias_entry->second.has_subquery) {
         return true;
     }
 
     bool found = false;
     EnumerateOrderAliasScopeChildren(expr, [&](const ParsedExpression &child) {
-        if (!found && ReferencesSubqueryAlias(child, aliases)) {
+        if (!found && ReferencesSubqueryAlias(child, aliases, from_qualifiers)) {
             found = true;
         }
     });
     return found;
 }
 
-static bool InlineSelectAliases(unique_ptr<ParsedExpression> &expr, const SelectAliasMap &aliases) {
+static bool InlineSelectAliases(
+    unique_ptr<ParsedExpression> &expr,
+    const SelectAliasMap &aliases,
+    const TableQualifierSet &from_qualifiers
+) {
     if (!expr) {
         return false;
     }
 
     SelectAliasMap::const_iterator alias_entry;
-    if (FindSelectAliasRef(*expr, aliases, alias_entry)) {
+    if (FindSelectAliasRef(*expr, aliases, from_qualifiers, alias_entry)) {
         if (!alias_entry->second.has_subquery) {
             return false;
         }
@@ -1330,7 +1387,7 @@ static bool InlineSelectAliases(unique_ptr<ParsedExpression> &expr, const Select
 
     bool changed = false;
     EnumerateOrderAliasScopeChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
-        if (InlineSelectAliases(child, aliases)) {
+        if (InlineSelectAliases(child, aliases, from_qualifiers)) {
             changed = true;
         }
     });
@@ -1364,6 +1421,9 @@ extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
         }
 
         auto* select_node = static_cast<SelectNode*>(select_stmt->node.get());
+        TableQualifierSet from_qualifiers;
+        CollectTableQualifiers(select_node->from_table.get(), from_qualifiers);
+
         SelectAliasMap aliases;
         bool has_subquery_alias = false;
         for (auto& expr : select_node->select_list) {
@@ -1390,13 +1450,13 @@ extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
                 if (!order.expression) {
                     continue;
                 }
-                if (IsSimpleSelectAliasOrder(*order.expression, aliases)) {
+                if (IsSimpleSelectAliasOrder(*order.expression, aliases, from_qualifiers)) {
                     continue;
                 }
-                if (!ReferencesSubqueryAlias(*order.expression, aliases)) {
+                if (!ReferencesSubqueryAlias(*order.expression, aliases, from_qualifiers)) {
                     continue;
                 }
-                changed = InlineSelectAliases(order.expression, aliases) || changed;
+                changed = InlineSelectAliases(order.expression, aliases, from_qualifiers) || changed;
             }
         }
 
