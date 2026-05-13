@@ -158,6 +158,40 @@ ORDER BY year_total, o.region, o.year;
 2023	EU	225.0
 2023	US	225.0
 
+# Non-subquery aliases in mixed ORDER BY expressions should stay alias refs (#28)
+statement ok
+CREATE TABLE order_alias_rows AS
+SELECT i::INT AS id, 1.0 AS amount
+FROM range(32) t(i);
+
+statement ok
+CREATE VIEW order_alias_v AS
+SELECT id, SUM(amount) AS MEASURE revenue
+FROM order_alias_rows;
+
+query I
+SELECT setseed(0.42);
+----
+NULL
+
+query I
+SEMANTIC WITH q AS (
+    SELECT
+        random() AS r,
+        id,
+        AGGREGATE(revenue) AT (ALL id) AS all_revenue
+    FROM order_alias_v
+    ORDER BY r / all_revenue
+)
+SELECT COUNT(*)::INTEGER
+FROM (
+    SELECT r, LAG(r) OVER () AS prev_r
+    FROM q
+)
+WHERE prev_r IS NOT NULL AND r < prev_r;
+----
+0
+
 # Lowercase from with line break
 query IIR rowsort
 SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total

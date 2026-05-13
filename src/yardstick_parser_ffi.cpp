@@ -516,7 +516,7 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
                                const std::string& sql) {
     if (!expr) return;
 
-    switch (expr->expression_class) {
+    switch (expr->GetExpressionClass()) {
         case ExpressionClass::FUNCTION: {
             auto* func = static_cast<FunctionExpression*>(expr);
             std::string lower_name = StringUtil::Lower(func->function_name);
@@ -528,7 +528,7 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
                 if (!func->children.empty()) {
                     // First argument should be measure name (column ref or string)
                     auto* first_arg = func->children[0].get();
-                    if (first_arg->expression_class == ExpressionClass::COLUMN_REF) {
+                    if (first_arg->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
                         auto* col = static_cast<ColumnRefExpression*>(first_arg);
                         info.measure_name = col->GetColumnName();
                     } else {
@@ -537,8 +537,9 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
                 }
 
                 // Get position from query_location
-                if (expr->query_location.IsValid()) {
-                    info.start_pos = static_cast<uint32_t>(expr->query_location.GetIndex());
+                auto query_location = expr->GetQueryLocation();
+                if (query_location.IsValid()) {
+                    info.start_pos = static_cast<uint32_t>(query_location.GetIndex());
                 } else {
                     info.start_pos = 0;
                 }
@@ -552,7 +553,7 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
                     auto* arg = func->children[i].get();
 
                     // Check if this is an AT modifier call
-                    if (arg->expression_class == ExpressionClass::FUNCTION) {
+                    if (arg->GetExpressionClass() == ExpressionClass::FUNCTION) {
                         auto* at_func = static_cast<FunctionExpression*>(arg);
                         std::string at_name = StringUtil::Lower(at_func->function_name);
 
@@ -746,7 +747,7 @@ static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableR
 static bool ExpressionContainsAggregate(ParsedExpression* expr) {
     if (!expr) return false;
 
-    switch (expr->expression_class) {
+    switch (expr->GetExpressionClass()) {
         case ExpressionClass::FUNCTION: {
             auto* func = static_cast<FunctionExpression*>(expr);
             if (IsStandardAggregate(func->function_name)) {
@@ -818,7 +819,7 @@ static bool ExpressionContainsAggregate(ParsedExpression* expr) {
 static bool ExpressionContainsMeasureRef(ParsedExpression* expr) {
     if (!expr) return false;
 
-    switch (expr->expression_class) {
+    switch (expr->GetExpressionClass()) {
         case ExpressionClass::FUNCTION: {
             auto* func = static_cast<FunctionExpression*>(expr);
             if (StringUtil::Lower(func->function_name) == "aggregate") {
@@ -882,7 +883,7 @@ static bool ExpressionContainsMeasureRef(ParsedExpression* expr) {
 static void QualifyColumnRefs(ParsedExpression* expr, const std::string& qualifier) {
     if (!expr) return;
 
-    switch (expr->expression_class) {
+    switch (expr->GetExpressionClass()) {
         case ExpressionClass::COLUMN_REF: {
             auto* col = static_cast<ColumnRefExpression*>(expr);
             if (col->column_names.size() == 1) {
@@ -1135,10 +1136,11 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
         for (auto& expr : select_node->select_list) {
             YardstickSelectItem item;
             item.expression_sql = safe_strdup(expr->ToString());
-            item.alias = expr->alias.empty() ? nullptr : safe_strdup(expr->alias);
+            item.alias = expr->HasAlias() ? safe_strdup(expr->GetAlias()) : nullptr;
 
-            if (expr->query_location.IsValid()) {
-                item.start_pos = static_cast<uint32_t>(expr->query_location.GetIndex());
+            auto query_location = expr->GetQueryLocation();
+            if (query_location.IsValid()) {
+                item.start_pos = static_cast<uint32_t>(query_location.GetIndex());
             } else {
                 item.start_pos = 0;
             }
@@ -1146,7 +1148,7 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
             item.end_pos = static_cast<uint32_t>(end_pos);
 
             item.is_aggregate = ExpressionContainsAggregate(expr.get());
-            item.is_star = expr->expression_class == ExpressionClass::STAR;
+            item.is_star = expr->GetExpressionClass() == ExpressionClass::STAR;
             item.is_measure_ref = ExpressionContainsMeasureRef(expr.get());
 
             items.push_back(item);
@@ -1246,7 +1248,7 @@ using SelectAliasMap = std::unordered_map<std::string, SelectAliasEntry>;
 
 static bool FindSelectAliasRef(const ParsedExpression &expr, const SelectAliasMap &aliases,
                                SelectAliasMap::const_iterator &alias_entry) {
-    if (expr.expression_class != ExpressionClass::COLUMN_REF) {
+    if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
         return false;
     }
 
@@ -1287,6 +1289,9 @@ static bool InlineSelectAliases(unique_ptr<ParsedExpression> &expr, const Select
 
     SelectAliasMap::const_iterator alias_entry;
     if (FindSelectAliasRef(*expr, aliases, alias_entry)) {
+        if (!alias_entry->second.has_subquery) {
+            return false;
+        }
         auto replacement = alias_entry->second.expression->Copy();
         replacement->ClearAlias();
         expr = std::move(replacement);
@@ -1332,11 +1337,11 @@ extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
         SelectAliasMap aliases;
         bool has_subquery_alias = false;
         for (auto& expr : select_node->select_list) {
-            if (expr->alias.empty()) {
+            if (!expr->HasAlias()) {
                 continue;
             }
             bool has_subquery = expr->HasSubquery();
-            aliases[NormalizeAliasName(expr->alias)] = SelectAliasEntry { expr.get(), has_subquery };
+            aliases[NormalizeAliasName(expr->GetAlias())] = SelectAliasEntry { expr.get(), has_subquery };
             has_subquery_alias = has_subquery_alias || has_subquery;
         }
 
@@ -1403,11 +1408,11 @@ extern "C" YardstickExpressionInfo* yardstick_parse_expression(const char* expr_
         auto& expr = expressions[0];
 
         result->sql = safe_strdup(expr->ToString());
-        result->is_identifier = expr->expression_class == ExpressionClass::COLUMN_REF;
+        result->is_identifier = expr->GetExpressionClass() == ExpressionClass::COLUMN_REF;
         result->is_aggregate = ExpressionContainsAggregate(expr.get());
 
         // If it's a simple aggregate function, extract the function name and inner expr
-        if (expr->expression_class == ExpressionClass::FUNCTION) {
+        if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
             auto* func = static_cast<FunctionExpression*>(expr.get());
             if (IsStandardAggregate(func->function_name)) {
                 result->aggregate_func = safe_strdup(StringUtil::Upper(func->function_name));
