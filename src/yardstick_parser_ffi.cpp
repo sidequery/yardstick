@@ -1267,6 +1267,36 @@ static bool IsSimpleSelectAliasOrder(const ParsedExpression &expr, const SelectA
     return FindSelectAliasRef(expr, aliases, alias_entry);
 }
 
+static void EnumerateOrderAliasScopeChildren(
+    const ParsedExpression &expr,
+    const std::function<void(const ParsedExpression &child)> &callback
+) {
+    if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+        auto &subquery_expr = expr.Cast<SubqueryExpression>();
+        if (subquery_expr.child) {
+            callback(*subquery_expr.child);
+        }
+        return;
+    }
+
+    ParsedExpressionIterator::EnumerateChildren(expr, callback);
+}
+
+static void EnumerateOrderAliasScopeChildren(
+    ParsedExpression &expr,
+    const std::function<void(unique_ptr<ParsedExpression> &child)> &callback
+) {
+    if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+        auto &subquery_expr = expr.Cast<SubqueryExpression>();
+        if (subquery_expr.child) {
+            callback(subquery_expr.child);
+        }
+        return;
+    }
+
+    ParsedExpressionIterator::EnumerateChildren(expr, callback);
+}
+
 static bool ReferencesSubqueryAlias(const ParsedExpression &expr, const SelectAliasMap &aliases) {
     SelectAliasMap::const_iterator alias_entry;
     if (FindSelectAliasRef(expr, aliases, alias_entry) && alias_entry->second.has_subquery) {
@@ -1274,7 +1304,7 @@ static bool ReferencesSubqueryAlias(const ParsedExpression &expr, const SelectAl
     }
 
     bool found = false;
-    ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+    EnumerateOrderAliasScopeChildren(expr, [&](const ParsedExpression &child) {
         if (!found && ReferencesSubqueryAlias(child, aliases)) {
             found = true;
         }
@@ -1299,7 +1329,7 @@ static bool InlineSelectAliases(unique_ptr<ParsedExpression> &expr, const Select
     }
 
     bool changed = false;
-    ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+    EnumerateOrderAliasScopeChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
         if (InlineSelectAliases(child, aliases)) {
             changed = true;
         }

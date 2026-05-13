@@ -192,6 +192,50 @@ WHERE prev_r IS NOT NULL AND r < prev_r;
 ----
 0
 
+# ORDER BY scalar subquery scopes should not be searched for outer aliases (#28)
+statement ok
+CREATE TABLE order_subquery_totals(year INT, total DOUBLE);
+
+statement ok
+INSERT INTO order_subquery_totals VALUES (2022, 2), (2023, 1);
+
+query IIR
+SEMANTIC SELECT
+    o.year,
+    o.region,
+    AGGREGATE(revenue) AT (ALL region) AS total
+FROM sales_v o
+ORDER BY (
+    SELECT total
+    FROM order_subquery_totals st
+    WHERE st.year = o.year
+), o.region;
+----
+2023	EU	225.0
+2023	US	225.0
+2022	EU	150.0
+2022	US	150.0
+
+# The outer side of IN/ANY still belongs to the ORDER BY alias scope (#28)
+statement ok
+CREATE TABLE order_allowed_totals(total DOUBLE);
+
+statement ok
+INSERT INTO order_allowed_totals VALUES (225);
+
+query IIR
+SEMANTIC SELECT
+    o.year,
+    o.region,
+    AGGREGATE(revenue) AT (ALL region) AS total
+FROM sales_v o
+ORDER BY total IN (SELECT total FROM order_allowed_totals), o.region, o.year;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
 # Lowercase from with line break
 query IIR rowsort
 SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total
