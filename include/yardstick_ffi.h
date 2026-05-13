@@ -178,6 +178,13 @@ void yardstick_free_aggregate_list(YardstickAggregateCallList* list);
 YardstickSelectInfo* yardstick_parse_select(const char* sql);
 
 /**
+ * Inline SELECT aliases inside complex ORDER BY expressions when they reference
+ * a SELECT alias whose expression contains a subquery. Returns NULL when no
+ * rewrite is needed or parsing fails.
+ */
+char* yardstick_inline_order_by_subquery_aliases(const char* sql);
+
+/**
  * Free a select info structure.
  */
 void yardstick_free_select_info(YardstickSelectInfo* info);

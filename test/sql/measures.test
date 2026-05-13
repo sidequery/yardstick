@@ -114,6 +114,50 @@ FROM sales_v;
 2023	EU	225.0
 2023	US	225.0
 
+# ORDER BY expression referencing a named aggregate that expands to a subquery (#28)
+query IIRR
+SEMANTIC SELECT
+    year,
+    region,
+    AGGREGATE(revenue) AS revenue,
+    AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+ORDER BY revenue/year_total, year, region;
+----
+2022	EU	50.0	150.0
+2023	EU	75.0	225.0
+2022	US	100.0	150.0
+2023	US	150.0	225.0
+
+# Qualified ORDER BY tie-breakers should remain in the original query scope (#28)
+query IIRR
+SEMANTIC SELECT
+    o.year,
+    o.region,
+    AGGREGATE(revenue) AS revenue,
+    AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v o
+ORDER BY revenue/year_total, o.region, o.year;
+----
+2022	EU	50.0	150.0
+2023	EU	75.0	225.0
+2022	US	100.0	150.0
+2023	US	150.0	225.0
+
+# Simple subquery aliases in ORDER BY should not force query wrapping (#28)
+query IIR
+SEMANTIC SELECT
+    o.year,
+    o.region,
+    AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v o
+ORDER BY year_total, o.region, o.year;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
 # Lowercase from with line break
 query IIR rowsort
 SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total

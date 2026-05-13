@@ -63,6 +63,7 @@ extern "C" {
         char* (*replace_range)(const char*, uint32_t, uint32_t, const char*),
         char* (*apply_replacements)(const char*, const YardstickReplacement*, size_t),
         char* (*qualify_expression)(const char*, const char*),
+        char* (*inline_order_by_subquery_aliases)(const char*),
         void (*free_string)(char*),
         char* (*expand_aggregate_call)(const char*, const char*, const YardstickAtModifier*, size_t, const char*, const char*, const char*, const char* const*, size_t)
     );
@@ -635,6 +636,7 @@ static void LoadInternal(ExtensionLoader &loader) {
         yardstick_replace_range,
         yardstick_apply_replacements,
         yardstick_qualify_expression,
+        yardstick_inline_order_by_subquery_aliases,
         yardstick_free_string,
         yardstick_expand_aggregate_call
     );

@@ -26,6 +26,7 @@
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/expression/between_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/tableref.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
@@ -37,6 +38,7 @@
 #include <cstring>
 #include <vector>
 #include <string>
+#include <unordered_map>
 
 using namespace duckdb;
 
@@ -55,6 +57,22 @@ static char* safe_strdup(const std::string& s) {
 
 static bool IsBoundaryChar(char c) {
     return !std::isalnum(static_cast<unsigned char>(c)) && c != '_';
+}
+
+static std::string NormalizeAliasName(const std::string &alias) {
+    return StringUtil::Lower(alias);
+}
+
+static bool IsPotentialOrderAliasRef(const ColumnRefExpression &colref, std::string &alias_name) {
+    if (!colref.IsQualified()) {
+        alias_name = colref.GetColumnName();
+        return true;
+    }
+    if (colref.column_names.size() == 2 && StringUtil::CIEquals(colref.GetTableName(), "alias")) {
+        alias_name = colref.GetColumnName();
+        return true;
+    }
+    return false;
 }
 
 static size_t SkipWhitespaceAndComments(const std::string& sql, size_t idx) {
@@ -1217,6 +1235,143 @@ extern "C" void yardstick_free_select_info(YardstickSelectInfo* info) {
     free(const_cast<char*>(info->error));
 
     delete info;
+}
+
+struct SelectAliasEntry {
+    ParsedExpression* expression;
+    bool has_subquery;
+};
+
+using SelectAliasMap = std::unordered_map<std::string, SelectAliasEntry>;
+
+static bool FindSelectAliasRef(const ParsedExpression &expr, const SelectAliasMap &aliases,
+                               SelectAliasMap::const_iterator &alias_entry) {
+    if (expr.expression_class != ExpressionClass::COLUMN_REF) {
+        return false;
+    }
+
+    std::string alias_name;
+    auto &colref = expr.Cast<ColumnRefExpression>();
+    if (!IsPotentialOrderAliasRef(colref, alias_name)) {
+        return false;
+    }
+
+    alias_entry = aliases.find(NormalizeAliasName(alias_name));
+    return alias_entry != aliases.end();
+}
+
+static bool IsSimpleSelectAliasOrder(const ParsedExpression &expr, const SelectAliasMap &aliases) {
+    SelectAliasMap::const_iterator alias_entry;
+    return FindSelectAliasRef(expr, aliases, alias_entry);
+}
+
+static bool ReferencesSubqueryAlias(const ParsedExpression &expr, const SelectAliasMap &aliases) {
+    SelectAliasMap::const_iterator alias_entry;
+    if (FindSelectAliasRef(expr, aliases, alias_entry) && alias_entry->second.has_subquery) {
+        return true;
+    }
+
+    bool found = false;
+    ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+        if (!found && ReferencesSubqueryAlias(child, aliases)) {
+            found = true;
+        }
+    });
+    return found;
+}
+
+static bool InlineSelectAliases(unique_ptr<ParsedExpression> &expr, const SelectAliasMap &aliases) {
+    if (!expr) {
+        return false;
+    }
+
+    SelectAliasMap::const_iterator alias_entry;
+    if (FindSelectAliasRef(*expr, aliases, alias_entry)) {
+        auto replacement = alias_entry->second.expression->Copy();
+        replacement->ClearAlias();
+        expr = std::move(replacement);
+        return true;
+    }
+
+    bool changed = false;
+    ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+        if (InlineSelectAliases(child, aliases)) {
+            changed = true;
+        }
+    });
+    return changed;
+}
+
+//=============================================================================
+// FFI Implementation: yardstick_inline_order_by_subquery_aliases
+//=============================================================================
+
+extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
+    if (!sql) {
+        return nullptr;
+    }
+
+    try {
+        Parser parser;
+        parser.ParseQuery(sql);
+        if (parser.statements.empty()) {
+            return nullptr;
+        }
+
+        auto& stmt = parser.statements[0];
+        if (stmt->type != StatementType::SELECT_STATEMENT) {
+            return nullptr;
+        }
+
+        auto* select_stmt = static_cast<SelectStatement*>(stmt.get());
+        if (!select_stmt->node || select_stmt->node->type != QueryNodeType::SELECT_NODE) {
+            return nullptr;
+        }
+
+        auto* select_node = static_cast<SelectNode*>(select_stmt->node.get());
+        SelectAliasMap aliases;
+        bool has_subquery_alias = false;
+        for (auto& expr : select_node->select_list) {
+            if (expr->alias.empty()) {
+                continue;
+            }
+            bool has_subquery = expr->HasSubquery();
+            aliases[NormalizeAliasName(expr->alias)] = SelectAliasEntry { expr.get(), has_subquery };
+            has_subquery_alias = has_subquery_alias || has_subquery;
+        }
+
+        if (!has_subquery_alias || aliases.empty()) {
+            return nullptr;
+        }
+
+        bool changed = false;
+        for (auto& modifier : select_node->modifiers) {
+            if (modifier->type != ResultModifierType::ORDER_MODIFIER) {
+                continue;
+            }
+
+            auto& order_modifier = modifier->Cast<OrderModifier>();
+            for (auto& order : order_modifier.orders) {
+                if (!order.expression) {
+                    continue;
+                }
+                if (IsSimpleSelectAliasOrder(*order.expression, aliases)) {
+                    continue;
+                }
+                if (!ReferencesSubqueryAlias(*order.expression, aliases)) {
+                    continue;
+                }
+                changed = InlineSelectAliases(order.expression, aliases) || changed;
+            }
+        }
+
+        if (!changed) {
+            return nullptr;
+        }
+        return safe_strdup(stmt->ToString());
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 //=============================================================================

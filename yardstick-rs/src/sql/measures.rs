@@ -5942,6 +5942,14 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         );
     }
 
+    if let Some(rewritten_sql) =
+        std::panic::catch_unwind(|| parser_ffi::inline_order_by_subquery_aliases(&result_sql))
+            .ok()
+            .flatten()
+    {
+        result_sql = rewritten_sql;
+    }
+
     AggregateExpandResult {
         had_aggregate,
         expanded_sql: result_sql,

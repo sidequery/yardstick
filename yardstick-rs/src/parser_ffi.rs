@@ -169,6 +169,7 @@ type FnFreeCreateViewInfo = unsafe extern "C" fn(*mut YardstickCreateViewInfo);
 type FnReplaceRange = unsafe extern "C" fn(*const c_char, u32, u32, *const c_char) -> *mut c_char;
 type FnApplyReplacements = unsafe extern "C" fn(*const c_char, *const YardstickReplacement, usize) -> *mut c_char;
 type FnQualifyExpression = unsafe extern "C" fn(*const c_char, *const c_char) -> *mut c_char;
+type FnInlineOrderBySubqueryAliases = unsafe extern "C" fn(*const c_char) -> *mut c_char;
 type FnFreeString = unsafe extern "C" fn(*mut c_char);
 type FnExpandAggregateCall = unsafe extern "C" fn(
     *const c_char, *const c_char, *const YardstickAtModifier, usize,
@@ -187,6 +188,7 @@ static FN_FREE_CREATE_VIEW_INFO: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut())
 static FN_REPLACE_RANGE: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_APPLY_REPLACEMENTS: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_QUALIFY_EXPRESSION: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_INLINE_ORDER_BY_SUBQUERY_ALIASES: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_FREE_STRING: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_EXPAND_AGGREGATE_CALL: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
@@ -204,6 +206,7 @@ pub extern "C" fn yardstick_init_parser_ffi(
     replace_range: FnReplaceRange,
     apply_replacements: FnApplyReplacements,
     qualify_expression: FnQualifyExpression,
+    inline_order_by_subquery_aliases: FnInlineOrderBySubqueryAliases,
     free_string: FnFreeString,
     expand_aggregate_call: FnExpandAggregateCall,
 ) {
@@ -218,6 +221,7 @@ pub extern "C" fn yardstick_init_parser_ffi(
     FN_REPLACE_RANGE.store(replace_range as *mut (), Ordering::SeqCst);
     FN_APPLY_REPLACEMENTS.store(apply_replacements as *mut (), Ordering::SeqCst);
     FN_QUALIFY_EXPRESSION.store(qualify_expression as *mut (), Ordering::SeqCst);
+    FN_INLINE_ORDER_BY_SUBQUERY_ALIASES.store(inline_order_by_subquery_aliases as *mut (), Ordering::SeqCst);
     FN_FREE_STRING.store(free_string as *mut (), Ordering::SeqCst);
     FN_EXPAND_AGGREGATE_CALL.store(expand_aggregate_call as *mut (), Ordering::SeqCst);
 }
@@ -276,6 +280,10 @@ unsafe fn yardstick_apply_replacements(sql: *const c_char, replacements: *const 
 
 unsafe fn yardstick_free_string(ptr: *mut c_char) {
     call_ffi!(FN_FREE_STRING, FnFreeString, ptr)
+}
+
+unsafe fn yardstick_inline_order_by_subquery_aliases(sql: *const c_char) -> *mut c_char {
+    call_ffi!(FN_INLINE_ORDER_BY_SUBQUERY_ALIASES, FnInlineOrderBySubqueryAliases, sql)
 }
 
 unsafe fn yardstick_expand_aggregate_call(
@@ -812,6 +820,25 @@ pub fn qualify_expression(expr: &str, qualifier: &str) -> Result<String, String>
         let result = c_str_to_string(result_ptr).unwrap_or_default();
         yardstick_free_string(result_ptr);
         Ok(result)
+    }
+}
+
+pub fn inline_order_by_subquery_aliases(sql: &str) -> Option<String> {
+    let fn_ptr = FN_INLINE_ORDER_BY_SUBQUERY_ALIASES.load(Ordering::SeqCst);
+    if fn_ptr.is_null() {
+        return None;
+    }
+
+    let c_sql = CString::new(sql).ok()?;
+    unsafe {
+        let result_ptr = yardstick_inline_order_by_subquery_aliases(c_sql.as_ptr());
+        if result_ptr.is_null() {
+            return None;
+        }
+
+        let result = c_str_to_string(result_ptr).unwrap_or_default();
+        yardstick_free_string(result_ptr);
+        Some(result)
     }
 }
 
