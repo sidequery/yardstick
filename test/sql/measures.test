@@ -114,6 +114,165 @@ FROM sales_v;
 2023	EU	225.0
 2023	US	225.0
 
+# ORDER BY expression referencing a named aggregate that expands to a subquery (#28)
+query IIRR
+SEMANTIC SELECT
+    year,
+    region,
+    AGGREGATE(revenue) AS revenue,
+    AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+ORDER BY revenue/year_total, year, region;
+----
+2022	EU	50.0	150.0
+2023	EU	75.0	225.0
+2022	US	100.0	150.0
+2023	US	150.0	225.0
+
+# Qualified ORDER BY tie-breakers should remain in the original query scope (#28)
+query IIRR
+SEMANTIC SELECT
+    o.year,
+    o.region,
+    AGGREGATE(revenue) AS revenue,
+    AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v o
+ORDER BY revenue/year_total, o.region, o.year;
+----
+2022	EU	50.0	150.0
+2023	EU	75.0	225.0
+2022	US	100.0	150.0
+2023	US	150.0	225.0
+
+# Simple subquery aliases in ORDER BY should not force query wrapping (#28)
+query IIR
+SEMANTIC SELECT
+    o.year,
+    o.region,
+    AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v o
+ORDER BY year_total, o.region, o.year;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
+# DuckDB's alias namespace should still work when no table qualifier shadows it (#28)
+query IIR
+SEMANTIC SELECT
+    o.year,
+    o.region,
+    AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v o
+ORDER BY alias.year_total + 1, o.region, o.year;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
+# A real table qualifier named alias should not be treated as the alias namespace (#28)
+statement ok
+CREATE TABLE alias_collision_sales(bucket INT, year_total INT, amount DOUBLE);
+
+statement ok
+INSERT INTO alias_collision_sales VALUES (1, 2, 10), (2, 1, 20);
+
+statement ok
+CREATE VIEW alias_collision_v AS
+SELECT bucket, year_total, SUM(amount) AS MEASURE revenue
+FROM alias_collision_sales;
+
+query IR
+SEMANTIC SELECT
+    alias.bucket,
+    AGGREGATE(revenue) AT (ALL bucket) AS year_total
+FROM alias_collision_v alias
+GROUP BY alias.bucket, alias.year_total
+ORDER BY ANY_VALUE(alias.year_total) + 1;
+----
+2	20.0
+1	10.0
+
+# Non-subquery aliases in mixed ORDER BY expressions should stay alias refs (#28)
+statement ok
+CREATE TABLE order_alias_rows AS
+SELECT i::INT AS id, 1.0 AS amount
+FROM range(32) t(i);
+
+statement ok
+CREATE VIEW order_alias_v AS
+SELECT id, SUM(amount) AS MEASURE revenue
+FROM order_alias_rows;
+
+query I
+SELECT setseed(0.42);
+----
+NULL
+
+query I
+SEMANTIC WITH q AS (
+    SELECT
+        random() AS r,
+        id,
+        AGGREGATE(revenue) AT (ALL id) AS all_revenue
+    FROM order_alias_v
+    ORDER BY r / all_revenue
+)
+SELECT COUNT(*)::INTEGER
+FROM (
+    SELECT r, LAG(r) OVER () AS prev_r
+    FROM q
+)
+WHERE prev_r IS NOT NULL AND r < prev_r;
+----
+0
+
+# ORDER BY scalar subquery scopes should not be searched for outer aliases (#28)
+statement ok
+CREATE TABLE order_subquery_totals(year INT, total DOUBLE);
+
+statement ok
+INSERT INTO order_subquery_totals VALUES (2022, 2), (2023, 1);
+
+query IIR
+SEMANTIC SELECT
+    o.year,
+    o.region,
+    AGGREGATE(revenue) AT (ALL region) AS total
+FROM sales_v o
+ORDER BY (
+    SELECT total
+    FROM order_subquery_totals st
+    WHERE st.year = o.year
+), o.region;
+----
+2023	EU	225.0
+2023	US	225.0
+2022	EU	150.0
+2022	US	150.0
+
+# The outer side of IN/ANY still belongs to the ORDER BY alias scope (#28)
+statement ok
+CREATE TABLE order_allowed_totals(total DOUBLE);
+
+statement ok
+INSERT INTO order_allowed_totals VALUES (225);
+
+query IIR
+SEMANTIC SELECT
+    o.year,
+    o.region,
+    AGGREGATE(revenue) AT (ALL region) AS total
+FROM sales_v o
+ORDER BY total IN (SELECT total FROM order_allowed_totals), o.region, o.year;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
 # Lowercase from with line break
 query IIR rowsort
 SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total
