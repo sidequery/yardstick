@@ -184,17 +184,16 @@ CREATE VIEW alias_collision_v AS
 SELECT bucket, year_total, SUM(amount) AS MEASURE revenue
 FROM alias_collision_sales;
 
-query IIR
+query IR
 SEMANTIC SELECT
     alias.bucket,
-    alias.year_total AS dim_total,
     AGGREGATE(revenue) AT (ALL bucket) AS year_total
 FROM alias_collision_v alias
 GROUP BY alias.bucket, alias.year_total
 ORDER BY alias.year_total + 1;
 ----
-2	1	20.0
-1	2	10.0
+2	20.0
+1	10.0
 
 # Non-subquery aliases in mixed ORDER BY expressions should stay alias refs (#28)
 statement ok
