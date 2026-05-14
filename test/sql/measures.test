@@ -190,6 +190,7 @@ SEMANTIC SELECT
     alias.year_total AS dim_total,
     AGGREGATE(revenue) AT (ALL bucket) AS year_total
 FROM alias_collision_v alias
+GROUP BY alias.bucket, alias.year_total
 ORDER BY alias.year_total + 1;
 ----
 2	1	20.0
