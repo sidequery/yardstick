@@ -188,7 +188,7 @@ query IIR
 SEMANTIC SELECT
     alias.bucket,
     alias.year_total AS dim_total,
-    AGGREGATE(revenue) AT (ALL year_total) AS year_total
+    AGGREGATE(revenue) AT (ALL bucket) AS year_total
 FROM alias_collision_v alias
 ORDER BY alias.year_total + 1;
 ----
