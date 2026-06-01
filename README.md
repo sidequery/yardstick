@@ -12,7 +12,7 @@ Yardstick adds **measure-aware SQL** to DuckDB. Measures are aggregations that k
 
 ## How can I use this with any database?
 
-Siemantic is a fully featured semantic layer from [Sidequery](https://sidequery.dev) that supports the yardstick syntax across many different databases. Even mix and match yardstick syntax with your existing semantic model definitions.
+[Sidemantic](https://github.com/sidequery/sidemantic) is a fully featured semantic layer from [Sidequery](https://sidequery.dev) that supports the yardstick syntax across many different databases. Even mix and match yardstick syntax with your existing semantic model definitions.
 
 ## Quick Start & Demo
 
