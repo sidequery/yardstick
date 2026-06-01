@@ -10,6 +10,10 @@ Yardstick adds **measure-aware SQL** to DuckDB. Measures are aggregations that k
 - **Year-over-year comparisons** with simple syntax
 - **Drill-down analytics** that automatically adjust aggregation context
 
+## How can I use this with any database?
+
+Siemantic is a fully featured semantic layer from [Sidequery](https://sidequery.dev) that supports the yardstick syntax across many different databases. Even mix and match yardstick syntax with your existing semantic model definitions.
+
 ## Quick Start & Demo
 
 ```sql
