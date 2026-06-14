@@ -1,0 +1,70 @@
+# name: test/sql/peg_parser.test
+# description: Guard Yardstick's parser integration across DuckDB's parser swap.
+#   DuckDB is replacing its legacy PostgreSQL parser with a PEG parser (opt-in in
+#   1.5, the sole parser on main, default in 2.0). This file is parser-agnostic so
+#   it runs under whichever parser the build uses -- the legacy parser on the
+#   stable line today, and the PEG parser automatically once the suite runs
+#   against a PEG-default DuckDB (the duckdb-next-build job, once Yardstick
+#   compiles against current main again). It pins down the two behaviors most
+#   exposed to the swap:
+#     1. Yardstick's parser_override path still rewrites custom syntax correctly.
+#     2. When the override declines, the active parser still surfaces syntax errors
+#        (the "fallback" path). The assertion matches only "Parser Error", which
+#        both the legacy and PEG parsers emit, so it stays parser-agnostic.
+# group: [yardstick]
+
+require yardstick
+
+statement ok
+CREATE TABLE peg_sales (year INT, region TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO peg_sales VALUES
+    (2022, 'US', 100), (2022, 'EU', 50),
+    (2023, 'US', 150), (2023, 'EU', 75);
+
+statement ok
+CREATE VIEW peg_sales_v AS
+SELECT year, region, SUM(amount) AS MEASURE revenue
+FROM peg_sales;
+
+# Override path, no SEMANTIC prefix (the parser_override="fallback" route).
+query IIR rowsort
+SELECT year, region, AGGREGATE(revenue) FROM peg_sales_v;
+----
+2022	EU	50.0
+2022	US	100.0
+2023	EU	75.0
+2023	US	150.0
+
+# Override path with explicit SEMANTIC prefix.
+query IIR rowsort
+SEMANTIC SELECT year, region, AGGREGATE(revenue) FROM peg_sales_v;
+----
+2022	EU	50.0
+2022	US	100.0
+2023	EU	75.0
+2023	US	150.0
+
+# AT modifier expansion still parses and rewrites under the active parser.
+query IIR rowsort
+SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM peg_sales_v;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	225.0
+2023	US	225.0
+
+# A plain query Yardstick does not touch must still execute normally.
+query I
+SELECT 1 + 1;
+----
+2
+
+# Fallback path: Yardstick declines, so the active parser must still raise a
+# syntax error. Match only the parser-agnostic "Parser Error" prefix.
+statement error
+SELECT * FROM;
+----
+Parser Error
