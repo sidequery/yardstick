@@ -44,6 +44,204 @@
 using namespace duckdb;
 
 //=============================================================================
+// Compatibility shims for DuckDB's expression-API refactor.
+//
+// DuckDB main made the ParsedExpression subclass fields private (exposing
+// accessors instead) and introduced a dedicated Identifier type in place of
+// std::string for names. DuckDB 1.5 and earlier expose public fields and use
+// std::string. We detect the new API via the header it introduced and route
+// field access through these helpers, so the extension builds against both the
+// stable line and main. Remove this shim once the minimum supported DuckDB has
+// the new API.
+//=============================================================================
+
+#if __has_include("duckdb/common/identifier.hpp")
+#define YARDSTICK_NEW_EXPR_API 1
+#else
+#define YARDSTICK_NEW_EXPR_API 0
+#endif
+
+namespace {
+
+// Identifier/string -> raw string (case preserved). The Identifier overload only
+// exists on the new API; the std::string overload covers the old API and any
+// already-raw string.
+#if YARDSTICK_NEW_EXPR_API
+inline const std::string &YsName(const Identifier &id) { return id.GetIdentifierName(); }
+#endif
+inline const std::string &YsName(const std::string &s) { return s; }
+
+inline const std::string &YsFuncName(const FunctionExpression &f) {
+#if YARDSTICK_NEW_EXPR_API
+    return f.FunctionName().GetIdentifierName();
+#else
+    return f.function_name;
+#endif
+}
+
+// Direct child expressions (arguments) of a function/window call.
+inline std::vector<ParsedExpression *> YsArgs(FunctionExpression &f) {
+    std::vector<ParsedExpression *> out;
+#if YARDSTICK_NEW_EXPR_API
+    for (auto &arg : f.GetArgumentsMutable()) out.push_back(arg.GetExpressionMutable().get());
+#else
+    for (auto &child : f.children) out.push_back(child.get());
+#endif
+    return out;
+}
+inline std::vector<ParsedExpression *> YsArgs(WindowExpression &w) {
+    std::vector<ParsedExpression *> out;
+#if YARDSTICK_NEW_EXPR_API
+    for (auto &arg : w.GetArgumentsMutable()) out.push_back(arg.GetExpressionMutable().get());
+#else
+    for (auto &child : w.children) out.push_back(child.get());
+#endif
+    return out;
+}
+
+inline ParsedExpression *YsFilter(FunctionExpression &f) {
+#if YARDSTICK_NEW_EXPR_API
+    return f.FilterMutable().get();
+#else
+    return f.filter.get();
+#endif
+}
+inline ParsedExpression *YsFilter(WindowExpression &w) {
+#if YARDSTICK_NEW_EXPR_API
+    return w.FilterMutable().get();
+#else
+    return w.filter_expr.get();
+#endif
+}
+
+inline ParsedExpression *YsLeft(ComparisonExpression &c) {
+#if YARDSTICK_NEW_EXPR_API
+    return c.LeftMutable().get();
+#else
+    return c.left.get();
+#endif
+}
+inline ParsedExpression *YsRight(ComparisonExpression &c) {
+#if YARDSTICK_NEW_EXPR_API
+    return c.RightMutable().get();
+#else
+    return c.right.get();
+#endif
+}
+
+inline std::vector<ParsedExpression *> YsChildren(ConjunctionExpression &c) {
+    std::vector<ParsedExpression *> out;
+#if YARDSTICK_NEW_EXPR_API
+    for (auto &child : c.GetChildrenMutable()) out.push_back(child.get());
+#else
+    for (auto &child : c.children) out.push_back(child.get());
+#endif
+    return out;
+}
+inline std::vector<ParsedExpression *> YsChildren(OperatorExpression &o) {
+    std::vector<ParsedExpression *> out;
+#if YARDSTICK_NEW_EXPR_API
+    for (auto &child : o.GetChildrenMutable()) out.push_back(child.get());
+#else
+    for (auto &child : o.children) out.push_back(child.get());
+#endif
+    return out;
+}
+inline std::vector<ParsedExpression *> YsPartitions(WindowExpression &w) {
+    std::vector<ParsedExpression *> out;
+#if YARDSTICK_NEW_EXPR_API
+    for (auto &part : w.PartitionsMutable()) out.push_back(part.get());
+#else
+    for (auto &part : w.partitions) out.push_back(part.get());
+#endif
+    return out;
+}
+
+inline std::vector<CaseCheck> &YsCaseChecks(CaseExpression &c) {
+#if YARDSTICK_NEW_EXPR_API
+    return c.CaseChecksMutable();
+#else
+    return c.case_checks;
+#endif
+}
+inline ParsedExpression *YsElse(CaseExpression &c) {
+#if YARDSTICK_NEW_EXPR_API
+    return c.ElseMutable().get();
+#else
+    return c.else_expr.get();
+#endif
+}
+
+inline ParsedExpression *YsChild(CastExpression &c) {
+#if YARDSTICK_NEW_EXPR_API
+    return c.ChildMutable().get();
+#else
+    return c.child.get();
+#endif
+}
+inline ParsedExpression *YsChild(SubqueryExpression &s) {
+#if YARDSTICK_NEW_EXPR_API
+    return s.GetChildMutable().get();
+#else
+    return s.child.get();
+#endif
+}
+inline const ParsedExpression *YsChild(const SubqueryExpression &s) {
+#if YARDSTICK_NEW_EXPR_API
+    return s.GetChild().get();
+#else
+    return s.child.get();
+#endif
+}
+// Mutable child slot of a subquery, for in-place rewrites.
+inline unique_ptr<ParsedExpression> &YsChildRef(SubqueryExpression &s) {
+#if YARDSTICK_NEW_EXPR_API
+    return s.GetChildMutable();
+#else
+    return s.child;
+#endif
+}
+
+inline ParsedExpression *YsInput(BetweenExpression &b) {
+#if YARDSTICK_NEW_EXPR_API
+    return b.InputMutable().get();
+#else
+    return b.input.get();
+#endif
+}
+inline ParsedExpression *YsLower(BetweenExpression &b) {
+#if YARDSTICK_NEW_EXPR_API
+    return b.LowerBoundMutable().get();
+#else
+    return b.lower.get();
+#endif
+}
+inline ParsedExpression *YsUpper(BetweenExpression &b) {
+#if YARDSTICK_NEW_EXPR_API
+    return b.UpperBoundMutable().get();
+#else
+    return b.upper.get();
+#endif
+}
+
+inline size_t YsColumnNameCount(const ColumnRefExpression &c) {
+#if YARDSTICK_NEW_EXPR_API
+    return c.ColumnNames().size();
+#else
+    return c.column_names.size();
+#endif
+}
+inline void YsPrependQualifier(ColumnRefExpression &c, const std::string &qualifier) {
+#if YARDSTICK_NEW_EXPR_API
+    c.ColumnNamesMutable().insert(c.ColumnNamesMutable().begin(), Identifier(qualifier));
+#else
+    c.column_names.insert(c.column_names.begin(), qualifier);
+#endif
+}
+
+} // namespace
+
+//=============================================================================
 // Helper: Safe strdup that handles nullptr
 //=============================================================================
 
@@ -72,14 +270,16 @@ static bool IsPotentialOrderAliasRef(
     std::string &alias_name
 ) {
     if (!colref.IsQualified()) {
-        alias_name = colref.GetColumnName();
+        alias_name = YsName(colref.GetColumnName());
         return true;
     }
-    if (colref.column_names.size() == 2 && StringUtil::CIEquals(colref.GetTableName(), "alias")) {
-        if (from_qualifiers.find(NormalizeAliasName(colref.GetTableName())) != from_qualifiers.end()) {
+    if (YsColumnNameCount(colref) == 2 &&
+        StringUtil::CIEquals(YsName(colref.GetTableName()), "alias")) {
+        if (from_qualifiers.find(NormalizeAliasName(YsName(colref.GetTableName()))) !=
+            from_qualifiers.end()) {
             return false;
         }
-        alias_name = colref.GetColumnName();
+        alias_name = YsName(colref.GetColumnName());
         return true;
     }
     return false;
@@ -529,18 +729,19 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
     switch (expr->GetExpressionClass()) {
         case ExpressionClass::FUNCTION: {
             auto* func = static_cast<FunctionExpression*>(expr);
-            std::string lower_name = StringUtil::Lower(func->function_name);
+            std::string lower_name = StringUtil::Lower(YsFuncName(*func));
+            auto args = YsArgs(*func);
 
             if (lower_name == "aggregate") {
                 AggregateCallInfo info;
 
                 // Get measure name from first argument
-                if (!func->children.empty()) {
+                if (!args.empty()) {
                     // First argument should be measure name (column ref or string)
-                    auto* first_arg = func->children[0].get();
+                    auto* first_arg = args[0];
                     if (first_arg->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
                         auto* col = static_cast<ColumnRefExpression*>(first_arg);
-                        info.measure_name = col->GetColumnName();
+                        info.measure_name = YsName(col->GetColumnName());
                     } else {
                         info.measure_name = first_arg->ToString();
                     }
@@ -559,21 +760,22 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
                 // Parse AT modifiers from remaining arguments
                 // AT syntax in DuckDB typically appears as special function arguments
                 // For now, we look for patterns like AT(ALL), AT(dimension), etc.
-                for (size_t i = 1; i < func->children.size(); i++) {
-                    auto* arg = func->children[i].get();
+                for (size_t i = 1; i < args.size(); i++) {
+                    auto* arg = args[i];
 
                     // Check if this is an AT modifier call
                     if (arg->GetExpressionClass() == ExpressionClass::FUNCTION) {
                         auto* at_func = static_cast<FunctionExpression*>(arg);
-                        std::string at_name = StringUtil::Lower(at_func->function_name);
+                        std::string at_name = StringUtil::Lower(YsFuncName(*at_func));
 
                         if (at_name == "at") {
                             YardstickAtModifier mod;
                             mod.dimension = nullptr;
                             mod.value = nullptr;
 
-                            if (!at_func->children.empty()) {
-                                auto* at_arg = at_func->children[0].get();
+                            auto at_args = YsArgs(*at_func);
+                            if (!at_args.empty()) {
+                                auto* at_arg = at_args[0];
                                 std::string at_arg_str = at_arg->ToString();
                                 std::string at_arg_lower = StringUtil::Lower(at_arg_str);
 
@@ -594,9 +796,9 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
                                     val.erase(val.find_last_not_of(" \t") + 1);
                                     mod.dimension = safe_strdup(dim);
                                     mod.value = safe_strdup(val);
-                                } else if (at_func->children.size() >= 2) {
+                                } else if (at_args.size() >= 2) {
                                     // WHERE modifier or ALL dimension
-                                    auto* second = at_func->children[1].get();
+                                    auto* second = at_args[1];
                                     if (at_arg_lower == "all") {
                                         mod.type = YARDSTICK_AT_ALL_DIM;
                                         mod.dimension = safe_strdup(second->ToString());
@@ -622,60 +824,60 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
             }
 
             // Recurse into function children
-            for (auto& child : func->children) {
-                FindAggregateCalls(child.get(), results, sql);
+            for (auto* child : args) {
+                FindAggregateCalls(child, results, sql);
             }
-            if (func->filter) {
-                FindAggregateCalls(func->filter.get(), results, sql);
+            if (auto* filter = YsFilter(*func)) {
+                FindAggregateCalls(filter, results, sql);
             }
             break;
         }
 
         case ExpressionClass::COMPARISON: {
             auto* comp = static_cast<ComparisonExpression*>(expr);
-            FindAggregateCalls(comp->left.get(), results, sql);
-            FindAggregateCalls(comp->right.get(), results, sql);
+            FindAggregateCalls(YsLeft(*comp), results, sql);
+            FindAggregateCalls(YsRight(*comp), results, sql);
             break;
         }
 
         case ExpressionClass::CONJUNCTION: {
             auto* conj = static_cast<ConjunctionExpression*>(expr);
-            for (auto& child : conj->children) {
-                FindAggregateCalls(child.get(), results, sql);
+            for (auto* child : YsChildren(*conj)) {
+                FindAggregateCalls(child, results, sql);
             }
             break;
         }
 
         case ExpressionClass::OPERATOR: {
             auto* op = static_cast<OperatorExpression*>(expr);
-            for (auto& child : op->children) {
-                FindAggregateCalls(child.get(), results, sql);
+            for (auto* child : YsChildren(*op)) {
+                FindAggregateCalls(child, results, sql);
             }
             break;
         }
 
         case ExpressionClass::CASE: {
             auto* case_expr = static_cast<CaseExpression*>(expr);
-            for (auto& check : case_expr->case_checks) {
+            for (auto& check : YsCaseChecks(*case_expr)) {
                 FindAggregateCalls(check.when_expr.get(), results, sql);
                 FindAggregateCalls(check.then_expr.get(), results, sql);
             }
-            if (case_expr->else_expr) {
-                FindAggregateCalls(case_expr->else_expr.get(), results, sql);
+            if (auto* else_expr = YsElse(*case_expr)) {
+                FindAggregateCalls(else_expr, results, sql);
             }
             break;
         }
 
         case ExpressionClass::CAST: {
             auto* cast = static_cast<CastExpression*>(expr);
-            FindAggregateCalls(cast->child.get(), results, sql);
+            FindAggregateCalls(YsChild(*cast), results, sql);
             break;
         }
 
         case ExpressionClass::SUBQUERY: {
             auto* subq = static_cast<SubqueryExpression*>(expr);
-            if (subq->child) {
-                FindAggregateCalls(subq->child.get(), results, sql);
+            if (auto* child = YsChild(*subq)) {
+                FindAggregateCalls(child, results, sql);
             }
             // Note: We don't recurse into the subquery itself
             break;
@@ -683,23 +885,23 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
 
         case ExpressionClass::WINDOW: {
             auto* window = static_cast<WindowExpression*>(expr);
-            for (auto& child : window->children) {
-                FindAggregateCalls(child.get(), results, sql);
+            for (auto* child : YsArgs(*window)) {
+                FindAggregateCalls(child, results, sql);
             }
-            for (auto& part : window->partitions) {
-                FindAggregateCalls(part.get(), results, sql);
+            for (auto* part : YsPartitions(*window)) {
+                FindAggregateCalls(part, results, sql);
             }
-            if (window->filter_expr) {
-                FindAggregateCalls(window->filter_expr.get(), results, sql);
+            if (auto* filter = YsFilter(*window)) {
+                FindAggregateCalls(filter, results, sql);
             }
             break;
         }
 
         case ExpressionClass::BETWEEN: {
             auto* between = static_cast<BetweenExpression*>(expr);
-            FindAggregateCalls(between->input.get(), results, sql);
-            FindAggregateCalls(between->lower.get(), results, sql);
-            FindAggregateCalls(between->upper.get(), results, sql);
+            FindAggregateCalls(YsInput(*between), results, sql);
+            FindAggregateCalls(YsLower(*between), results, sql);
+            FindAggregateCalls(YsUpper(*between), results, sql);
             break;
         }
 
@@ -720,8 +922,8 @@ static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableR
         case TableReferenceType::BASE_TABLE: {
             auto* base = static_cast<BaseTableRef*>(ref);
             YardstickTableRef t;
-            t.table_name = safe_strdup(base->table_name);
-            t.alias = base->alias.empty() ? nullptr : safe_strdup(base->alias);
+            t.table_name = safe_strdup(YsName(base->table_name));
+            t.alias = base->alias.empty() ? nullptr : safe_strdup(YsName(base->alias));
             t.is_subquery = false;
             tables.push_back(t);
             break;
@@ -737,8 +939,8 @@ static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableR
         case TableReferenceType::SUBQUERY: {
             auto* subq = static_cast<SubqueryRef*>(ref);
             YardstickTableRef t;
-            t.table_name = subq->alias.empty() ? safe_strdup("(subquery)") : safe_strdup(subq->alias);
-            t.alias = subq->alias.empty() ? nullptr : safe_strdup(subq->alias);
+            t.table_name = subq->alias.empty() ? safe_strdup("(subquery)") : safe_strdup(YsName(subq->alias));
+            t.alias = subq->alias.empty() ? nullptr : safe_strdup(YsName(subq->alias));
             t.is_subquery = true;
             tables.push_back(t);
             break;
@@ -760,50 +962,53 @@ static bool ExpressionContainsAggregate(ParsedExpression* expr) {
     switch (expr->GetExpressionClass()) {
         case ExpressionClass::FUNCTION: {
             auto* func = static_cast<FunctionExpression*>(expr);
-            if (IsStandardAggregate(func->function_name)) {
+            if (IsStandardAggregate(YsFuncName(*func))) {
                 return true;
             }
-            for (auto& child : func->children) {
-                if (ExpressionContainsAggregate(child.get())) return true;
+            for (auto* child : YsArgs(*func)) {
+                if (ExpressionContainsAggregate(child)) return true;
             }
-            if (func->filter && ExpressionContainsAggregate(func->filter.get())) return true;
+            if (auto* filter = YsFilter(*func)) {
+                if (ExpressionContainsAggregate(filter)) return true;
+            }
             return false;
         }
 
         case ExpressionClass::COMPARISON: {
             auto* comp = static_cast<ComparisonExpression*>(expr);
-            return ExpressionContainsAggregate(comp->left.get()) ||
-                   ExpressionContainsAggregate(comp->right.get());
+            return ExpressionContainsAggregate(YsLeft(*comp)) ||
+                   ExpressionContainsAggregate(YsRight(*comp));
         }
 
         case ExpressionClass::CONJUNCTION: {
             auto* conj = static_cast<ConjunctionExpression*>(expr);
-            for (auto& child : conj->children) {
-                if (ExpressionContainsAggregate(child.get())) return true;
+            for (auto* child : YsChildren(*conj)) {
+                if (ExpressionContainsAggregate(child)) return true;
             }
             return false;
         }
 
         case ExpressionClass::OPERATOR: {
             auto* op = static_cast<OperatorExpression*>(expr);
-            for (auto& child : op->children) {
-                if (ExpressionContainsAggregate(child.get())) return true;
+            for (auto* child : YsChildren(*op)) {
+                if (ExpressionContainsAggregate(child)) return true;
             }
             return false;
         }
 
         case ExpressionClass::CASE: {
             auto* case_expr = static_cast<CaseExpression*>(expr);
-            for (auto& check : case_expr->case_checks) {
+            for (auto& check : YsCaseChecks(*case_expr)) {
                 if (ExpressionContainsAggregate(check.when_expr.get())) return true;
                 if (ExpressionContainsAggregate(check.then_expr.get())) return true;
             }
-            return case_expr->else_expr && ExpressionContainsAggregate(case_expr->else_expr.get());
+            auto* else_expr = YsElse(*case_expr);
+            return else_expr && ExpressionContainsAggregate(else_expr);
         }
 
         case ExpressionClass::CAST: {
             auto* cast = static_cast<CastExpression*>(expr);
-            return ExpressionContainsAggregate(cast->child.get());
+            return ExpressionContainsAggregate(YsChild(*cast));
         }
 
         case ExpressionClass::WINDOW:
@@ -812,9 +1017,9 @@ static bool ExpressionContainsAggregate(ParsedExpression* expr) {
 
         case ExpressionClass::BETWEEN: {
             auto* between = static_cast<BetweenExpression*>(expr);
-            return ExpressionContainsAggregate(between->input.get()) ||
-                   ExpressionContainsAggregate(between->lower.get()) ||
-                   ExpressionContainsAggregate(between->upper.get());
+            return ExpressionContainsAggregate(YsInput(*between)) ||
+                   ExpressionContainsAggregate(YsLower(*between)) ||
+                   ExpressionContainsAggregate(YsUpper(*between));
         }
 
         default:
@@ -832,57 +1037,60 @@ static bool ExpressionContainsMeasureRef(ParsedExpression* expr) {
     switch (expr->GetExpressionClass()) {
         case ExpressionClass::FUNCTION: {
             auto* func = static_cast<FunctionExpression*>(expr);
-            if (StringUtil::Lower(func->function_name) == "aggregate") {
+            if (StringUtil::Lower(YsFuncName(*func)) == "aggregate") {
                 return true;
             }
-            for (auto& child : func->children) {
-                if (ExpressionContainsMeasureRef(child.get())) return true;
+            for (auto* child : YsArgs(*func)) {
+                if (ExpressionContainsMeasureRef(child)) return true;
             }
-            if (func->filter && ExpressionContainsMeasureRef(func->filter.get())) return true;
+            if (auto* filter = YsFilter(*func)) {
+                if (ExpressionContainsMeasureRef(filter)) return true;
+            }
             return false;
         }
 
         case ExpressionClass::COMPARISON: {
             auto* comp = static_cast<ComparisonExpression*>(expr);
-            return ExpressionContainsMeasureRef(comp->left.get()) ||
-                   ExpressionContainsMeasureRef(comp->right.get());
+            return ExpressionContainsMeasureRef(YsLeft(*comp)) ||
+                   ExpressionContainsMeasureRef(YsRight(*comp));
         }
 
         case ExpressionClass::CONJUNCTION: {
             auto* conj = static_cast<ConjunctionExpression*>(expr);
-            for (auto& child : conj->children) {
-                if (ExpressionContainsMeasureRef(child.get())) return true;
+            for (auto* child : YsChildren(*conj)) {
+                if (ExpressionContainsMeasureRef(child)) return true;
             }
             return false;
         }
 
         case ExpressionClass::OPERATOR: {
             auto* op = static_cast<OperatorExpression*>(expr);
-            for (auto& child : op->children) {
-                if (ExpressionContainsMeasureRef(child.get())) return true;
+            for (auto* child : YsChildren(*op)) {
+                if (ExpressionContainsMeasureRef(child)) return true;
             }
             return false;
         }
 
         case ExpressionClass::CASE: {
             auto* case_expr = static_cast<CaseExpression*>(expr);
-            for (auto& check : case_expr->case_checks) {
+            for (auto& check : YsCaseChecks(*case_expr)) {
                 if (ExpressionContainsMeasureRef(check.when_expr.get())) return true;
                 if (ExpressionContainsMeasureRef(check.then_expr.get())) return true;
             }
-            return case_expr->else_expr && ExpressionContainsMeasureRef(case_expr->else_expr.get());
+            auto* else_expr = YsElse(*case_expr);
+            return else_expr && ExpressionContainsMeasureRef(else_expr);
         }
 
         case ExpressionClass::CAST: {
             auto* cast = static_cast<CastExpression*>(expr);
-            return ExpressionContainsMeasureRef(cast->child.get());
+            return ExpressionContainsMeasureRef(YsChild(*cast));
         }
 
         case ExpressionClass::BETWEEN: {
             auto* between = static_cast<BetweenExpression*>(expr);
-            return ExpressionContainsMeasureRef(between->input.get()) ||
-                   ExpressionContainsMeasureRef(between->lower.get()) ||
-                   ExpressionContainsMeasureRef(between->upper.get());
+            return ExpressionContainsMeasureRef(YsInput(*between)) ||
+                   ExpressionContainsMeasureRef(YsLower(*between)) ||
+                   ExpressionContainsMeasureRef(YsUpper(*between));
         }
 
         default:
@@ -896,82 +1104,82 @@ static void QualifyColumnRefs(ParsedExpression* expr, const std::string& qualifi
     switch (expr->GetExpressionClass()) {
         case ExpressionClass::COLUMN_REF: {
             auto* col = static_cast<ColumnRefExpression*>(expr);
-            if (col->column_names.size() == 1) {
-                col->column_names.insert(col->column_names.begin(), qualifier);
+            if (YsColumnNameCount(*col) == 1) {
+                YsPrependQualifier(*col, qualifier);
             }
             break;
         }
         case ExpressionClass::FUNCTION: {
             auto* func = static_cast<FunctionExpression*>(expr);
-            for (auto& child : func->children) {
-                QualifyColumnRefs(child.get(), qualifier);
+            for (auto* child : YsArgs(*func)) {
+                QualifyColumnRefs(child, qualifier);
             }
-            if (func->filter) {
-                QualifyColumnRefs(func->filter.get(), qualifier);
+            if (auto* filter = YsFilter(*func)) {
+                QualifyColumnRefs(filter, qualifier);
             }
             break;
         }
         case ExpressionClass::COMPARISON: {
             auto* comp = static_cast<ComparisonExpression*>(expr);
-            QualifyColumnRefs(comp->left.get(), qualifier);
-            QualifyColumnRefs(comp->right.get(), qualifier);
+            QualifyColumnRefs(YsLeft(*comp), qualifier);
+            QualifyColumnRefs(YsRight(*comp), qualifier);
             break;
         }
         case ExpressionClass::CONJUNCTION: {
             auto* conj = static_cast<ConjunctionExpression*>(expr);
-            for (auto& child : conj->children) {
-                QualifyColumnRefs(child.get(), qualifier);
+            for (auto* child : YsChildren(*conj)) {
+                QualifyColumnRefs(child, qualifier);
             }
             break;
         }
         case ExpressionClass::OPERATOR: {
             auto* op = static_cast<OperatorExpression*>(expr);
-            for (auto& child : op->children) {
-                QualifyColumnRefs(child.get(), qualifier);
+            for (auto* child : YsChildren(*op)) {
+                QualifyColumnRefs(child, qualifier);
             }
             break;
         }
         case ExpressionClass::CASE: {
             auto* case_expr = static_cast<CaseExpression*>(expr);
-            for (auto& check : case_expr->case_checks) {
+            for (auto& check : YsCaseChecks(*case_expr)) {
                 QualifyColumnRefs(check.when_expr.get(), qualifier);
                 QualifyColumnRefs(check.then_expr.get(), qualifier);
             }
-            if (case_expr->else_expr) {
-                QualifyColumnRefs(case_expr->else_expr.get(), qualifier);
+            if (auto* else_expr = YsElse(*case_expr)) {
+                QualifyColumnRefs(else_expr, qualifier);
             }
             break;
         }
         case ExpressionClass::CAST: {
             auto* cast = static_cast<CastExpression*>(expr);
-            QualifyColumnRefs(cast->child.get(), qualifier);
+            QualifyColumnRefs(YsChild(*cast), qualifier);
             break;
         }
         case ExpressionClass::SUBQUERY: {
             auto* subq = static_cast<SubqueryExpression*>(expr);
-            if (subq->child) {
-                QualifyColumnRefs(subq->child.get(), qualifier);
+            if (auto* child = YsChild(*subq)) {
+                QualifyColumnRefs(child, qualifier);
             }
             break;
         }
         case ExpressionClass::WINDOW: {
             auto* window = static_cast<WindowExpression*>(expr);
-            for (auto& child : window->children) {
-                QualifyColumnRefs(child.get(), qualifier);
+            for (auto* child : YsArgs(*window)) {
+                QualifyColumnRefs(child, qualifier);
             }
-            for (auto& part : window->partitions) {
-                QualifyColumnRefs(part.get(), qualifier);
+            for (auto* part : YsPartitions(*window)) {
+                QualifyColumnRefs(part, qualifier);
             }
-            if (window->filter_expr) {
-                QualifyColumnRefs(window->filter_expr.get(), qualifier);
+            if (auto* filter = YsFilter(*window)) {
+                QualifyColumnRefs(filter, qualifier);
             }
             break;
         }
         case ExpressionClass::BETWEEN: {
             auto* between = static_cast<BetweenExpression*>(expr);
-            QualifyColumnRefs(between->input.get(), qualifier);
-            QualifyColumnRefs(between->lower.get(), qualifier);
-            QualifyColumnRefs(between->upper.get(), qualifier);
+            QualifyColumnRefs(YsInput(*between), qualifier);
+            QualifyColumnRefs(YsLower(*between), qualifier);
+            QualifyColumnRefs(YsUpper(*between), qualifier);
             break;
         }
         default:
@@ -1146,7 +1354,7 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
         for (auto& expr : select_node->select_list) {
             YardstickSelectItem item;
             item.expression_sql = safe_strdup(expr->ToString());
-            item.alias = expr->HasAlias() ? safe_strdup(expr->GetAlias()) : nullptr;
+            item.alias = expr->HasAlias() ? safe_strdup(YsName(expr->GetAlias())) : nullptr;
 
             auto query_location = expr->GetQueryLocation();
             if (query_location.IsValid()) {
@@ -1267,13 +1475,13 @@ static void CollectTableQualifiers(const TableRef *ref, TableQualifierSet &quali
         return;
     }
 
-    AddTableQualifier(qualifiers, ref->alias);
+    AddTableQualifier(qualifiers, YsName(ref->alias));
 
     switch (ref->type) {
         case TableReferenceType::BASE_TABLE: {
             auto *base = static_cast<const BaseTableRef*>(ref);
             if (ref->alias.empty()) {
-                AddTableQualifier(qualifiers, base->table_name);
+                AddTableQualifier(qualifiers, YsName(base->table_name));
             }
             break;
         }
@@ -1322,8 +1530,8 @@ static void EnumerateOrderAliasScopeChildren(
 ) {
     if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
         auto &subquery_expr = expr.Cast<SubqueryExpression>();
-        if (subquery_expr.child) {
-            callback(*subquery_expr.child);
+        if (auto* child = YsChild(subquery_expr)) {
+            callback(*child);
         }
         return;
     }
@@ -1337,8 +1545,9 @@ static void EnumerateOrderAliasScopeChildren(
 ) {
     if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
         auto &subquery_expr = expr.Cast<SubqueryExpression>();
-        if (subquery_expr.child) {
-            callback(subquery_expr.child);
+        auto &child = YsChildRef(subquery_expr);
+        if (child) {
+            callback(child);
         }
         return;
     }
@@ -1431,7 +1640,7 @@ extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
                 continue;
             }
             bool has_subquery = expr->HasSubquery();
-            aliases[NormalizeAliasName(expr->GetAlias())] = SelectAliasEntry { expr.get(), has_subquery };
+            aliases[NormalizeAliasName(YsName(expr->GetAlias()))] = SelectAliasEntry { expr.get(), has_subquery };
             has_subquery_alias = has_subquery_alias || has_subquery;
         }
 
@@ -1504,10 +1713,11 @@ extern "C" YardstickExpressionInfo* yardstick_parse_expression(const char* expr_
         // If it's a simple aggregate function, extract the function name and inner expr
         if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
             auto* func = static_cast<FunctionExpression*>(expr.get());
-            if (IsStandardAggregate(func->function_name)) {
-                result->aggregate_func = safe_strdup(StringUtil::Upper(func->function_name));
-                if (!func->children.empty()) {
-                    result->inner_expr = safe_strdup(func->children[0]->ToString());
+            if (IsStandardAggregate(YsFuncName(*func))) {
+                result->aggregate_func = safe_strdup(StringUtil::Upper(YsFuncName(*func)));
+                auto args = YsArgs(*func);
+                if (!args.empty()) {
+                    result->inner_expr = safe_strdup(args[0]->ToString());
                 }
             }
         }

@@ -22,8 +22,25 @@ public:
 BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
                                OperatorExtensionInfo *info, SQLStatement &statement);
 
+// DuckDB main changed parse_function_t to receive the post-PEG-failure token
+// tail (vector<SimpleToken>) instead of the raw query string; DuckDB 1.5 and
+// earlier pass the query string. Detected via the header the refactor introduced.
+// Yardstick performs all of its rewriting in yardstick_parser_override (which
+// still receives the full query string on both APIs), so on the new signature
+// parse_function is a no-op fallback.
+#if __has_include("duckdb/common/identifier.hpp")
+#define YARDSTICK_TOKEN_PARSE_FN 1
+#else
+#define YARDSTICK_TOKEN_PARSE_FN 0
+#endif
+
+#if YARDSTICK_TOKEN_PARSE_FN
+ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
+                                            const vector<SimpleToken> &tokens);
+#else
 ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
                                             const std::string &query);
+#endif
 
 ParserExtensionPlanResult yardstick_plan(ParserExtensionInfo *, ClientContext &,
                                           unique_ptr<ParserExtensionParseData>);

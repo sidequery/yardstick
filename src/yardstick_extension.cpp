@@ -330,6 +330,16 @@ static bool StartsWithSemantic(const std::string &query, std::string &stripped_q
     return true;
 }
 
+#if YARDSTICK_TOKEN_PARSE_FN
+// DuckDB main: parse_function receives the post-PEG-failure token tail rather
+// than the query string. Yardstick rewrites queries earlier, in
+// yardstick_parser_override (which sees the full query string), so there is
+// nothing to do here -- decline and let DuckDB proceed.
+ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
+                                            const vector<SimpleToken> &) {
+    return ParserExtensionParseResult();
+}
+#else
 ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
                                             const std::string &query) {
 
@@ -422,6 +432,7 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
     // Not a yardstick query, let DuckDB handle it
     return ParserExtensionParseResult();
 }
+#endif // YARDSTICK_TOKEN_PARSE_FN
 
 //=============================================================================
 // PARSER OVERRIDE: intercepts ALL queries before DuckDB's native parser
