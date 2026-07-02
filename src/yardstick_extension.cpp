@@ -565,34 +565,6 @@ static bool EqualsCaseInsensitive(const std::string &left, const std::string &ri
     return true;
 }
 
-static bool ContainsIdentifier(const std::string &sql, const std::string &identifier) {
-    if (identifier.empty() || sql.size() < identifier.size()) {
-        return false;
-    }
-
-    for (idx_t i = 0; i + identifier.size() <= sql.size(); i++) {
-        bool matches = true;
-        for (idx_t j = 0; j < identifier.size(); j++) {
-            if (std::tolower(static_cast<unsigned char>(sql[i + j])) !=
-                std::tolower(static_cast<unsigned char>(identifier[j]))) {
-                matches = false;
-                break;
-            }
-        }
-        if (!matches) {
-            continue;
-        }
-
-        bool left_boundary = i == 0 || !IsIdentifierChar(sql[i - 1]);
-        idx_t end = i + identifier.size();
-        bool right_boundary = end >= sql.size() || !IsIdentifierChar(sql[end]);
-        if (left_boundary && right_boundary) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool RemoveCaseInsensitive(std::vector<std::string> &values, const std::string &value) {
     for (auto it = values.begin(); it != values.end(); ++it) {
         if (EqualsCaseInsensitive(*it, value)) {
@@ -603,8 +575,20 @@ static bool RemoveCaseInsensitive(std::vector<std::string> &values, const std::s
     return false;
 }
 
-static bool HasTemporarySnapshot(const std::vector<MeasureViewSnapshot> &snapshots,
-                                 const std::string &view_name) {
+static bool RestoreAndRemoveTemporarySnapshot(std::vector<MeasureViewSnapshot> &snapshots,
+                                              const std::string &view_name) {
+    for (auto it = snapshots.begin(); it != snapshots.end(); ++it) {
+        if (EqualsCaseInsensitive(it->view_name, view_name)) {
+            yardstick_restore_measure_view_snapshot(it->view_name.c_str(), it->snapshot);
+            snapshots.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool HasMeasureSnapshot(const std::vector<MeasureViewSnapshot> &snapshots,
+                               const std::string &view_name) {
     for (auto &snapshot : snapshots) {
         if (EqualsCaseInsensitive(snapshot.view_name, view_name)) {
             return true;
@@ -613,8 +597,132 @@ static bool HasTemporarySnapshot(const std::vector<MeasureViewSnapshot> &snapsho
     return false;
 }
 
+static std::string SelectPortionForTableAnalysis(const std::string &sql) {
+    std::string dollar_quote_end;
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+    idx_t depth = 0;
+
+    for (idx_t i = 0; i < sql.size(); i++) {
+        char c = sql[i];
+        char next = i + 1 < sql.size() ? sql[i + 1] : '\0';
+
+        if (in_line_comment) {
+            if (c == '\n') {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if (in_block_comment) {
+            if (c == '*' && next == '/') {
+                in_block_comment = false;
+                i++;
+            }
+            continue;
+        }
+        if (!dollar_quote_end.empty()) {
+            if (sql.compare(i, dollar_quote_end.size(), dollar_quote_end) == 0) {
+                i += dollar_quote_end.size() - 1;
+                dollar_quote_end.clear();
+            }
+            continue;
+        }
+        if (in_single_quote) {
+            if (c == '\'' && next == '\'') {
+                i++;
+            } else if (c == '\'') {
+                in_single_quote = false;
+            }
+            continue;
+        }
+        if (in_double_quote) {
+            if (c == '"' && next == '"') {
+                i++;
+            } else if (c == '"') {
+                in_double_quote = false;
+            }
+            continue;
+        }
+
+        if (c == '-' && next == '-') {
+            in_line_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '/' && next == '*') {
+            in_block_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '\'') {
+            in_single_quote = true;
+            continue;
+        }
+        if (c == '"') {
+            in_double_quote = true;
+            continue;
+        }
+        if (c == '$') {
+            idx_t tag_end = i + 1;
+            while (tag_end < sql.size() && sql[tag_end] != '$') {
+                char tag_char = sql[tag_end];
+                if (!std::isalnum(static_cast<unsigned char>(tag_char)) && tag_char != '_') {
+                    break;
+                }
+                tag_end++;
+            }
+            if (tag_end < sql.size() && sql[tag_end] == '$') {
+                dollar_quote_end = sql.substr(i, tag_end - i + 1);
+                i = tag_end;
+                continue;
+            }
+        }
+
+        if (c == '(') {
+            depth++;
+            continue;
+        }
+        if (c == ')' && depth > 0) {
+            depth--;
+            continue;
+        }
+
+        size_t pos = i;
+        if (depth == 0 && ConsumeKeyword(sql, pos, "SELECT")) {
+            return sql.substr(i);
+        }
+    }
+
+    return sql;
+}
+
+static bool StatementReadsFromView(const std::string &sql, const std::string &view_name) {
+    std::string select_sql = SelectPortionForTableAnalysis(sql);
+    YardstickSelectInfo *info = yardstick_parse_select(select_sql.c_str());
+    if (!info || info->error) {
+        if (info) {
+            yardstick_free_select_info(info);
+        }
+        return false;
+    }
+
+    bool found = false;
+    for (idx_t i = 0; i < info->table_count; i++) {
+        if (info->tables[i].table_name &&
+            EqualsCaseInsensitive(info->tables[i].table_name, view_name)) {
+            found = true;
+            break;
+        }
+    }
+
+    yardstick_free_select_info(info);
+    return found;
+}
+
 static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
-                                              const std::vector<MeasureViewSnapshot> &temporary_snapshots,
+                                              std::vector<MeasureViewSnapshot> &temporary_snapshots,
                                               std::vector<std::string> &pending_temporary_views,
                                               std::vector<MeasureViewSnapshot> &snapshots) {
     char *extracted_view_name = yardstick_extract_drop_view_name(sql.c_str());
@@ -625,9 +733,10 @@ static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
     std::string view_name = extracted_view_name;
     yardstick_free(extracted_view_name);
 
-    if (HasTemporarySnapshot(temporary_snapshots, view_name)) {
+    if (HasMeasureSnapshot(temporary_snapshots, view_name)) {
         RemoveCaseInsensitive(pending_temporary_views, view_name);
         yardstick_drop_measure_view_from_sql(sql.c_str());
+        RestoreAndRemoveTemporarySnapshot(temporary_snapshots, view_name);
         return true;
     }
 
@@ -760,7 +869,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         if (result.had_aggregate) {
             rewrite_result.had_aggregate = true;
             for (auto it = pending_temporary_views.begin(); it != pending_temporary_views.end();) {
-                if (ContainsIdentifier(aggregate_statement, *it)) {
+                if (StatementReadsFromView(aggregate_statement, *it)) {
                     it = pending_temporary_views.erase(it);
                 } else {
                     ++it;
