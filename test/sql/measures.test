@@ -241,6 +241,19 @@ GROUP BY year;
 ----
 TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
 
+statement error
+CREATE TEMP VIEW batch_temp_reuse_v AS
+SELECT year, SUM(amount) AS MEASURE temp_reuse_revenue
+FROM sales;
+CREATE TABLE batch_temp_reuse_result AS
+SELECT year, AGGREGATE(temp_reuse_revenue) AS revenue
+FROM batch_temp_reuse_v;
+SELECT year, AGGREGATE(temp_reuse_revenue) AS revenue
+FROM batch_temp_reuse_v
+GROUP BY year;
+----
+TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
+
 query IR rowsort
 CREATE VIEW batch_catalog_guard_v AS
 SELECT year, SUM(amount) AS MEASURE catalog_guard_revenue

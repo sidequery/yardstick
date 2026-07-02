@@ -531,6 +531,11 @@ static bool StartsWithDropViewStatement(const std::string &sql) {
     return ConsumeKeyword(sql, pos, "VIEW");
 }
 
+static bool StartsWithSelectStatement(const std::string &sql) {
+    size_t pos = SkipWhitespaceAndComments(sql, 0);
+    return ConsumeKeyword(sql, pos, "SELECT");
+}
+
 struct MeasureRewriteResult {
     bool had_measure_view = false;
     bool had_aggregate = false;
@@ -584,6 +589,15 @@ static bool RemoveCaseInsensitive(std::vector<std::string> &values, const std::s
     return false;
 }
 
+static bool ContainsCaseInsensitive(const std::vector<std::string> &values, const std::string &value) {
+    for (auto &candidate : values) {
+        if (EqualsCaseInsensitive(candidate, value)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool RestoreAndRemoveTemporarySnapshot(std::vector<MeasureViewSnapshot> &snapshots,
                                               const std::string &view_name) {
     for (auto it = snapshots.begin(); it != snapshots.end(); ++it) {
@@ -610,12 +624,17 @@ static bool TableRefMatchesView(const std::string &table_name, const std::string
     if (EqualsCaseInsensitive(table_name, view_name)) {
         return true;
     }
-    if (table_name.size() <= view_name.size()) {
-        return false;
+    if (table_name.size() > view_name.size()) {
+        idx_t suffix_start = table_name.size() - view_name.size();
+        return table_name[suffix_start - 1] == '.' &&
+               EqualsCaseInsensitive(table_name.substr(suffix_start), view_name);
     }
-    idx_t suffix_start = table_name.size() - view_name.size();
-    return table_name[suffix_start - 1] == '.' &&
-           EqualsCaseInsensitive(table_name.substr(suffix_start), view_name);
+    if (view_name.size() > table_name.size()) {
+        idx_t suffix_start = view_name.size() - table_name.size();
+        return view_name[suffix_start - 1] == '.' &&
+               EqualsCaseInsensitive(view_name.substr(suffix_start), table_name);
+    }
+    return false;
 }
 
 static std::string SelectPortionForTableAnalysis(const std::string &sql) {
@@ -940,9 +959,11 @@ static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
                                               const std::string &view_name,
                                               std::vector<MeasureViewSnapshot> &temporary_snapshots,
                                               std::vector<std::string> &pending_temporary_views,
+                                              std::vector<std::string> &used_temporary_views,
                                               std::vector<MeasureViewSnapshot> &snapshots) {
     if (HasMeasureSnapshot(temporary_snapshots, view_name)) {
         RemoveCaseInsensitive(pending_temporary_views, view_name);
+        RemoveCaseInsensitive(used_temporary_views, view_name);
         yardstick_drop_measure_view_from_sql(sql.c_str());
         RestoreAndRemoveTemporarySnapshot(temporary_snapshots, view_name);
         return true;
@@ -987,6 +1008,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
     std::vector<std::string> rewritten_statements;
     std::vector<MeasureViewSnapshot> temporary_snapshots;
     std::vector<std::string> pending_temporary_views;
+    std::vector<std::string> used_temporary_views;
     bool catalog_statement_seen = false;
     bool executable_since_catalog_mutation = false;
     auto cleanup_temporary_measure_views = [&temporary_snapshots]() {
@@ -1016,6 +1038,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
             catalog_statement_seen = true;
             SnapshotAndDropMeasureViewFromSql(statement_body, drop_view_name,
                                               temporary_snapshots, pending_temporary_views,
+                                              used_temporary_views,
                                               permanent_snapshots);
             executable_since_catalog_mutation = false;
             rewritten_statements.push_back(statement);
@@ -1099,6 +1122,18 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
             continue;
         }
 
+        std::vector<std::string> read_temporary_views;
+        for (auto &view_name : pending_temporary_views) {
+            if (StatementReadsFromView(aggregate_statement, view_name)) {
+                read_temporary_views.push_back(view_name);
+            }
+        }
+        if (!read_temporary_views.empty() && StartsWithSelectStatement(aggregate_statement)) {
+            rewrite_result.error = "TEMPORARY AS MEASURE views cannot be returned directly from a statement batch";
+            cleanup_temporary_measure_views();
+            return rewrite_result;
+        }
+
         YardstickAggregateResult result = yardstick_expand_aggregate(aggregate_statement.c_str());
         if (result.error) {
             yardstick_free_aggregate_result(result);
@@ -1111,13 +1146,10 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
 
         if (result.had_aggregate) {
             rewrite_result.had_aggregate = true;
-            bool reads_pending_temporary_view = false;
-            for (auto it = pending_temporary_views.begin(); it != pending_temporary_views.end();) {
-                if (StatementReadsFromView(aggregate_statement, *it)) {
-                    reads_pending_temporary_view = true;
-                    it = pending_temporary_views.erase(it);
-                } else {
-                    ++it;
+            bool reads_pending_temporary_view = !read_temporary_views.empty();
+            for (auto &view_name : read_temporary_views) {
+                if (!ContainsCaseInsensitive(used_temporary_views, view_name)) {
+                    used_temporary_views.push_back(view_name);
                 }
             }
             string expanded_sql(result.expanded_sql);
@@ -1141,7 +1173,10 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         yardstick_free_aggregate_result(result);
     }
 
-    if (!pending_temporary_views.empty()) {
+    for (auto &view_name : pending_temporary_views) {
+        if (ContainsCaseInsensitive(used_temporary_views, view_name)) {
+            continue;
+        }
         rewrite_result.error = "TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()";
         cleanup_temporary_measure_views();
         return rewrite_result;
