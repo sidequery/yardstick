@@ -64,6 +64,11 @@ SELECT (
 ----
 <REGEX>:.*(Parser Error|Catalog Error).*
 
+statement ok
+CREATE OR REPLACE VIEW sales_v AS
+SELECT year, region, SUM(amount) AS MEASURE revenue
+FROM sales;
+
 query R
 SEMANTIC SELECT AGGREGATE(revenue) FROM sales_v;
 ----
@@ -110,6 +115,11 @@ DROP VIEW sales_case_v;
 SELECT (
 ----
 <REGEX>:.*(Parser Error|Catalog Error).*
+
+statement ok
+CREATE OR REPLACE VIEW Sales_Case_V AS
+SELECT year, SUM(amount) AS MEASURE case_revenue
+FROM sales;
 
 query R
 SEMANTIC SELECT AGGREGATE(case_revenue) FROM Sales_Case_V;
