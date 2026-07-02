@@ -3634,6 +3634,29 @@ fn dollar_quote_delimiter_at(sql: &str, start: usize) -> Option<&str> {
     }
 }
 
+fn is_bracket_quoted_identifier_at(sql: &str, start: usize) -> bool {
+    let bytes = sql.as_bytes();
+    if start >= bytes.len() || bytes[start] != b'[' {
+        return false;
+    }
+
+    let mut i = start + 1;
+    let content_start = i;
+    while i < bytes.len() {
+        if bytes[i] == b']' {
+            return i > content_start;
+        }
+        if i + 1 < bytes.len()
+            && ((bytes[i] == b'-' && bytes[i + 1] == b'-')
+                || (bytes[i] == b'/' && bytes[i + 1] == b'*'))
+        {
+            return false;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -3763,7 +3786,7 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
             '\'' => in_single = true,
             '"' => in_double = true,
             '`' => in_backtick = true,
-            '[' => in_bracket = true,
+            '[' if is_bracket_quoted_identifier_at(sql, i - ch.len_utf8()) => in_bracket = true,
             _ => {}
         }
     }
@@ -6675,6 +6698,28 @@ FROM orders"#;
         assert!(sanitized.contains("-- $tag$ caf"));
         assert!(!sanitized.ends_with("café"));
         assert!(sanitized.is_ascii());
+        assert_eq!(sanitized.len(), sql.len());
+    }
+
+    #[test]
+    fn test_comment_sanitizer_handles_comments_inside_list_brackets() {
+        let sql = "SELECT [1, /* 東京 */ 2] AS xs FROM t -- résumé";
+        let sanitized = sanitize_non_ascii_in_sql_comments(sql);
+
+        assert!(sanitized.contains("[1, /*"));
+        assert!(!sanitized.contains("東京"));
+        assert!(!sanitized.ends_with("résumé"));
+        assert!(sanitized.is_ascii());
+        assert_eq!(sanitized.len(), sql.len());
+    }
+
+    #[test]
+    fn test_comment_sanitizer_preserves_bracket_quoted_identifiers() {
+        let sql = "SELECT [東京] FROM t -- résumé";
+        let sanitized = sanitize_non_ascii_in_sql_comments(sql);
+
+        assert!(sanitized.contains("[東京]"));
+        assert!(!sanitized.ends_with("résumé"));
         assert_eq!(sanitized.len(), sql.len());
     }
 
