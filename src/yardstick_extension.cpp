@@ -44,6 +44,10 @@ extern "C" {
     bool yardstick_has_as_measure(const char *sql);
     bool yardstick_has_aggregate(const char *sql);
     bool yardstick_drop_measure_view_from_sql(const char *sql);
+    char *yardstick_extract_view_name(const char *sql);
+    void *yardstick_snapshot_measure_view(const char *view_name);
+    void yardstick_restore_measure_view_snapshot(const char *view_name, void *snapshot);
+    void yardstick_free_measure_view_snapshot(void *snapshot);
     YardstickCreateViewResult yardstick_process_create_view(const char *sql);
     YardstickAggregateResult yardstick_expand_aggregate(const char *sql);
     void yardstick_free(char *ptr);
@@ -524,16 +528,37 @@ struct MeasureRewriteResult {
     std::string error;
 };
 
-static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::string &query) {
+struct MeasureViewSnapshot {
+    std::string view_name;
+    void *snapshot = nullptr;
+};
+
+static void RestoreMeasureViewSnapshots(std::vector<MeasureViewSnapshot> &snapshots) {
+    for (auto it = snapshots.rbegin(); it != snapshots.rend(); ++it) {
+        yardstick_restore_measure_view_snapshot(it->view_name.c_str(), it->snapshot);
+    }
+    snapshots.clear();
+}
+
+static void FreeMeasureViewSnapshots(std::vector<MeasureViewSnapshot> &snapshots) {
+    for (auto &snapshot : snapshots) {
+        yardstick_free_measure_view_snapshot(snapshot.snapshot);
+    }
+    snapshots.clear();
+}
+
+static MeasureViewSnapshot SnapshotMeasureView(const std::string &view_name) {
+    return {view_name, yardstick_snapshot_measure_view(view_name.c_str())};
+}
+
+static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
+        const std::string &query,
+        std::vector<MeasureViewSnapshot> &permanent_snapshots) {
     MeasureRewriteResult rewrite_result;
     std::vector<std::string> rewritten_statements;
-    std::vector<std::string> temporary_measure_views;
-    auto cleanup_temporary_measure_views = [&temporary_measure_views]() {
-        for (auto it = temporary_measure_views.rbegin(); it != temporary_measure_views.rend(); ++it) {
-            std::string drop_sql = "DROP VIEW " + *it;
-            yardstick_drop_measure_view_from_sql(drop_sql.c_str());
-        }
-        temporary_measure_views.clear();
+    std::vector<MeasureViewSnapshot> temporary_snapshots;
+    auto cleanup_temporary_measure_views = [&temporary_snapshots]() {
+        RestoreMeasureViewSnapshots(temporary_snapshots);
     };
 
     for (auto statement : SplitSqlStatements(query)) {
@@ -549,25 +574,52 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::s
             StartsWithCreateViewStatement(statement_body)) {
             std::string rewritten_statement = RewritePercentileWithinGroup(statement_body);
             bool is_temporary_measure_view = IsTemporaryCreateViewStatement(statement_body);
+            std::string view_name;
+            char *extracted_view_name = yardstick_extract_view_name(rewritten_statement.c_str());
+            if (extracted_view_name) {
+                view_name = extracted_view_name;
+                yardstick_free(extracted_view_name);
+            }
+            MeasureViewSnapshot snapshot;
+            bool has_snapshot = false;
+            if (!view_name.empty()) {
+                snapshot = SnapshotMeasureView(view_name);
+                has_snapshot = true;
+            }
             YardstickCreateViewResult result = yardstick_process_create_view(rewritten_statement.c_str());
 
             if (result.error) {
                 rewrite_result.error = result.error;
                 yardstick_free_create_view_result(result);
+                if (has_snapshot) {
+                    yardstick_free_measure_view_snapshot(snapshot.snapshot);
+                }
                 cleanup_temporary_measure_views();
                 return rewrite_result;
             }
 
             if (result.is_measure_view) {
                 rewrite_result.had_measure_view = true;
-                if (is_temporary_measure_view && result.view_name) {
-                    temporary_measure_views.emplace_back(result.view_name);
+                if (view_name.empty() && result.view_name) {
+                    view_name = result.view_name;
+                }
+                if (is_temporary_measure_view && !view_name.empty()) {
+                    if (has_snapshot) {
+                        temporary_snapshots.push_back(snapshot);
+                        has_snapshot = false;
+                    }
+                } else if (has_snapshot) {
+                    permanent_snapshots.push_back(snapshot);
+                    has_snapshot = false;
                 }
                 rewritten_statements.push_back(RewritePercentileWithinGroup(result.clean_sql));
             } else {
                 rewritten_statements.push_back(statement);
             }
 
+            if (has_snapshot) {
+                yardstick_free_measure_view_snapshot(snapshot.snapshot);
+            }
             yardstick_free_create_view_result(result);
             continue;
         }
@@ -593,7 +645,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::s
         yardstick_free_aggregate_result(result);
     }
 
-    if (!temporary_measure_views.empty() && !rewrite_result.had_aggregate) {
+    if (!temporary_snapshots.empty() && !rewrite_result.had_aggregate) {
         rewrite_result.error = "TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()";
         cleanup_temporary_measure_views();
         return rewrite_result;
@@ -636,9 +688,11 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
     }
 
     bool had_measure_rewrite = false;
+    std::vector<MeasureViewSnapshot> permanent_snapshots;
     if (yardstick_has_as_measure(sql_to_check.c_str())) {
-        auto measure_rewrite = RewriteMeasureViewsStatementByStatement(sql_to_check);
+        auto measure_rewrite = RewriteMeasureViewsStatementByStatement(sql_to_check, permanent_snapshots);
         if (!measure_rewrite.error.empty()) {
+            RestoreMeasureViewSnapshots(permanent_snapshots);
             return ParserExtensionParseResult(measure_rewrite.error);
         }
         if (measure_rewrite.had_measure_view) {
@@ -692,17 +746,26 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
 
     if (had_measure_rewrite) {
         Parser parser;
-        parser.ParseQuery(sql_to_check);
+        try {
+            parser.ParseQuery(sql_to_check);
+        } catch (std::exception &e) {
+            RestoreMeasureViewSnapshots(permanent_snapshots);
+            return ParserExtensionParseResult(e.what());
+        }
         auto statements = std::move(parser.statements);
 
         if (statements.empty()) {
+            RestoreMeasureViewSnapshots(permanent_snapshots);
             return ParserExtensionParseResult("CREATE VIEW produced no statements");
         }
 
+        FreeMeasureViewSnapshots(permanent_snapshots);
         return ParserExtensionParseResult(
             make_uniq_base<ParserExtensionParseData, YardstickParseData>(
                 std::move(statements[0])));
     }
+
+    FreeMeasureViewSnapshots(permanent_snapshots);
 
     // Not a yardstick query, let DuckDB handle it
     return ParserExtensionParseResult();
@@ -731,9 +794,11 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
     }
 
     bool had_measure_rewrite = false;
+    std::vector<MeasureViewSnapshot> permanent_snapshots;
     if (yardstick_has_as_measure(sql_to_check.c_str())) {
-        auto measure_rewrite = RewriteMeasureViewsStatementByStatement(sql_to_check);
+        auto measure_rewrite = RewriteMeasureViewsStatementByStatement(sql_to_check, permanent_snapshots);
         if (!measure_rewrite.error.empty()) {
+            RestoreMeasureViewSnapshots(permanent_snapshots);
             try {
                 throw ParserException(measure_rewrite.error);
             } catch (std::exception &e) {
@@ -805,11 +870,15 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
         try {
             Parser parser;
             parser.ParseQuery(sql_to_check);
+            FreeMeasureViewSnapshots(permanent_snapshots);
             return ParserOverrideResult(std::move(parser.statements));
         } catch (std::exception &e) {
+            RestoreMeasureViewSnapshots(permanent_snapshots);
             return ParserOverrideResult(e);
         }
     }
+
+    FreeMeasureViewSnapshots(permanent_snapshots);
 
     // Not a yardstick query; fall through to DuckDB's native parser
     return ParserOverrideResult();

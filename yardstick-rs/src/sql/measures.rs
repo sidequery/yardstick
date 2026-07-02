@@ -6329,6 +6329,11 @@ pub fn get_measure_view(view_name: &str) -> Option<MeasureView> {
     views.get(view_name).cloned()
 }
 
+pub fn restore_measure_view(view: MeasureView) {
+    let mut views = MEASURE_VIEWS.lock().unwrap();
+    views.insert(view.view_name.clone(), view);
+}
+
 pub fn clear_measure_views() {
     let mut views = MEASURE_VIEWS.lock().unwrap();
     views.clear();

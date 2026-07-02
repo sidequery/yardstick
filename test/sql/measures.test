@@ -195,6 +195,33 @@ FROM sales;
 ----
 TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
 
+statement ok
+CREATE VIEW batch_shadow_v AS
+SELECT year, SUM(amount) AS MEASURE shadow_revenue
+FROM sales;
+
+statement ok
+CREATE TEMP VIEW batch_shadow_v AS
+SELECT year, SUM(amount * 10) AS MEASURE shadow_revenue
+FROM sales;
+CREATE TABLE batch_shadow_temp_result AS
+SELECT year, AGGREGATE(shadow_revenue) AS revenue
+FROM batch_shadow_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_shadow_temp_result;
+----
+2022	1500.0
+2023	2250.0
+
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(shadow_revenue) AS revenue
+FROM batch_shadow_v
+GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================
