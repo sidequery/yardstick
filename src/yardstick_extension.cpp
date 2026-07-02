@@ -730,6 +730,11 @@ static std::string SelectPortionForTableAnalysis(const std::string &sql) {
         }
 
         size_t pos = i;
+        if (depth == 0 && ConsumeKeyword(sql, pos, "WITH")) {
+            return sql.substr(i);
+        }
+
+        pos = i;
         if (depth == 0 && ConsumeKeyword(sql, pos, "SELECT")) {
             return sql.substr(i);
         }

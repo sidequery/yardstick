@@ -6327,6 +6327,7 @@ pub fn store_measure_view(
     };
 
     let mut views = MEASURE_VIEWS.lock().unwrap();
+    remove_measure_view_case_insensitive(&mut views, view_name);
     views.insert(view_name.to_string(), measure_view);
 }
 
@@ -6340,6 +6341,7 @@ pub fn get_measure_view(view_name: &str) -> Option<MeasureView> {
 
 pub fn restore_measure_view(view: MeasureView) {
     let mut views = MEASURE_VIEWS.lock().unwrap();
+    remove_measure_view_case_insensitive(&mut views, &view.view_name);
     views.insert(view.view_name.clone(), view);
 }
 
@@ -6490,6 +6492,21 @@ fn is_literal_constant(expr: &str) -> bool {
         }
     }
 
+    false
+}
+
+fn remove_measure_view_case_insensitive(
+    views: &mut HashMap<String, MeasureView>,
+    view_name: &str,
+) -> bool {
+    let key = views
+        .keys()
+        .find(|name| name.eq_ignore_ascii_case(view_name))
+        .cloned();
+    if let Some(key) = key {
+        views.remove(&key);
+        return true;
+    }
     false
 }
 
@@ -7365,6 +7382,38 @@ FROM orders"#;
         assert!(get_measure_view("orders_v").is_some());
         assert!(drop_measure_view_from_sql("DROP VIEW orders_v;"));
         assert!(get_measure_view("orders_v").is_none());
+
+        store_measure_view(
+            "sales_v",
+            vec![ViewMeasure {
+                column_name: "new_revenue".to_string(),
+                expression: "SUM(new_amount)".to_string(),
+                is_decomposable: true,
+            }],
+            "SELECT year, SUM(new_amount) AS new_revenue FROM sales GROUP BY year",
+            Some("sales".to_string()),
+        );
+        restore_measure_view(MeasureView {
+            view_name: "Sales_V".to_string(),
+            measures: vec![ViewMeasure {
+                column_name: "revenue".to_string(),
+                expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
+            }],
+            base_query: "SELECT year, SUM(amount) AS revenue FROM sales GROUP BY year".to_string(),
+            base_table: Some("sales".to_string()),
+            base_relation_sql: None,
+            dimension_exprs: HashMap::new(),
+            group_by_cols: vec!["year".to_string()],
+        });
+        let restored = get_measure_view("sales_v").unwrap();
+        assert_eq!(restored.view_name, "Sales_V");
+        assert_eq!(restored.measures[0].column_name, "revenue");
+        let views = MEASURE_VIEWS.lock().unwrap();
+        assert!(views.contains_key("Sales_V"));
+        assert!(!views.contains_key("sales_v"));
+        drop(views);
+        clear_measure_views();
     }
 
     #[test]
