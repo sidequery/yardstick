@@ -71,6 +71,20 @@ inline const std::string &YsName(const Identifier &id) { return id.GetIdentifier
 #endif
 inline const std::string &YsName(const std::string &s) { return s; }
 
+template <class T>
+auto YsBaseTableNameImpl(const T &base, int) -> decltype(base.Table(), std::string()) {
+    return YsName(base.Table());
+}
+
+template <class T>
+std::string YsBaseTableNameImpl(const T &base, long) {
+    return YsName(base.table_name);
+}
+
+inline std::string YsBaseTableName(const BaseTableRef &base) {
+    return YsBaseTableNameImpl(base, 0);
+}
+
 inline const std::string &YsFuncName(const FunctionExpression &f) {
 #if YARDSTICK_NEW_EXPR_API
     return f.FunctionName().GetIdentifierName();
