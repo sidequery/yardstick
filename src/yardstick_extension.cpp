@@ -552,7 +552,70 @@ static MeasureViewSnapshot SnapshotMeasureView(const std::string &view_name) {
     return {view_name, yardstick_snapshot_measure_view(view_name.c_str())};
 }
 
+static bool EqualsCaseInsensitive(const std::string &left, const std::string &right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (idx_t i = 0; i < left.size(); i++) {
+        if (std::tolower(static_cast<unsigned char>(left[i])) !=
+            std::tolower(static_cast<unsigned char>(right[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ContainsIdentifier(const std::string &sql, const std::string &identifier) {
+    if (identifier.empty() || sql.size() < identifier.size()) {
+        return false;
+    }
+
+    for (idx_t i = 0; i + identifier.size() <= sql.size(); i++) {
+        bool matches = true;
+        for (idx_t j = 0; j < identifier.size(); j++) {
+            if (std::tolower(static_cast<unsigned char>(sql[i + j])) !=
+                std::tolower(static_cast<unsigned char>(identifier[j]))) {
+                matches = false;
+                break;
+            }
+        }
+        if (!matches) {
+            continue;
+        }
+
+        bool left_boundary = i == 0 || !IsIdentifierChar(sql[i - 1]);
+        idx_t end = i + identifier.size();
+        bool right_boundary = end >= sql.size() || !IsIdentifierChar(sql[end]);
+        if (left_boundary && right_boundary) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool RemoveCaseInsensitive(std::vector<std::string> &values, const std::string &value) {
+    for (auto it = values.begin(); it != values.end(); ++it) {
+        if (EqualsCaseInsensitive(*it, value)) {
+            values.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool HasTemporarySnapshot(const std::vector<MeasureViewSnapshot> &snapshots,
+                                 const std::string &view_name) {
+    for (auto &snapshot : snapshots) {
+        if (EqualsCaseInsensitive(snapshot.view_name, view_name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
+                                              const std::vector<MeasureViewSnapshot> &temporary_snapshots,
+                                              std::vector<std::string> &pending_temporary_views,
                                               std::vector<MeasureViewSnapshot> &snapshots) {
     char *extracted_view_name = yardstick_extract_drop_view_name(sql.c_str());
     if (!extracted_view_name) {
@@ -561,6 +624,13 @@ static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
 
     std::string view_name = extracted_view_name;
     yardstick_free(extracted_view_name);
+
+    if (HasTemporarySnapshot(temporary_snapshots, view_name)) {
+        RemoveCaseInsensitive(pending_temporary_views, view_name);
+        yardstick_drop_measure_view_from_sql(sql.c_str());
+        return true;
+    }
+
     snapshots.push_back(SnapshotMeasureView(view_name));
     yardstick_drop_measure_view_from_sql(sql.c_str());
     return true;
@@ -599,6 +669,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
     MeasureRewriteResult rewrite_result;
     std::vector<std::string> rewritten_statements;
     std::vector<MeasureViewSnapshot> temporary_snapshots;
+    std::vector<std::string> pending_temporary_views;
     auto cleanup_temporary_measure_views = [&temporary_snapshots]() {
         RestoreMeasureViewSnapshots(temporary_snapshots);
     };
@@ -610,7 +681,8 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         }
 
         auto statement_body = statement.substr(SkipWhitespaceAndComments(statement, 0));
-        SnapshotAndDropMeasureViewFromSql(statement_body, permanent_snapshots);
+        SnapshotAndDropMeasureViewFromSql(statement_body, temporary_snapshots,
+                                          pending_temporary_views, permanent_snapshots);
 
         if (yardstick_has_as_measure(statement_body.c_str()) &&
             StartsWithCreateViewStatement(statement_body)) {
@@ -648,6 +720,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                 if (is_temporary_measure_view && !view_name.empty()) {
                     if (has_snapshot) {
                         temporary_snapshots.push_back(snapshot);
+                        pending_temporary_views.push_back(view_name);
                         has_snapshot = false;
                     }
                 } else if (has_snapshot) {
@@ -686,6 +759,13 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
 
         if (result.had_aggregate) {
             rewrite_result.had_aggregate = true;
+            for (auto it = pending_temporary_views.begin(); it != pending_temporary_views.end();) {
+                if (ContainsIdentifier(aggregate_statement, *it)) {
+                    it = pending_temporary_views.erase(it);
+                } else {
+                    ++it;
+                }
+            }
             string expanded_sql(result.expanded_sql);
             if (ParsesAsSingleSelect(expanded_sql)) {
                 rewritten_statements.push_back(WrapYardstickSelect(expanded_sql));
@@ -698,7 +778,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         yardstick_free_aggregate_result(result);
     }
 
-    if (!temporary_snapshots.empty() && !rewrite_result.had_aggregate) {
+    if (!pending_temporary_views.empty()) {
         rewrite_result.error = "TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()";
         cleanup_temporary_measure_views();
         return rewrite_result;
