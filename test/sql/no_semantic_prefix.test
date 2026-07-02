@@ -50,6 +50,11 @@ SELECT year, region, AGGREGATE(revenue) FROM sales_unicode_comment_v;
 2023	EU	75.0
 2023	US	150.0
 
+query RI
+SELECT AGGREGATE(revenue), 1 AS measure FROM sales_v;
+----
+375.0	1
+
 # Multi-statement batches should rewrite and register each measure view independently
 statement ok
 CREATE TABLE batch_notes(note TEXT);

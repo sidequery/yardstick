@@ -428,6 +428,71 @@ static std::vector<std::string> SplitSqlStatements(const std::string &sql) {
     return statements;
 }
 
+static bool IsIdentifierChar(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static size_t SkipWhitespaceAndComments(const std::string &sql, size_t pos) {
+    while (pos < sql.size()) {
+        if (std::isspace(static_cast<unsigned char>(sql[pos]))) {
+            pos++;
+            continue;
+        }
+        if (pos + 1 < sql.size() && sql[pos] == '-' && sql[pos + 1] == '-') {
+            pos += 2;
+            while (pos < sql.size() && sql[pos] != '\n') {
+                pos++;
+            }
+            continue;
+        }
+        if (pos + 1 < sql.size() && sql[pos] == '/' && sql[pos + 1] == '*') {
+            pos += 2;
+            while (pos + 1 < sql.size() && !(sql[pos] == '*' && sql[pos + 1] == '/')) {
+                pos++;
+            }
+            pos = std::min(pos + 2, sql.size());
+            continue;
+        }
+        break;
+    }
+    return pos;
+}
+
+static bool ConsumeKeyword(const std::string &sql, size_t &pos, const char *keyword) {
+    size_t keyword_len = strlen(keyword);
+    if (pos + keyword_len > sql.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < keyword_len; i++) {
+        if (std::toupper(static_cast<unsigned char>(sql[pos + i])) != keyword[i]) {
+            return false;
+        }
+    }
+    if (pos + keyword_len < sql.size() && IsIdentifierChar(sql[pos + keyword_len])) {
+        return false;
+    }
+    pos += keyword_len;
+    return true;
+}
+
+static bool StartsWithCreateViewStatement(const std::string &sql) {
+    size_t pos = SkipWhitespaceAndComments(sql, 0);
+    if (!ConsumeKeyword(sql, pos, "CREATE")) {
+        return false;
+    }
+
+    pos = SkipWhitespaceAndComments(sql, pos);
+    if (ConsumeKeyword(sql, pos, "OR")) {
+        pos = SkipWhitespaceAndComments(sql, pos);
+        if (!ConsumeKeyword(sql, pos, "REPLACE")) {
+            return false;
+        }
+        pos = SkipWhitespaceAndComments(sql, pos);
+    }
+
+    return ConsumeKeyword(sql, pos, "VIEW");
+}
+
 struct MeasureRewriteResult {
     bool had_measure_view = false;
     std::string rewritten_sql;
@@ -449,7 +514,8 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::s
             continue;
         }
 
-        if (!yardstick_has_as_measure(statement.c_str())) {
+        if (!yardstick_has_as_measure(statement.c_str()) ||
+            !StartsWithCreateViewStatement(statement)) {
             rewritten_statements.push_back(statement);
             continue;
         }
