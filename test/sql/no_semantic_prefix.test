@@ -34,6 +34,22 @@ SELECT year, region, AGGREGATE(revenue) FROM sales_v;
 2023	EU	75.0
 2023	US	150.0
 
+statement ok
+CREATE VIEW sales_unicode_comment_v AS
+SELECT
+    year,
+    region, -- café
+    SUM(amount) AS MEASURE revenue /* 東京 */
+FROM sales;
+
+query IIR rowsort
+SELECT year, region, AGGREGATE(revenue) FROM sales_unicode_comment_v;
+----
+2022	EU	50.0
+2022	US	100.0
+2023	EU	75.0
+2023	US	150.0
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================

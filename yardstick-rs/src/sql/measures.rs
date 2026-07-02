@@ -3606,6 +3606,129 @@ fn is_interval_date_part_keyword(ident: &str) -> bool {
     parts.iter().any(|p| p.eq_ignore_ascii_case(ident))
 }
 
+fn push_comment_char_sanitized(out: &mut String, ch: char) {
+    if ch.is_ascii() {
+        out.push(ch);
+    } else {
+        for _ in 0..ch.len_utf8() {
+            out.push(' ');
+        }
+    }
+}
+
+fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut in_bracket = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while i < bytes.len() {
+        if in_line_comment {
+            let ch = sql[i..].chars().next().unwrap();
+            push_comment_char_sanitized(&mut out, ch);
+            i += ch.len_utf8();
+            if ch == '\n' || ch == '\r' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+
+        if in_block_comment {
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                out.push_str("*/");
+                i += 2;
+                in_block_comment = false;
+                continue;
+            }
+
+            let ch = sql[i..].chars().next().unwrap();
+            push_comment_char_sanitized(&mut out, ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        let ch = sql[i..].chars().next().unwrap();
+
+        if in_single {
+            out.push(ch);
+            i += ch.len_utf8();
+            if ch == '\'' {
+                if i < bytes.len() && bytes[i] == b'\'' {
+                    out.push('\'');
+                    i += 1;
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+
+        if in_double {
+            out.push(ch);
+            i += ch.len_utf8();
+            if ch == '"' {
+                if i < bytes.len() && bytes[i] == b'"' {
+                    out.push('"');
+                    i += 1;
+                } else {
+                    in_double = false;
+                }
+            }
+            continue;
+        }
+
+        if in_backtick {
+            out.push(ch);
+            i += ch.len_utf8();
+            if ch == '`' {
+                in_backtick = false;
+            }
+            continue;
+        }
+
+        if in_bracket {
+            out.push(ch);
+            i += ch.len_utf8();
+            if ch == ']' {
+                in_bracket = false;
+            }
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            out.push_str("--");
+            i += 2;
+            in_line_comment = true;
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            out.push_str("/*");
+            i += 2;
+            in_block_comment = true;
+            continue;
+        }
+
+        out.push(ch);
+        i += ch.len_utf8();
+
+        match ch {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            '`' => in_backtick = true,
+            '[' => in_bracket = true,
+            _ => {}
+        }
+    }
+
+    out
+}
+
 // =============================================================================
 // Core Functions - Process CREATE VIEW
 // =============================================================================
@@ -3676,9 +3799,11 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
 fn extract_measures_from_sql(
     sql: &str,
 ) -> Result<(String, Vec<ViewMeasure>, Option<String>, Option<String>)> {
+    let sanitized_sql = sanitize_non_ascii_in_sql_comments(sql);
+    let sql = sanitized_sql.as_str();
     let view_name = extract_view_name(sql);
     let base_table = extract_table_name_from_sql(sql);
-    let sql_upper = sql.to_uppercase();
+    let sql_upper = sql.to_ascii_uppercase();
 
     // First pass: collect all measures with positions
     struct MeasureInfo {
@@ -6451,6 +6576,41 @@ mod tests {
         assert_eq!(result.measures[0].expression, "SUM(amount)");
         assert!(result.clean_sql.contains("AS revenue"));
         assert!(!result.clean_sql.contains("AS MEASURE"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_process_create_view_sanitizes_non_ascii_comments() {
+        clear_measure_views();
+
+        let sql = r#"CREATE VIEW orders_comment AS
+SELECT status, -- café
+SUM(amount) AS MEASURE revenue /* 東京 */
+FROM orders"#;
+        let result = std::panic::catch_unwind(|| process_create_view(sql))
+            .expect("non-ASCII comments must not panic");
+
+        assert!(result.is_measure_view);
+        assert!(result.error.is_none());
+        assert_eq!(result.measures.len(), 1);
+        assert_eq!(result.measures[0].column_name, "revenue");
+        assert!(result.clean_sql.is_ascii());
+        assert!(result.clean_sql.contains("-- caf"));
+        assert!(result.clean_sql.contains("/*"));
+        assert!(!result.clean_sql.contains("café"));
+        assert!(!result.clean_sql.contains("東京"));
+    }
+
+    #[test]
+    fn test_comment_sanitizer_preserves_non_comment_unicode() {
+        let sql = "SELECT 'café -- literal', \"東京\" /* résumé */ FROM t -- 東京";
+        let sanitized = sanitize_non_ascii_in_sql_comments(sql);
+
+        assert!(sanitized.contains("'café -- literal'"));
+        assert!(sanitized.contains("\"東京\""));
+        assert!(!sanitized.contains("résumé"));
+        assert!(!sanitized.ends_with("東京"));
+        assert_eq!(sanitized.len(), sql.len());
     }
 
     #[test]
