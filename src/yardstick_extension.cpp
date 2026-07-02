@@ -580,13 +580,16 @@ static bool EqualsCaseInsensitive(const std::string &left, const std::string &ri
 }
 
 static bool RemoveCaseInsensitive(std::vector<std::string> &values, const std::string &value) {
-    for (auto it = values.begin(); it != values.end(); ++it) {
+    bool removed = false;
+    for (auto it = values.begin(); it != values.end();) {
         if (EqualsCaseInsensitive(*it, value)) {
-            values.erase(it);
-            return true;
+            it = values.erase(it);
+            removed = true;
+        } else {
+            ++it;
         }
     }
-    return false;
+    return removed;
 }
 
 static bool ContainsCaseInsensitive(const std::vector<std::string> &values, const std::string &value) {
@@ -600,14 +603,21 @@ static bool ContainsCaseInsensitive(const std::vector<std::string> &values, cons
 
 static bool RestoreAndRemoveTemporarySnapshot(std::vector<MeasureViewSnapshot> &snapshots,
                                               const std::string &view_name) {
-    for (auto it = snapshots.begin(); it != snapshots.end(); ++it) {
+    bool restored = false;
+    for (auto it = snapshots.begin(); it != snapshots.end();) {
         if (EqualsCaseInsensitive(it->view_name, view_name)) {
-            yardstick_restore_measure_view_snapshot(it->view_name.c_str(), it->snapshot);
-            snapshots.erase(it);
-            return true;
+            if (!restored) {
+                yardstick_restore_measure_view_snapshot(it->view_name.c_str(), it->snapshot);
+                restored = true;
+            } else {
+                yardstick_free_measure_view_snapshot(it->snapshot);
+            }
+            it = snapshots.erase(it);
+        } else {
+            ++it;
         }
     }
-    return false;
+    return restored;
 }
 
 static bool HasMeasureSnapshot(const std::vector<MeasureViewSnapshot> &snapshots,

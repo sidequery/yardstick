@@ -495,6 +495,20 @@ SEMANTIC SELECT AGGREGATE(drop_temp_permanent_revenue) FROM batch_drop_temp_repl
 ----
 <REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
 
+statement ok
+CREATE TEMP VIEW batch_temp_replace_drop_v AS
+SELECT year, SUM(amount) AS MEASURE temp_replace_drop_revenue
+FROM sales;
+CREATE OR REPLACE TEMP VIEW batch_temp_replace_drop_v AS
+SELECT year, SUM(amount * 10) AS MEASURE temp_replace_drop_revenue
+FROM sales;
+DROP VIEW batch_temp_replace_drop_v;
+
+statement error
+SEMANTIC SELECT AGGREGATE(temp_replace_drop_revenue) FROM batch_temp_replace_drop_v;
+----
+<REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
+
 statement error
 CREATE TEMP VIEW batch_shadow_v AS
 SELECT year, SUM(amount * 20) AS MEASURE shadow_revenue
