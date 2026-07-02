@@ -3667,7 +3667,7 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
     let mut in_bracket = false;
     let mut in_dollar_quote: Option<String> = None;
     let mut in_line_comment = false;
-    let mut in_block_comment = false;
+    let mut block_comment_depth = 0usize;
 
     while i < bytes.len() {
         if let Some(ref delimiter) = in_dollar_quote {
@@ -3694,11 +3694,18 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
             continue;
         }
 
-        if in_block_comment {
+        if block_comment_depth > 0 {
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                out.push_str("/*");
+                i += 2;
+                block_comment_depth += 1;
+                continue;
+            }
+
             if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
                 out.push_str("*/");
                 i += 2;
-                in_block_comment = false;
+                block_comment_depth -= 1;
                 continue;
             }
 
@@ -3775,7 +3782,7 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
             out.push_str("/*");
             i += 2;
-            in_block_comment = true;
+            block_comment_depth = 1;
             continue;
         }
 
@@ -6707,6 +6714,18 @@ FROM orders"#;
         let sanitized = sanitize_non_ascii_in_sql_comments(sql);
 
         assert!(sanitized.contains("[1, /*"));
+        assert!(!sanitized.contains("東京"));
+        assert!(!sanitized.ends_with("résumé"));
+        assert!(sanitized.is_ascii());
+        assert_eq!(sanitized.len(), sql.len());
+    }
+
+    #[test]
+    fn test_comment_sanitizer_handles_nested_block_comments() {
+        let sql = "SELECT 1 /* outer /* inner */ 東京 */ FROM t -- résumé";
+        let sanitized = sanitize_non_ascii_in_sql_comments(sql);
+
+        assert!(sanitized.contains("/* outer /* inner */"));
         assert!(!sanitized.contains("東京"));
         assert!(!sanitized.ends_with("résumé"));
         assert!(sanitized.is_ascii());
