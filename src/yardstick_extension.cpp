@@ -495,13 +495,9 @@ static bool StartsWithCreateViewStatement(const std::string &sql) {
 
 struct MeasureRewriteResult {
     bool had_measure_view = false;
-    std::string rewritten_sql;
-    std::string error;
-};
-
-struct AggregateRewriteResult {
     bool had_aggregate = false;
     std::string rewritten_sql;
+    std::string error;
 };
 
 static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::string &query) {
@@ -514,50 +510,28 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::s
             continue;
         }
 
-        yardstick_drop_measure_view_from_sql(statement.c_str());
+        auto statement_body = statement.substr(SkipWhitespaceAndComments(statement, 0));
+        yardstick_drop_measure_view_from_sql(statement_body.c_str());
 
-        if (!yardstick_has_as_measure(statement.c_str()) ||
-            !StartsWithCreateViewStatement(statement)) {
-            rewritten_statements.push_back(statement);
-            continue;
-        }
+        if (yardstick_has_as_measure(statement_body.c_str()) &&
+            StartsWithCreateViewStatement(statement_body)) {
+            std::string rewritten_statement = RewritePercentileWithinGroup(statement_body);
+            YardstickCreateViewResult result = yardstick_process_create_view(rewritten_statement.c_str());
 
-        std::string rewritten_statement = RewritePercentileWithinGroup(statement);
-        YardstickCreateViewResult result = yardstick_process_create_view(rewritten_statement.c_str());
+            if (result.error) {
+                rewrite_result.error = result.error;
+                yardstick_free_create_view_result(result);
+                return rewrite_result;
+            }
 
-        if (result.error) {
-            rewrite_result.error = result.error;
+            if (result.is_measure_view) {
+                rewrite_result.had_measure_view = true;
+                rewritten_statements.push_back(RewritePercentileWithinGroup(result.clean_sql));
+            } else {
+                rewritten_statements.push_back(statement);
+            }
+
             yardstick_free_create_view_result(result);
-            return rewrite_result;
-        }
-
-        if (result.is_measure_view) {
-            rewrite_result.had_measure_view = true;
-            rewritten_statements.push_back(RewritePercentileWithinGroup(result.clean_sql));
-        } else {
-            rewritten_statements.push_back(statement);
-        }
-
-        yardstick_free_create_view_result(result);
-    }
-
-    for (idx_t i = 0; i < rewritten_statements.size(); i++) {
-        if (i > 0) {
-            rewrite_result.rewritten_sql += ";\n";
-        }
-        rewrite_result.rewritten_sql += rewritten_statements[i];
-    }
-
-    return rewrite_result;
-}
-
-static AggregateRewriteResult RewriteAggregatesStatementByStatement(const std::string &query) {
-    AggregateRewriteResult rewrite_result;
-    std::vector<std::string> rewritten_statements;
-
-    for (auto statement : SplitSqlStatements(query)) {
-        StringUtil::Trim(statement);
-        if (statement.empty()) {
             continue;
         }
 
@@ -626,13 +600,6 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
         if (measure_rewrite.had_measure_view) {
             had_measure_rewrite = true;
             sql_to_check = std::move(measure_rewrite.rewritten_sql);
-        }
-    }
-
-    if (had_measure_rewrite && yardstick_has_aggregate(sql_to_check.c_str())) {
-        auto aggregate_rewrite = RewriteAggregatesStatementByStatement(sql_to_check);
-        if (aggregate_rewrite.had_aggregate) {
-            sql_to_check = std::move(aggregate_rewrite.rewritten_sql);
         }
     }
 
@@ -732,13 +699,6 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
         if (measure_rewrite.had_measure_view) {
             had_measure_rewrite = true;
             sql_to_check = std::move(measure_rewrite.rewritten_sql);
-        }
-    }
-
-    if (had_measure_rewrite && yardstick_has_aggregate(sql_to_check.c_str())) {
-        auto aggregate_rewrite = RewriteAggregatesStatementByStatement(sql_to_check);
-        if (aggregate_rewrite.had_aggregate) {
-            sql_to_check = std::move(aggregate_rewrite.rewritten_sql);
         }
     }
 

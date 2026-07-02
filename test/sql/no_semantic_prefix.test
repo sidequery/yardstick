@@ -123,6 +123,36 @@ GROUP BY year;
 ----
 Binder Error
 
+statement ok
+CREATE VIEW batch_order_v AS
+SELECT year, SUM(amount) AS MEASURE order_sensitive_revenue
+FROM sales;
+CREATE TABLE batch_order_result AS
+SELECT year, AGGREGATE(order_sensitive_revenue) AS revenue
+FROM batch_order_v;
+DROP VIEW batch_order_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_order_result;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+-- leading comment should not prevent measure registration
+CREATE VIEW batch_comment_v AS
+SELECT year, SUM(amount) AS MEASURE comment_revenue
+FROM sales;
+CREATE TABLE batch_comment_result AS
+SELECT year, AGGREGATE(comment_revenue) AS revenue
+FROM batch_comment_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_comment_result;
+----
+2022	150.0
+2023	225.0
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================
