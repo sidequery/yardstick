@@ -80,6 +80,20 @@ SEMANTIC SELECT region, AGGREGATE(regional_revenue) FROM batch_regions_v;
 EU	125.0
 US	250.0
 
+statement ok
+CREATE VIEW batch_inline_v AS
+SELECT year, SUM(amount) AS MEASURE inline_revenue
+FROM sales;
+CREATE TABLE batch_inline_result AS
+SELECT year, AGGREGATE(inline_revenue) AS revenue
+FROM batch_inline_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_inline_result;
+----
+2022	150.0
+2023	225.0
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================

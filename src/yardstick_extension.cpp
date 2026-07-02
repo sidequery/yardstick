@@ -434,6 +434,11 @@ struct MeasureRewriteResult {
     std::string error;
 };
 
+struct AggregateRewriteResult {
+    bool had_aggregate = false;
+    std::string rewritten_sql;
+};
+
 static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::string &query) {
     MeasureRewriteResult rewrite_result;
     std::vector<std::string> rewritten_statements;
@@ -466,6 +471,47 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::s
         }
 
         yardstick_free_create_view_result(result);
+    }
+
+    for (idx_t i = 0; i < rewritten_statements.size(); i++) {
+        if (i > 0) {
+            rewrite_result.rewritten_sql += ";\n";
+        }
+        rewrite_result.rewritten_sql += rewritten_statements[i];
+    }
+
+    return rewrite_result;
+}
+
+static AggregateRewriteResult RewriteAggregatesStatementByStatement(const std::string &query) {
+    AggregateRewriteResult rewrite_result;
+    std::vector<std::string> rewritten_statements;
+
+    for (auto statement : SplitSqlStatements(query)) {
+        StringUtil::Trim(statement);
+        if (statement.empty()) {
+            continue;
+        }
+
+        if (!yardstick_has_aggregate(statement.c_str())) {
+            rewritten_statements.push_back(statement);
+            continue;
+        }
+
+        YardstickAggregateResult result = yardstick_expand_aggregate(statement.c_str());
+        if (result.error) {
+            yardstick_free_aggregate_result(result);
+            rewritten_statements.push_back(statement);
+            continue;
+        }
+
+        if (result.had_aggregate) {
+            rewrite_result.had_aggregate = true;
+            rewritten_statements.push_back(result.expanded_sql);
+        } else {
+            rewritten_statements.push_back(statement);
+        }
+        yardstick_free_aggregate_result(result);
     }
 
     for (idx_t i = 0; i < rewritten_statements.size(); i++) {
@@ -515,8 +561,15 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
         }
     }
 
+    if (had_measure_rewrite && yardstick_has_aggregate(sql_to_check.c_str())) {
+        auto aggregate_rewrite = RewriteAggregatesStatementByStatement(sql_to_check);
+        if (aggregate_rewrite.had_aggregate) {
+            sql_to_check = std::move(aggregate_rewrite.rewritten_sql);
+        }
+    }
+
     // Check for AGGREGATE() function
-    if (yardstick_has_aggregate(sql_to_check.c_str())) {
+    if (!had_measure_rewrite && yardstick_has_aggregate(sql_to_check.c_str())) {
         YardstickAggregateResult result = yardstick_expand_aggregate(sql_to_check.c_str());
 
         if (result.error) {
@@ -614,8 +667,15 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
         }
     }
 
+    if (had_measure_rewrite && yardstick_has_aggregate(sql_to_check.c_str())) {
+        auto aggregate_rewrite = RewriteAggregatesStatementByStatement(sql_to_check);
+        if (aggregate_rewrite.had_aggregate) {
+            sql_to_check = std::move(aggregate_rewrite.rewritten_sql);
+        }
+    }
+
     // Check for AGGREGATE() function
-    if (yardstick_has_aggregate(sql_to_check.c_str())) {
+    if (!had_measure_rewrite && yardstick_has_aggregate(sql_to_check.c_str())) {
         YardstickAggregateResult result = yardstick_expand_aggregate(sql_to_check.c_str());
 
         if (result.error) {
