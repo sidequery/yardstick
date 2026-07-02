@@ -3687,15 +3687,6 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
 
         let ch = sql[i..].chars().next().unwrap();
 
-        if let Some(delimiter) = dollar_quote_delimiter_at(sql, i) {
-            if sql[i + delimiter.len()..].contains(delimiter) {
-                out.push_str(delimiter);
-                i += delimiter.len();
-                in_dollar_quote = Some(delimiter.to_string());
-                continue;
-            }
-        }
-
         if in_single {
             out.push(ch);
             i += ch.len_utf8();
@@ -3740,6 +3731,15 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
                 in_bracket = false;
             }
             continue;
+        }
+
+        if let Some(delimiter) = dollar_quote_delimiter_at(sql, i) {
+            if sql[i + delimiter.len()..].contains(delimiter) {
+                out.push_str(delimiter);
+                i += delimiter.len();
+                in_dollar_quote = Some(delimiter.to_string());
+                continue;
+            }
         }
 
         if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
@@ -6663,6 +6663,18 @@ FROM orders"#;
         assert!(sanitized.contains("$$-- café$$"));
         assert!(sanitized.contains("$tag$/* 東京 */$tag$"));
         assert!(!sanitized.ends_with("résumé"));
+        assert_eq!(sanitized.len(), sql.len());
+    }
+
+    #[test]
+    fn test_comment_sanitizer_ignores_dollar_tags_inside_regular_strings() {
+        let sql = "SELECT '$tag$' AS label FROM t -- $tag$ café";
+        let sanitized = sanitize_non_ascii_in_sql_comments(sql);
+
+        assert!(sanitized.contains("'$tag$'"));
+        assert!(sanitized.contains("-- $tag$ caf"));
+        assert!(!sanitized.ends_with("café"));
+        assert!(sanitized.is_ascii());
         assert_eq!(sanitized.len(), sql.len());
     }
 
