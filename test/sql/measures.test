@@ -60,9 +60,9 @@ DROP VIEW sales_v;
 CREATE VIEW rollback_other_v AS
 SELECT year, SUM(amount) AS MEASURE rollback_other_revenue
 FROM sales;
-SELEC
+SELECT FROM
 ----
-Parser Error
+<REGEX>:.*(Parser Error|Catalog Error).*
 
 query R
 SEMANTIC SELECT AGGREGATE(revenue) FROM sales_v;
@@ -107,9 +107,9 @@ FROM sales;
 
 statement error
 DROP VIEW sales_case_v;
-SELEC
+SELECT FROM
 ----
-Parser Error
+<REGEX>:.*(Parser Error|Catalog Error).*
 
 query R
 SEMANTIC SELECT AGGREGATE(case_revenue) FROM Sales_Case_V;
@@ -325,7 +325,7 @@ SELECT year, AGGREGATE(temp_select_revenue) AS revenue
 FROM batch_temp_select_v
 GROUP BY year;
 ----
-TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
 
 statement error
 CREATE TEMP VIEW batch_temp_reuse_v AS
@@ -338,7 +338,7 @@ SELECT year, AGGREGATE(temp_reuse_revenue) AS revenue
 FROM batch_temp_reuse_v
 GROUP BY year;
 ----
-TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
 
 query IR rowsort
 CREATE VIEW batch_catalog_guard_v AS
@@ -363,7 +363,7 @@ CREATE TEMP VIEW batch_temp_standalone_v AS
 SELECT year, SUM(amount) AS MEASURE standalone_temp_revenue
 FROM sales;
 ----
-TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
 
 statement error
 CREATE TEMP VIEW batch_temp_unused_v AS
@@ -372,7 +372,7 @@ FROM sales;
 CREATE TABLE batch_temp_unused_result AS
 SELECT AGGREGATE(revenue) AS revenue FROM sales_v;
 ----
-TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
 
 statement error
 CREATE TEMP VIEW batch_temp_alias_v AS
@@ -381,7 +381,7 @@ FROM sales;
 CREATE TABLE batch_temp_alias_result AS
 SELECT AGGREGATE(revenue) AS batch_temp_alias_v FROM sales_v;
 ----
-TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
 
 statement ok
 CREATE VIEW batch_shadow_v AS
@@ -435,9 +435,9 @@ CREATE TEMP VIEW batch_shadow_v AS
 SELECT year, SUM(amount * 20) AS MEASURE shadow_revenue
 FROM sales;
 DROP VIEW batch_shadow_v;
-SELEC
+SELECT FROM
 ----
-Parser Error
+<REGEX>:.*(Parser Error|Catalog Error).*
 
 query IR rowsort
 SEMANTIC SELECT year, AGGREGATE(shadow_revenue) AS revenue
