@@ -1187,24 +1187,155 @@ fn aggregate_with_at(input: &str) -> IResult<&str, (&str, Vec<ContextModifier>)>
 }
 
 /// Extract all AGGREGATE(...) [AT (...)]+ patterns from SQL with full modifier list
+fn aggregate_call_starts_outside_literals(sql: &str) -> Vec<usize> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut starts = Vec::new();
+    let mut i = 0;
+
+    let is_ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+    let is_ident_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let skip_whitespace = |mut idx: usize| -> usize {
+        while idx < len && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        idx
+    };
+
+    while i < len {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < len && bytes[i + 1] == b'\'' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'"' {
+                        if i + 1 < len && bytes[i + 1] == b'"' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < len {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'$' => {
+                let tag_start = i;
+                let mut tag_end = i + 1;
+                while tag_end < len && is_ident_char(bytes[tag_end]) {
+                    tag_end += 1;
+                }
+                if tag_end < len && bytes[tag_end] == b'$' {
+                    let tag = &sql[tag_start..tag_end + 1];
+                    if let Some(end_offset) = sql[tag_end + 1..].find(tag) {
+                        i = tag_end + 1 + end_offset + tag.len();
+                    } else {
+                        i = tag_end + 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            b if is_ident_start(b) => {
+                let mut token_start = i;
+                let mut token_end = i + 1;
+                while token_end < len && is_ident_char(bytes[token_end]) {
+                    token_end += 1;
+                }
+
+                let mut pos = token_end;
+                loop {
+                    pos = skip_whitespace(pos);
+                    if pos >= len || bytes[pos] != b'.' {
+                        break;
+                    }
+                    pos += 1;
+                    pos = skip_whitespace(pos);
+                    if pos < len && is_ident_start(bytes[pos]) {
+                        token_start = pos;
+                        token_end = pos + 1;
+                        while token_end < len && is_ident_char(bytes[token_end]) {
+                            token_end += 1;
+                        }
+                        pos = token_end;
+                    } else if pos < len && bytes[pos] == b'"' {
+                        pos += 1;
+                        while pos < len {
+                            if bytes[pos] == b'"' {
+                                if pos + 1 < len && bytes[pos + 1] == b'"' {
+                                    pos += 2;
+                                } else {
+                                    pos += 1;
+                                    break;
+                                }
+                            } else {
+                                pos += 1;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                let after_ws = skip_whitespace(pos);
+                if after_ws < len
+                    && bytes[after_ws] == b'('
+                    && sql[token_start..token_end].eq_ignore_ascii_case("AGGREGATE")
+                {
+                    starts.push(token_start);
+                }
+                i = pos;
+            }
+            _ => i += 1,
+        }
+    }
+
+    starts
+}
+
 pub fn extract_aggregate_with_at_full(
     sql: &str,
 ) -> Vec<(String, Vec<ContextModifier>, usize, usize)> {
     let mut results = Vec::new();
-    let sql_upper = sql.to_uppercase();
-    let mut search_pos = 0;
 
-    while let Some(agg_offset) = sql_upper[search_pos..].find("AGGREGATE") {
-        let start = search_pos + agg_offset;
-
+    for start in aggregate_call_starts_outside_literals(sql) {
         if let Ok((remaining, (measure, modifiers))) = aggregate_with_at(&sql[start..]) {
             if !modifiers.is_empty() {
                 let end = sql.len() - remaining.len();
                 results.push((measure.to_string(), modifiers, start, end));
             }
         }
-
-        search_pos = start + 1;
     }
 
     results
@@ -1237,12 +1368,8 @@ pub fn extract_aggregate_with_at(sql: &str) -> Vec<(String, ContextModifier, usi
 /// Extract all AGGREGATE() calls without AT
 pub fn extract_all_aggregate_calls(sql: &str) -> Vec<(String, usize, usize)> {
     let mut results = Vec::new();
-    let sql_upper = sql.to_uppercase();
-    let mut search_pos = 0;
 
-    while let Some(agg_offset) = sql_upper[search_pos..].find("AGGREGATE") {
-        let start = search_pos + agg_offset;
-
+    for start in aggregate_call_starts_outside_literals(sql) {
         if let Ok((remaining, (measure, modifiers))) = aggregate_with_at(&sql[start..]) {
             // Only include calls WITHOUT AT modifier, and only when the argument
             // is a simple identifier (measure name). This avoids intercepting
@@ -1252,8 +1379,6 @@ pub fn extract_all_aggregate_calls(sql: &str) -> Vec<(String, usize, usize)> {
                 results.push((measure.to_string(), start, end));
             }
         }
-
-        search_pos = start + 1;
     }
 
     results
@@ -6909,6 +7034,24 @@ FROM orders"#;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "revenue");
         assert_eq!(results[0].1, ContextModifier::All("status".to_string()));
+    }
+
+    #[test]
+    fn test_extract_aggregate_skips_dollar_quoted_literals() {
+        assert!(extract_all_aggregate_calls(
+            "SELECT $$AGGREGATE(revenue)$$ AS note"
+        )
+        .is_empty());
+        assert!(extract_aggregate_with_at_full(
+            "SELECT $tag$AGGREGATE(revenue) AT (ALL)$tag$ AS note"
+        )
+        .is_empty());
+
+        let calls = extract_all_aggregate_calls(
+            "SELECT AGGREGATE(revenue), $$AGGREGATE(cost)$$ FROM sales_v",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "revenue");
     }
 
     #[test]

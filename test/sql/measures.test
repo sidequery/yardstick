@@ -73,6 +73,20 @@ SELECT note FROM batch_notes;
 ----
 a;b
 
+statement ok
+CREATE TABLE batch_literal_notes(note TEXT);
+
+statement ok
+CREATE VIEW batch_literal_v AS
+SELECT year, SUM(amount) AS MEASURE literal_revenue
+FROM sales;
+INSERT INTO batch_literal_notes VALUES ($$AGGREGATE(literal_revenue)$$);
+
+query T
+SELECT note FROM batch_literal_notes;
+----
+AGGREGATE(literal_revenue)
+
 query IR rowsort
 SEMANTIC SELECT year, AGGREGATE(order_revenue) FROM batch_orders_v;
 ----
