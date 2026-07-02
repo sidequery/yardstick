@@ -3634,29 +3634,6 @@ fn dollar_quote_delimiter_at(sql: &str, start: usize) -> Option<&str> {
     }
 }
 
-fn is_bracket_quoted_identifier_at(sql: &str, start: usize) -> bool {
-    let bytes = sql.as_bytes();
-    if start >= bytes.len() || bytes[start] != b'[' {
-        return false;
-    }
-
-    let mut i = start + 1;
-    let content_start = i;
-    while i < bytes.len() {
-        if bytes[i] == b']' {
-            return i > content_start;
-        }
-        if i + 1 < bytes.len()
-            && ((bytes[i] == b'-' && bytes[i + 1] == b'-')
-                || (bytes[i] == b'/' && bytes[i + 1] == b'*'))
-        {
-            return false;
-        }
-        i += 1;
-    }
-    false
-}
-
 fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -3664,7 +3641,6 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
     let mut in_single = false;
     let mut in_double = false;
     let mut in_backtick = false;
-    let mut in_bracket = false;
     let mut in_dollar_quote: Option<String> = None;
     let mut in_line_comment = false;
     let mut block_comment_depth = 0usize;
@@ -3754,15 +3730,6 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
             continue;
         }
 
-        if in_bracket {
-            out.push(ch);
-            i += ch.len_utf8();
-            if ch == ']' {
-                in_bracket = false;
-            }
-            continue;
-        }
-
         if let Some(delimiter) = dollar_quote_delimiter_at(sql, i) {
             if sql[i + delimiter.len()..].contains(delimiter) {
                 out.push_str(delimiter);
@@ -3793,7 +3760,6 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
             '\'' => in_single = true,
             '"' => in_double = true,
             '`' => in_backtick = true,
-            '[' if is_bracket_quoted_identifier_at(sql, i - ch.len_utf8()) => in_bracket = true,
             _ => {}
         }
     }
@@ -6716,6 +6682,17 @@ FROM orders"#;
         assert!(sanitized.contains("[1, /*"));
         assert!(!sanitized.contains("東京"));
         assert!(!sanitized.ends_with("résumé"));
+        assert!(sanitized.is_ascii());
+        assert_eq!(sanitized.len(), sql.len());
+    }
+
+    #[test]
+    fn test_comment_sanitizer_handles_quotes_inside_list_brackets() {
+        let sql = "SELECT [']'] AS xs FROM t -- 東京";
+        let sanitized = sanitize_non_ascii_in_sql_comments(sql);
+
+        assert!(sanitized.contains("[']']"));
+        assert!(!sanitized.ends_with("東京"));
         assert!(sanitized.is_ascii());
         assert_eq!(sanitized.len(), sql.len());
     }
