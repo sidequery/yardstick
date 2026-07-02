@@ -1277,6 +1277,12 @@ fn create_view_header(input: &str) -> IResult<&str, &str> {
         multispace1,
     )))(input)?;
 
+    // Optional TEMP/TEMPORARY
+    let (input, _) = opt(tuple((
+        alt((tag_no_case("TEMPORARY"), tag_no_case("TEMP"))),
+        multispace1,
+    )))(input)?;
+
     let (input, _) = tag_no_case("VIEW")(input)?;
     let (input, _) = multispace1(input)?;
     let (input, name) = identifier(input)?;
@@ -7144,6 +7150,14 @@ FROM orders"#;
         assert_eq!(
             extract_view_name("CREATE OR REPLACE VIEW bar AS SELECT 1"),
             Some("bar".to_string())
+        );
+        assert_eq!(
+            extract_view_name("CREATE TEMP VIEW temp_foo AS SELECT 1"),
+            Some("temp_foo".to_string())
+        );
+        assert_eq!(
+            extract_view_name("CREATE OR REPLACE TEMPORARY VIEW temp_bar AS SELECT 1"),
+            Some("temp_bar".to_string())
         );
     }
 

@@ -153,6 +153,20 @@ SELECT year, revenue FROM batch_comment_result;
 2022	150.0
 2023	225.0
 
+statement ok
+CREATE TEMP VIEW batch_temp_v AS
+SELECT year, SUM(amount) AS MEASURE temp_revenue
+FROM sales;
+CREATE TABLE batch_temp_result AS
+SELECT year, AGGREGATE(temp_revenue) AS revenue
+FROM batch_temp_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_temp_result;
+----
+2022	150.0
+2023	225.0
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================

@@ -490,6 +490,11 @@ static bool StartsWithCreateViewStatement(const std::string &sql) {
         pos = SkipWhitespaceAndComments(sql, pos);
     }
 
+    if (ConsumeKeyword(sql, pos, "TEMPORARY") ||
+        ConsumeKeyword(sql, pos, "TEMP")) {
+        pos = SkipWhitespaceAndComments(sql, pos);
+    }
+
     return ConsumeKeyword(sql, pos, "VIEW");
 }
 
