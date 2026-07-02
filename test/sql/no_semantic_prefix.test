@@ -52,12 +52,21 @@ SELECT year, region, AGGREGATE(revenue) FROM sales_unicode_comment_v;
 
 # Multi-statement batches should rewrite and register each measure view independently
 statement ok
+CREATE TABLE batch_notes(note TEXT);
+
+statement ok
+INSERT INTO batch_notes VALUES ($$a;b$$);
 CREATE VIEW batch_orders_v AS
 SELECT year, SUM(amount) AS MEASURE order_revenue
 FROM sales;
 CREATE VIEW batch_regions_v AS
 SELECT region, SUM(amount) AS MEASURE regional_revenue
 FROM sales;
+
+query T
+SELECT note FROM batch_notes;
+----
+a;b
 
 query IR rowsort
 SELECT year, AGGREGATE(order_revenue) FROM batch_orders_v;

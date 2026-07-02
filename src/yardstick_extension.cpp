@@ -333,6 +333,7 @@ static bool StartsWithSemantic(const std::string &query, std::string &stripped_q
 static std::vector<std::string> SplitSqlStatements(const std::string &sql) {
     std::vector<std::string> statements;
     size_t statement_start = 0;
+    std::string dollar_quote_end;
     bool in_single_quote = false;
     bool in_double_quote = false;
     bool in_line_comment = false;
@@ -353,6 +354,14 @@ static std::vector<std::string> SplitSqlStatements(const std::string &sql) {
             if (c == '*' && next == '/') {
                 in_block_comment = false;
                 i++;
+            }
+            continue;
+        }
+
+        if (!dollar_quote_end.empty()) {
+            if (sql.compare(i, dollar_quote_end.size(), dollar_quote_end) == 0) {
+                i += dollar_quote_end.size() - 1;
+                dollar_quote_end.clear();
             }
             continue;
         }
@@ -392,6 +401,21 @@ static std::vector<std::string> SplitSqlStatements(const std::string &sql) {
         if (c == '"') {
             in_double_quote = true;
             continue;
+        }
+        if (c == '$') {
+            size_t tag_end = i + 1;
+            while (tag_end < sql.size() && sql[tag_end] != '$') {
+                char tag_char = sql[tag_end];
+                if (!std::isalnum(static_cast<unsigned char>(tag_char)) && tag_char != '_') {
+                    break;
+                }
+                tag_end++;
+            }
+            if (tag_end < sql.size() && sql[tag_end] == '$') {
+                dollar_quote_end = sql.substr(i, tag_end - i + 1);
+                i = tag_end;
+                continue;
+            }
         }
 
         if (c == ';') {
