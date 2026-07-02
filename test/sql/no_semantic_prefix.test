@@ -181,6 +181,17 @@ SELECT year, revenue FROM batch_temp_result;
 2022	150.0
 2023	225.0
 
+query IR rowsort
+CREATE VIEW batch_select_v AS
+SELECT year, SUM(amount) AS MEASURE batch_select_revenue
+FROM sales;
+SELECT year, AGGREGATE(batch_select_revenue) AS revenue
+FROM batch_select_v
+GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
 statement error
 SELECT year, AGGREGATE(temp_revenue) AS revenue
 FROM batch_temp_v

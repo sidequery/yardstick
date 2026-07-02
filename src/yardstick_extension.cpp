@@ -551,6 +551,33 @@ static MeasureViewSnapshot SnapshotMeasureView(const std::string &view_name) {
     return {view_name, yardstick_snapshot_measure_view(view_name.c_str())};
 }
 
+static string EscapeSqlStringLiteral(const string &sql) {
+    string escaped_sql;
+    for (char c : sql) {
+        if (c == '\'') {
+            escaped_sql += "''";
+        } else {
+            escaped_sql += c;
+        }
+    }
+    return escaped_sql;
+}
+
+static string WrapYardstickSelect(const string &sql) {
+    return "SELECT * FROM yardstick('" + EscapeSqlStringLiteral(sql) + "')";
+}
+
+static bool ParsesAsSingleSelect(const string &sql) {
+    Parser parser;
+    try {
+        parser.ParseQuery(sql);
+    } catch (...) {
+        return false;
+    }
+    return parser.statements.size() == 1 &&
+           parser.statements[0]->type == StatementType::SELECT_STATEMENT;
+}
+
 static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         const std::string &query,
         std::vector<MeasureViewSnapshot> &permanent_snapshots) {
@@ -638,7 +665,12 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
 
         if (result.had_aggregate) {
             rewrite_result.had_aggregate = true;
-            rewritten_statements.push_back(result.expanded_sql);
+            string expanded_sql(result.expanded_sql);
+            if (ParsesAsSingleSelect(expanded_sql)) {
+                rewritten_statements.push_back(WrapYardstickSelect(expanded_sql));
+            } else {
+                rewritten_statements.push_back(expanded_sql);
+            }
         } else {
             rewritten_statements.push_back(statement);
         }
@@ -715,18 +747,8 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
             string expanded_sql(result.expanded_sql);
             yardstick_free_aggregate_result(result);
 
-            // Escape single quotes for embedding in string literal
-            string escaped_sql;
-            for (char c : expanded_sql) {
-                if (c == '\'') {
-                    escaped_sql += "''";
-                } else {
-                    escaped_sql += c;
-                }
-            }
-
             // Wrap in table function call
-            string wrapper_sql = "SELECT * FROM yardstick('" + escaped_sql + "')";
+            string wrapper_sql = WrapYardstickSelect(expanded_sql);
 
             Parser parser;
             parser.ParseQuery(wrapper_sql);
@@ -845,16 +867,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
                              validation_parser.statements[0]->type == StatementType::SELECT_STATEMENT;
 
             if (is_select) {
-                string escaped_sql;
-                for (char c : expanded_sql) {
-                    if (c == '\'') {
-                        escaped_sql += "''";
-                    } else {
-                        escaped_sql += c;
-                    }
-                }
-
-                string wrapper_sql = "SELECT * FROM yardstick('" + escaped_sql + "')";
+                string wrapper_sql = WrapYardstickSelect(expanded_sql);
                 Parser parser;
                 parser.ParseQuery(wrapper_sql);
                 return ParserOverrideResult(std::move(parser.statements));
