@@ -514,6 +514,8 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::s
             continue;
         }
 
+        yardstick_drop_measure_view_from_sql(statement.c_str());
+
         if (!yardstick_has_as_measure(statement.c_str()) ||
             !StartsWithCreateViewStatement(statement)) {
             rewritten_statements.push_back(statement);
