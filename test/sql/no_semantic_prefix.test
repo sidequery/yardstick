@@ -188,6 +188,13 @@ GROUP BY year;
 ----
 Table with name batch_temp_v does not exist
 
+statement error
+CREATE TEMP VIEW batch_temp_standalone_v AS
+SELECT year, SUM(amount) AS MEASURE standalone_temp_revenue
+FROM sales;
+----
+TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================

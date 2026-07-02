@@ -593,6 +593,12 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::s
         yardstick_free_aggregate_result(result);
     }
 
+    if (!temporary_measure_views.empty() && !rewrite_result.had_aggregate) {
+        rewrite_result.error = "TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()";
+        cleanup_temporary_measure_views();
+        return rewrite_result;
+    }
+
     for (idx_t i = 0; i < rewritten_statements.size(); i++) {
         if (i > 0) {
             rewrite_result.rewritten_sql += ";\n";
