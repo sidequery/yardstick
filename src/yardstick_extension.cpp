@@ -1204,6 +1204,7 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
         if (result.error) {
             string error_msg(result.error);
             yardstick_free_aggregate_result(result);
+            RestoreMeasureViewSnapshots(permanent_snapshots);
             return ParserExtensionParseResult(error_msg);
         }
 
@@ -1219,9 +1220,11 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
             auto statements = std::move(parser.statements);
 
             if (statements.empty()) {
+                RestoreMeasureViewSnapshots(permanent_snapshots);
                 return ParserExtensionParseResult("Table function wrapper produced no statements");
             }
 
+            RestoreMeasureViewSnapshots(permanent_snapshots);
             return ParserExtensionParseResult(
                 make_uniq_base<ParserExtensionParseData, YardstickParseData>(
                     std::move(statements[0])));
@@ -1251,7 +1254,7 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
                 std::move(statements[0])));
     }
 
-    FreeMeasureViewSnapshots(permanent_snapshots);
+    RestoreMeasureViewSnapshots(permanent_snapshots);
 
     // Not a yardstick query, let DuckDB handle it
     return ParserExtensionParseResult();
@@ -1306,6 +1309,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
             // (e.g. DuckDB's built-in list aggregate function). Fall through to
             // the native parser in case it can handle the query.
             yardstick_free_aggregate_result(result);
+            RestoreMeasureViewSnapshots(permanent_snapshots);
             return ParserOverrideResult();
         }
 
@@ -1320,6 +1324,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
             try {
                 validation_parser.ParseQuery(expanded_sql);
             } catch (...) {
+                RestoreMeasureViewSnapshots(permanent_snapshots);
                 return ParserOverrideResult();
             }
 
@@ -1334,9 +1339,11 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
                 string wrapper_sql = WrapYardstickSelect(expanded_sql);
                 Parser parser;
                 parser.ParseQuery(wrapper_sql);
+                RestoreMeasureViewSnapshots(permanent_snapshots);
                 return ParserOverrideResult(std::move(parser.statements));
             }
 
+            RestoreMeasureViewSnapshots(permanent_snapshots);
             return ParserOverrideResult(std::move(validation_parser.statements));
         }
 
@@ -1355,7 +1362,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
         }
     }
 
-    FreeMeasureViewSnapshots(permanent_snapshots);
+    RestoreMeasureViewSnapshots(permanent_snapshots);
 
     // Not a yardstick query; fall through to DuckDB's native parser
     return ParserOverrideResult();

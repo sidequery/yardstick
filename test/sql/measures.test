@@ -69,6 +69,17 @@ SEMANTIC SELECT AGGREGATE(revenue) FROM sales_v;
 ----
 375.0
 
+statement error
+SELECT * FROM missing_false_positive_v /* AS MEASURE */;
+DROP VIEW sales_v;
+----
+Catalog Error
+
+query R
+SEMANTIC SELECT AGGREGATE(revenue) FROM sales_v;
+----
+375.0
+
 # Multi-statement batches should rewrite and register each measure view independently
 statement ok
 CREATE TABLE batch_notes(note TEXT);
