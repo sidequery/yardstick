@@ -60,7 +60,7 @@ DROP VIEW sales_v;
 CREATE VIEW rollback_other_v AS
 SELECT year, SUM(amount) AS MEASURE rollback_other_revenue
 FROM sales;
-SELECT FROM
+SELECT (
 ----
 <REGEX>:.*(Parser Error|Catalog Error).*
 
@@ -107,7 +107,7 @@ FROM sales;
 
 statement error
 DROP VIEW sales_case_v;
-SELECT FROM
+SELECT (
 ----
 <REGEX>:.*(Parser Error|Catalog Error).*
 
@@ -453,7 +453,7 @@ CREATE TEMP VIEW batch_shadow_v AS
 SELECT year, SUM(amount * 20) AS MEASURE shadow_revenue
 FROM sales;
 DROP VIEW batch_shadow_v;
-SELECT FROM
+SELECT (
 ----
 <REGEX>:.*(Parser Error|Catalog Error).*
 
