@@ -239,6 +239,14 @@ inline void YsPrependQualifier(ColumnRefExpression &c, const std::string &qualif
 #endif
 }
 
+inline const std::string &YsBaseTableName(const BaseTableRef &b) {
+#if YARDSTICK_NEW_EXPR_API
+    return b.Table().GetIdentifierName();
+#else
+    return b.table_name;
+#endif
+}
+
 } // namespace
 
 //=============================================================================
@@ -922,7 +930,7 @@ static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableR
         case TableReferenceType::BASE_TABLE: {
             auto* base = static_cast<BaseTableRef*>(ref);
             YardstickTableRef t;
-            t.table_name = safe_strdup(YsName(base->table_name));
+            t.table_name = safe_strdup(YsBaseTableName(*base));
             t.alias = base->alias.empty() ? nullptr : safe_strdup(YsName(base->alias));
             t.is_subquery = false;
             tables.push_back(t);
@@ -1481,7 +1489,7 @@ static void CollectTableQualifiers(const TableRef *ref, TableQualifierSet &quali
         case TableReferenceType::BASE_TABLE: {
             auto *base = static_cast<const BaseTableRef*>(ref);
             if (ref->alias.empty()) {
-                AddTableQualifier(qualifiers, YsName(base->table_name));
+                AddTableQualifier(qualifiers, YsBaseTableName(*base));
             }
             break;
         }
