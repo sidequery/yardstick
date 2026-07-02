@@ -50,6 +50,27 @@ SELECT year, region, AGGREGATE(revenue) FROM sales_unicode_comment_v;
 2023	EU	75.0
 2023	US	150.0
 
+# Multi-statement batches should rewrite and register each measure view independently
+statement ok
+CREATE VIEW batch_orders_v AS
+SELECT year, SUM(amount) AS MEASURE order_revenue
+FROM sales;
+CREATE VIEW batch_regions_v AS
+SELECT region, SUM(amount) AS MEASURE regional_revenue
+FROM sales;
+
+query IR rowsort
+SELECT year, AGGREGATE(order_revenue) FROM batch_orders_v;
+----
+2022	150.0
+2023	225.0
+
+query TR rowsort
+SELECT region, AGGREGATE(regional_revenue) FROM batch_regions_v;
+----
+EU	125.0
+US	250.0
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================

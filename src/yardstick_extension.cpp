@@ -330,6 +330,130 @@ static bool StartsWithSemantic(const std::string &query, std::string &stripped_q
     return true;
 }
 
+static std::vector<std::string> SplitSqlStatements(const std::string &sql) {
+    std::vector<std::string> statements;
+    size_t statement_start = 0;
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+
+    for (size_t i = 0; i < sql.size(); i++) {
+        char c = sql[i];
+        char next = i + 1 < sql.size() ? sql[i + 1] : '\0';
+
+        if (in_line_comment) {
+            if (c == '\n') {
+                in_line_comment = false;
+            }
+            continue;
+        }
+
+        if (in_block_comment) {
+            if (c == '*' && next == '/') {
+                in_block_comment = false;
+                i++;
+            }
+            continue;
+        }
+
+        if (in_single_quote) {
+            if (c == '\'' && next == '\'') {
+                i++;
+            } else if (c == '\'') {
+                in_single_quote = false;
+            }
+            continue;
+        }
+
+        if (in_double_quote) {
+            if (c == '"' && next == '"') {
+                i++;
+            } else if (c == '"') {
+                in_double_quote = false;
+            }
+            continue;
+        }
+
+        if (c == '-' && next == '-') {
+            in_line_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '/' && next == '*') {
+            in_block_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '\'') {
+            in_single_quote = true;
+            continue;
+        }
+        if (c == '"') {
+            in_double_quote = true;
+            continue;
+        }
+
+        if (c == ';') {
+            statements.push_back(sql.substr(statement_start, i - statement_start));
+            statement_start = i + 1;
+        }
+    }
+
+    statements.push_back(sql.substr(statement_start));
+    return statements;
+}
+
+struct MeasureRewriteResult {
+    bool had_measure_view = false;
+    std::string rewritten_sql;
+    std::string error;
+};
+
+static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::string &query) {
+    MeasureRewriteResult rewrite_result;
+    std::vector<std::string> rewritten_statements;
+
+    for (auto statement : SplitSqlStatements(query)) {
+        StringUtil::Trim(statement);
+        if (statement.empty()) {
+            continue;
+        }
+
+        if (!yardstick_has_as_measure(statement.c_str())) {
+            rewritten_statements.push_back(statement);
+            continue;
+        }
+
+        std::string rewritten_statement = RewritePercentileWithinGroup(statement);
+        YardstickCreateViewResult result = yardstick_process_create_view(rewritten_statement.c_str());
+
+        if (result.error) {
+            rewrite_result.error = result.error;
+            yardstick_free_create_view_result(result);
+            return rewrite_result;
+        }
+
+        if (result.is_measure_view) {
+            rewrite_result.had_measure_view = true;
+            rewritten_statements.push_back(RewritePercentileWithinGroup(result.clean_sql));
+        } else {
+            rewritten_statements.push_back(statement);
+        }
+
+        yardstick_free_create_view_result(result);
+    }
+
+    for (idx_t i = 0; i < rewritten_statements.size(); i++) {
+        if (i > 0) {
+            rewrite_result.rewritten_sql += ";\n";
+        }
+        rewrite_result.rewritten_sql += rewritten_statements[i];
+    }
+
+    return rewrite_result;
+}
+
 #if YARDSTICK_TOKEN_PARSE_FN
 // DuckDB main: parse_function receives the post-PEG-failure token tail rather
 // than the query string. Yardstick rewrites queries earlier, in
@@ -353,6 +477,18 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
 
     if (yardstick_drop_measure_view_from_sql(sql_to_check.c_str())) {
         return ParserExtensionParseResult();
+    }
+
+    bool had_measure_rewrite = false;
+    if (yardstick_has_as_measure(sql_to_check.c_str())) {
+        auto measure_rewrite = RewriteMeasureViewsStatementByStatement(sql_to_check);
+        if (!measure_rewrite.error.empty()) {
+            return ParserExtensionParseResult(measure_rewrite.error);
+        }
+        if (measure_rewrite.had_measure_view) {
+            had_measure_rewrite = true;
+            sql_to_check = std::move(measure_rewrite.rewritten_sql);
+        }
     }
 
     // Check for AGGREGATE() function
@@ -398,35 +534,18 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
         yardstick_free_aggregate_result(result);
     }
 
-    // Check for CREATE VIEW with AS MEASURE
-    if (yardstick_has_as_measure(sql_to_check.c_str())) {
-        std::string rewritten_query = RewritePercentileWithinGroup(query);
-        YardstickCreateViewResult result = yardstick_process_create_view(rewritten_query.c_str());
+    if (had_measure_rewrite) {
+        Parser parser;
+        parser.ParseQuery(sql_to_check);
+        auto statements = std::move(parser.statements);
 
-        if (result.error) {
-            string error_msg(result.error);
-            yardstick_free_create_view_result(result);
-            return ParserExtensionParseResult(error_msg);
+        if (statements.empty()) {
+            return ParserExtensionParseResult("CREATE VIEW produced no statements");
         }
 
-        if (result.is_measure_view) {
-            string clean_sql = RewritePercentileWithinGroup(result.clean_sql);
-            yardstick_free_create_view_result(result);
-
-            Parser parser;
-            parser.ParseQuery(clean_sql);
-            auto statements = std::move(parser.statements);
-
-            if (statements.empty()) {
-                return ParserExtensionParseResult("CREATE VIEW produced no statements");
-            }
-
-            return ParserExtensionParseResult(
-                make_uniq_base<ParserExtensionParseData, YardstickParseData>(
-                    std::move(statements[0])));
-        }
-
-        yardstick_free_create_view_result(result);
+        return ParserExtensionParseResult(
+            make_uniq_base<ParserExtensionParseData, YardstickParseData>(
+                std::move(statements[0])));
     }
 
     // Not a yardstick query, let DuckDB handle it
@@ -453,6 +572,22 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
     if (yardstick_drop_measure_view_from_sql(sql_to_check.c_str())) {
         // Catalog cleanup done; let DuckDB handle the actual DROP
         return ParserOverrideResult();
+    }
+
+    bool had_measure_rewrite = false;
+    if (yardstick_has_as_measure(sql_to_check.c_str())) {
+        auto measure_rewrite = RewriteMeasureViewsStatementByStatement(sql_to_check);
+        if (!measure_rewrite.error.empty()) {
+            try {
+                throw ParserException(measure_rewrite.error);
+            } catch (std::exception &e) {
+                return ParserOverrideResult(e);
+            }
+        }
+        if (measure_rewrite.had_measure_view) {
+            had_measure_rewrite = true;
+            sql_to_check = std::move(measure_rewrite.rewritten_sql);
+        }
     }
 
     // Check for AGGREGATE() function
@@ -510,35 +645,14 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
         yardstick_free_aggregate_result(result);
     }
 
-    // Check for CREATE VIEW with AS MEASURE
-    if (yardstick_has_as_measure(sql_to_check.c_str())) {
-        std::string rewritten_query = RewritePercentileWithinGroup(query);
-        YardstickCreateViewResult result = yardstick_process_create_view(rewritten_query.c_str());
-
-        if (result.error) {
-            string error_msg(result.error);
-            yardstick_free_create_view_result(result);
-            try {
-                throw ParserException(error_msg);
-            } catch (std::exception &e) {
-                return ParserOverrideResult(e);
-            }
+    if (had_measure_rewrite) {
+        try {
+            Parser parser;
+            parser.ParseQuery(sql_to_check);
+            return ParserOverrideResult(std::move(parser.statements));
+        } catch (std::exception &e) {
+            return ParserOverrideResult(e);
         }
-
-        if (result.is_measure_view) {
-            string clean_sql = RewritePercentileWithinGroup(result.clean_sql);
-            yardstick_free_create_view_result(result);
-
-            try {
-                Parser parser;
-                parser.ParseQuery(clean_sql);
-                return ParserOverrideResult(std::move(parser.statements));
-            } catch (std::exception &e) {
-                return ParserOverrideResult(e);
-            }
-        }
-
-        yardstick_free_create_view_result(result);
     }
 
     // Not a yardstick query; fall through to DuckDB's native parser
