@@ -1469,7 +1469,13 @@ pub fn extract_drop_view_name(sql: &str) -> Option<String> {
     }
 
     let end = parse_qualified_name_span(sql, idx)?;
-    if !is_statement_tail(sql, end) {
+    let mut tail = skip_ws_and_comments(sql, end);
+    if matches_keyword_at(&upper, tail, "CASCADE") {
+        tail += "CASCADE".len();
+    } else if matches_keyword_at(&upper, tail, "RESTRICT") {
+        tail += "RESTRICT".len();
+    }
+    if !is_statement_tail(sql, tail) {
         return None;
     }
     extract_last_qualified_identifier(&sql[idx..end])
@@ -7370,6 +7376,14 @@ FROM orders"#;
         assert_eq!(
             extract_drop_view_name("DROP VIEW /* keep */ IF EXISTS [dbo].[Orders View]"),
             Some("Orders View".to_string())
+        );
+        assert_eq!(
+            extract_drop_view_name("DROP VIEW orders_v CASCADE"),
+            Some("orders_v".to_string())
+        );
+        assert_eq!(
+            extract_drop_view_name("DROP VIEW orders_v RESTRICT;"),
+            Some("orders_v".to_string())
         );
         assert_eq!(extract_drop_view_name("DROP VIEW orders_v extra"), None);
     }

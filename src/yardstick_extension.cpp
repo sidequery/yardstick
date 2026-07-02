@@ -942,6 +942,10 @@ static bool ExtractDropViewNameFromSql(const std::string &sql, std::string &view
         return false;
     }
     pos = SkipWhitespaceAndComments(sql, pos);
+    if (ConsumeKeyword(sql, pos, "CASCADE") ||
+        ConsumeKeyword(sql, pos, "RESTRICT")) {
+        pos = SkipWhitespaceAndComments(sql, pos);
+    }
     while (pos < sql.size() && sql[pos] == ';') {
         pos++;
         pos = SkipWhitespaceAndComments(sql, pos);
@@ -1022,6 +1026,10 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         }
 
         auto statement_body = statement.substr(SkipWhitespaceAndComments(statement, 0));
+        std::string semantic_statement_body;
+        if (StartsWithSemantic(statement_body, semantic_statement_body)) {
+            statement_body = semantic_statement_body;
+        }
         std::string drop_view_name;
         bool starts_with_drop_view = StartsWithDropViewStatement(statement_body);
         if (starts_with_drop_view && catalog_statement_seen && executable_since_catalog_mutation) {

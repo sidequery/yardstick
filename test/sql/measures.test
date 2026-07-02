@@ -163,6 +163,30 @@ GROUP BY year;
 Binder Error
 
 statement ok
+CREATE VIEW batch_drop_cascade_v AS
+SELECT year, SUM(amount) AS MEASURE cascade_drop_revenue
+FROM sales;
+
+statement ok
+DROP VIEW batch_drop_cascade_v CASCADE;
+CREATE VIEW batch_after_cascade_drop_v AS
+SELECT year, SUM(amount) AS MEASURE after_cascade_drop_revenue
+FROM sales;
+
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(after_cascade_drop_revenue) FROM batch_after_cascade_drop_v;
+----
+2022	150.0
+2023	225.0
+
+statement error
+SEMANTIC SELECT year, AGGREGATE(cascade_drop_revenue) AT (ALL)
+FROM batch_after_cascade_drop_v
+GROUP BY year;
+----
+Binder Error
+
+statement ok
 CREATE VIEW batch_order_v AS
 SELECT year, SUM(amount) AS MEASURE order_sensitive_revenue
 FROM sales;
@@ -227,6 +251,21 @@ FROM sales;
 SEMANTIC SELECT year, AGGREGATE(batch_mid_semantic_revenue) AS revenue
 FROM batch_mid_semantic_v
 GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE TABLE batch_semantic_create_marker(i INT);
+SEMANTIC CREATE VIEW batch_semantic_create_v AS
+SELECT year, SUM(amount) AS MEASURE semantic_create_revenue
+FROM sales;
+CREATE TABLE batch_semantic_create_result AS
+SELECT year, AGGREGATE(semantic_create_revenue) AS revenue
+FROM batch_semantic_create_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_semantic_create_result;
 ----
 2022	150.0
 2023	225.0
