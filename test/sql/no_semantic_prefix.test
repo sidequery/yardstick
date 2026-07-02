@@ -144,13 +144,15 @@ FROM sales;
 CREATE TABLE batch_order_result AS
 SELECT year, AGGREGATE(order_sensitive_revenue) AS revenue
 FROM batch_order_v;
-DROP VIEW batch_order_v;
 
 query IR rowsort
 SELECT year, revenue FROM batch_order_result;
 ----
 2022	150.0
 2023	225.0
+
+statement ok
+DROP VIEW batch_order_v;
 
 statement ok
 -- leading comment should not prevent measure registration

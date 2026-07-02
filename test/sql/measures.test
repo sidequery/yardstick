@@ -158,13 +158,15 @@ FROM sales;
 CREATE TABLE batch_order_result AS
 SELECT year, AGGREGATE(order_sensitive_revenue) AS revenue
 FROM batch_order_v;
-DROP VIEW batch_order_v;
 
 query IR rowsort
 SELECT year, revenue FROM batch_order_result;
 ----
 2022	150.0
 2023	225.0
+
+statement ok
+DROP VIEW batch_order_v;
 
 statement ok
 -- leading comment should not prevent measure registration
@@ -213,6 +215,27 @@ FROM sales;
 -- prefix applies only to the second statement in this batch
 SEMANTIC SELECT year, AGGREGATE(batch_mid_semantic_revenue) AS revenue
 FROM batch_mid_semantic_v
+GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
+statement error
+CREATE TEMP VIEW batch_temp_select_v AS
+SELECT year, SUM(amount) AS MEASURE temp_select_revenue
+FROM sales;
+SELECT year, AGGREGATE(temp_select_revenue) AS revenue
+FROM batch_temp_select_v
+GROUP BY year;
+----
+TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
+
+query IR rowsort
+CREATE VIEW batch_catalog_guard_v AS
+SELECT year, SUM(amount) AS MEASURE catalog_guard_revenue
+FROM sales;
+SELECT year, AGGREGATE(catalog_guard_revenue) AS revenue
+FROM batch_catalog_guard_v
 GROUP BY year;
 ----
 2022	150.0
@@ -301,9 +324,6 @@ statement error
 CREATE TEMP VIEW batch_shadow_v AS
 SELECT year, SUM(amount * 20) AS MEASURE shadow_revenue
 FROM sales;
-CREATE TABLE batch_shadow_dropped_result AS
-SELECT year, AGGREGATE(shadow_revenue) AS revenue
-FROM batch_shadow_v;
 DROP VIEW batch_shadow_v;
 SELEC
 ----

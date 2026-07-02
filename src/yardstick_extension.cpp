@@ -522,6 +522,15 @@ static bool IsTemporaryCreateViewStatement(const std::string &sql) {
            ConsumeKeyword(sql, pos, "TEMP");
 }
 
+static bool StartsWithDropViewStatement(const std::string &sql) {
+    size_t pos = SkipWhitespaceAndComments(sql, 0);
+    if (!ConsumeKeyword(sql, pos, "DROP")) {
+        return false;
+    }
+    pos = SkipWhitespaceAndComments(sql, pos);
+    return ConsumeKeyword(sql, pos, "VIEW");
+}
+
 struct MeasureRewriteResult {
     bool had_measure_view = false;
     bool had_aggregate = false;
@@ -595,6 +604,18 @@ static bool HasMeasureSnapshot(const std::vector<MeasureViewSnapshot> &snapshots
         }
     }
     return false;
+}
+
+static bool TableRefMatchesView(const std::string &table_name, const std::string &view_name) {
+    if (EqualsCaseInsensitive(table_name, view_name)) {
+        return true;
+    }
+    if (table_name.size() <= view_name.size()) {
+        return false;
+    }
+    idx_t suffix_start = table_name.size() - view_name.size();
+    return table_name[suffix_start - 1] == '.' &&
+           EqualsCaseInsensitive(table_name.substr(suffix_start), view_name);
 }
 
 static std::string SelectPortionForTableAnalysis(const std::string &sql) {
@@ -698,6 +719,157 @@ static std::string SelectPortionForTableAnalysis(const std::string &sql) {
     return sql;
 }
 
+static std::string ReadQualifiedIdentifier(const std::string &sql, size_t &pos) {
+    std::string identifier;
+    bool expect_part = true;
+
+    while (pos < sql.size()) {
+        if (!expect_part && sql[pos] == '.') {
+            identifier += '.';
+            pos++;
+            expect_part = true;
+            continue;
+        }
+
+        if (!expect_part) {
+            break;
+        }
+
+        if (sql[pos] == '"') {
+            pos++;
+            std::string part;
+            while (pos < sql.size()) {
+                if (sql[pos] == '"' && pos + 1 < sql.size() && sql[pos + 1] == '"') {
+                    part += '"';
+                    pos += 2;
+                    continue;
+                }
+                if (sql[pos] == '"') {
+                    pos++;
+                    break;
+                }
+                part += sql[pos++];
+            }
+            if (part.empty()) {
+                break;
+            }
+            identifier += part;
+            expect_part = false;
+            continue;
+        }
+
+        if (!IsIdentifierChar(sql[pos])) {
+            break;
+        }
+
+        size_t start = pos;
+        while (pos < sql.size() && IsIdentifierChar(sql[pos])) {
+            pos++;
+        }
+        identifier += sql.substr(start, pos - start);
+        expect_part = false;
+    }
+
+    return identifier;
+}
+
+static bool StatementTextReadsFromView(const std::string &sql, const std::string &view_name) {
+    std::string dollar_quote_end;
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+
+    for (idx_t i = 0; i < sql.size(); i++) {
+        char c = sql[i];
+        char next = i + 1 < sql.size() ? sql[i + 1] : '\0';
+
+        if (in_line_comment) {
+            if (c == '\n') {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if (in_block_comment) {
+            if (c == '*' && next == '/') {
+                in_block_comment = false;
+                i++;
+            }
+            continue;
+        }
+        if (!dollar_quote_end.empty()) {
+            if (sql.compare(i, dollar_quote_end.size(), dollar_quote_end) == 0) {
+                i += dollar_quote_end.size() - 1;
+                dollar_quote_end.clear();
+            }
+            continue;
+        }
+        if (in_single_quote) {
+            if (c == '\'' && next == '\'') {
+                i++;
+            } else if (c == '\'') {
+                in_single_quote = false;
+            }
+            continue;
+        }
+        if (in_double_quote) {
+            if (c == '"' && next == '"') {
+                i++;
+            } else if (c == '"') {
+                in_double_quote = false;
+            }
+            continue;
+        }
+
+        if (c == '-' && next == '-') {
+            in_line_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '/' && next == '*') {
+            in_block_comment = true;
+            i++;
+            continue;
+        }
+        if (c == '\'') {
+            in_single_quote = true;
+            continue;
+        }
+        if (c == '"') {
+            in_double_quote = true;
+            continue;
+        }
+        if (c == '$') {
+            idx_t tag_end = i + 1;
+            while (tag_end < sql.size() && sql[tag_end] != '$') {
+                char tag_char = sql[tag_end];
+                if (!std::isalnum(static_cast<unsigned char>(tag_char)) && tag_char != '_') {
+                    break;
+                }
+                tag_end++;
+            }
+            if (tag_end < sql.size() && sql[tag_end] == '$') {
+                dollar_quote_end = sql.substr(i, tag_end - i + 1);
+                i = tag_end;
+                continue;
+            }
+        }
+
+        size_t pos = i;
+        if (!ConsumeKeyword(sql, pos, "FROM") && !ConsumeKeyword(sql, pos, "JOIN")) {
+            continue;
+        }
+
+        pos = SkipWhitespaceAndComments(sql, pos);
+        std::string table_name = ReadQualifiedIdentifier(sql, pos);
+        if (!table_name.empty() && TableRefMatchesView(table_name, view_name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool StatementReadsFromView(const std::string &sql, const std::string &view_name) {
     std::string select_sql = SelectPortionForTableAnalysis(sql);
     YardstickSelectInfo *info = yardstick_parse_select(select_sql.c_str());
@@ -705,34 +877,70 @@ static bool StatementReadsFromView(const std::string &sql, const std::string &vi
         if (info) {
             yardstick_free_select_info(info);
         }
-        return false;
+        return StatementTextReadsFromView(select_sql, view_name);
     }
 
     bool found = false;
     for (idx_t i = 0; i < info->table_count; i++) {
         if (info->tables[i].table_name &&
-            EqualsCaseInsensitive(info->tables[i].table_name, view_name)) {
+            TableRefMatchesView(info->tables[i].table_name, view_name)) {
             found = true;
             break;
         }
     }
 
     yardstick_free_select_info(info);
-    return found;
+    return found || StatementTextReadsFromView(select_sql, view_name);
 }
 
-static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
-                                              std::vector<MeasureViewSnapshot> &temporary_snapshots,
-                                              std::vector<std::string> &pending_temporary_views,
-                                              std::vector<MeasureViewSnapshot> &snapshots) {
+static bool ExtractDropViewNameFromSql(const std::string &sql, std::string &view_name) {
     char *extracted_view_name = yardstick_extract_drop_view_name(sql.c_str());
-    if (!extracted_view_name) {
+    if (extracted_view_name) {
+        view_name = extracted_view_name;
+        yardstick_free(extracted_view_name);
+        return true;
+    }
+
+    size_t pos = SkipWhitespaceAndComments(sql, 0);
+    if (!ConsumeKeyword(sql, pos, "DROP")) {
+        return false;
+    }
+    pos = SkipWhitespaceAndComments(sql, pos);
+    if (!ConsumeKeyword(sql, pos, "VIEW")) {
+        return false;
+    }
+    pos = SkipWhitespaceAndComments(sql, pos);
+    if (ConsumeKeyword(sql, pos, "IF")) {
+        pos = SkipWhitespaceAndComments(sql, pos);
+        if (!ConsumeKeyword(sql, pos, "EXISTS")) {
+            return false;
+        }
+        pos = SkipWhitespaceAndComments(sql, pos);
+    }
+
+    std::string qualified_name = ReadQualifiedIdentifier(sql, pos);
+    if (qualified_name.empty()) {
+        return false;
+    }
+    pos = SkipWhitespaceAndComments(sql, pos);
+    while (pos < sql.size() && sql[pos] == ';') {
+        pos++;
+        pos = SkipWhitespaceAndComments(sql, pos);
+    }
+    if (pos < sql.size()) {
         return false;
     }
 
-    std::string view_name = extracted_view_name;
-    yardstick_free(extracted_view_name);
+    size_t dot_pos = qualified_name.rfind('.');
+    view_name = dot_pos == std::string::npos ? qualified_name : qualified_name.substr(dot_pos + 1);
+    return true;
+}
 
+static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
+                                              const std::string &view_name,
+                                              std::vector<MeasureViewSnapshot> &temporary_snapshots,
+                                              std::vector<std::string> &pending_temporary_views,
+                                              std::vector<MeasureViewSnapshot> &snapshots) {
     if (HasMeasureSnapshot(temporary_snapshots, view_name)) {
         RemoveCaseInsensitive(pending_temporary_views, view_name);
         yardstick_drop_measure_view_from_sql(sql.c_str());
@@ -779,6 +987,8 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
     std::vector<std::string> rewritten_statements;
     std::vector<MeasureViewSnapshot> temporary_snapshots;
     std::vector<std::string> pending_temporary_views;
+    bool catalog_statement_seen = false;
+    bool executable_since_catalog_mutation = false;
     auto cleanup_temporary_measure_views = [&temporary_snapshots]() {
         RestoreMeasureViewSnapshots(temporary_snapshots);
     };
@@ -790,11 +1000,37 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         }
 
         auto statement_body = statement.substr(SkipWhitespaceAndComments(statement, 0));
-        SnapshotAndDropMeasureViewFromSql(statement_body, temporary_snapshots,
-                                          pending_temporary_views, permanent_snapshots);
+        std::string drop_view_name;
+        bool starts_with_drop_view = StartsWithDropViewStatement(statement_body);
+        if (starts_with_drop_view && catalog_statement_seen && executable_since_catalog_mutation) {
+            rewrite_result.error = "AS MEASURE batches cannot apply catalog changes after executable statements";
+            cleanup_temporary_measure_views();
+            return rewrite_result;
+        }
+        if (ExtractDropViewNameFromSql(statement_body, drop_view_name)) {
+            if (catalog_statement_seen && executable_since_catalog_mutation) {
+                rewrite_result.error = "AS MEASURE batches cannot apply catalog changes after executable statements";
+                cleanup_temporary_measure_views();
+                return rewrite_result;
+            }
+            catalog_statement_seen = true;
+            SnapshotAndDropMeasureViewFromSql(statement_body, drop_view_name,
+                                              temporary_snapshots, pending_temporary_views,
+                                              permanent_snapshots);
+            executable_since_catalog_mutation = false;
+            rewritten_statements.push_back(statement);
+            continue;
+        }
 
         if (yardstick_has_as_measure(statement_body.c_str()) &&
             StartsWithCreateViewStatement(statement_body)) {
+            if (catalog_statement_seen && executable_since_catalog_mutation) {
+                rewrite_result.error = "AS MEASURE batches cannot apply catalog changes after executable statements";
+                cleanup_temporary_measure_views();
+                return rewrite_result;
+            }
+            catalog_statement_seen = true;
+
             std::string rewritten_statement = RewritePercentileWithinGroup(statement_body);
             bool is_temporary_measure_view = IsTemporaryCreateViewStatement(statement_body);
             std::string view_name;
@@ -823,6 +1059,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
 
             if (result.is_measure_view) {
                 rewrite_result.had_measure_view = true;
+                executable_since_catalog_mutation = false;
                 if (view_name.empty() && result.view_name) {
                     view_name = result.view_name;
                 }
@@ -856,6 +1093,9 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
 
         if (!yardstick_has_aggregate(aggregate_statement.c_str())) {
             rewritten_statements.push_back(statement);
+            if (catalog_statement_seen) {
+                executable_since_catalog_mutation = true;
+            }
             continue;
         }
 
@@ -863,13 +1103,18 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         if (result.error) {
             yardstick_free_aggregate_result(result);
             rewritten_statements.push_back(statement);
+            if (catalog_statement_seen) {
+                executable_since_catalog_mutation = true;
+            }
             continue;
         }
 
         if (result.had_aggregate) {
             rewrite_result.had_aggregate = true;
+            bool reads_pending_temporary_view = false;
             for (auto it = pending_temporary_views.begin(); it != pending_temporary_views.end();) {
                 if (StatementReadsFromView(aggregate_statement, *it)) {
+                    reads_pending_temporary_view = true;
                     it = pending_temporary_views.erase(it);
                 } else {
                     ++it;
@@ -877,12 +1122,21 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
             }
             string expanded_sql(result.expanded_sql);
             if (ParsesAsSingleSelect(expanded_sql)) {
+                if (reads_pending_temporary_view) {
+                    rewrite_result.error = "TEMPORARY AS MEASURE views cannot be returned directly from a statement batch";
+                    yardstick_free_aggregate_result(result);
+                    cleanup_temporary_measure_views();
+                    return rewrite_result;
+                }
                 rewritten_statements.push_back(WrapYardstickSelect(expanded_sql));
             } else {
                 rewritten_statements.push_back(expanded_sql);
             }
         } else {
             rewritten_statements.push_back(statement);
+        }
+        if (catalog_statement_seen) {
+            executable_since_catalog_mutation = true;
         }
         yardstick_free_aggregate_result(result);
     }
