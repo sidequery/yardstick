@@ -3616,6 +3616,24 @@ fn push_comment_char_sanitized(out: &mut String, ch: char) {
     }
 }
 
+fn dollar_quote_delimiter_at(sql: &str, start: usize) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    if start >= bytes.len() || bytes[start] != b'$' {
+        return None;
+    }
+
+    let mut end = start + 1;
+    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+        end += 1;
+    }
+
+    if end < bytes.len() && bytes[end] == b'$' {
+        Some(&sql[start..=end])
+    } else {
+        None
+    }
+}
+
 fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -3624,10 +3642,25 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
     let mut in_double = false;
     let mut in_backtick = false;
     let mut in_bracket = false;
+    let mut in_dollar_quote: Option<String> = None;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
 
     while i < bytes.len() {
+        if let Some(ref delimiter) = in_dollar_quote {
+            if sql[i..].starts_with(delimiter) {
+                out.push_str(delimiter);
+                i += delimiter.len();
+                in_dollar_quote = None;
+                continue;
+            }
+
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
         if in_line_comment {
             let ch = sql[i..].chars().next().unwrap();
             push_comment_char_sanitized(&mut out, ch);
@@ -3653,6 +3686,15 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
         }
 
         let ch = sql[i..].chars().next().unwrap();
+
+        if let Some(delimiter) = dollar_quote_delimiter_at(sql, i) {
+            if sql[i + delimiter.len()..].contains(delimiter) {
+                out.push_str(delimiter);
+                i += delimiter.len();
+                in_dollar_quote = Some(delimiter.to_string());
+                continue;
+            }
+        }
 
         if in_single {
             out.push(ch);
@@ -6610,6 +6652,17 @@ FROM orders"#;
         assert!(sanitized.contains("\"東京\""));
         assert!(!sanitized.contains("résumé"));
         assert!(!sanitized.ends_with("東京"));
+        assert_eq!(sanitized.len(), sql.len());
+    }
+
+    #[test]
+    fn test_comment_sanitizer_preserves_dollar_quoted_strings() {
+        let sql = "SELECT $$-- café$$ AS label, $tag$/* 東京 */$tag$ AS note FROM t -- résumé";
+        let sanitized = sanitize_non_ascii_in_sql_comments(sql);
+
+        assert!(sanitized.contains("$$-- café$$"));
+        assert!(sanitized.contains("$tag$/* 東京 */$tag$"));
+        assert!(!sanitized.ends_with("résumé"));
         assert_eq!(sanitized.len(), sql.len());
     }
 
