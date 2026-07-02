@@ -312,6 +312,26 @@ pub fn has_aggregate_function(sql: &str) -> bool {
                     i += 1;
                 }
             }
+            '$' => {
+                let tag_start = i;
+                let mut tag_end = i + 1;
+                while tag_end < len && is_ident_char(chars[tag_end]) {
+                    tag_end += 1;
+                }
+                if tag_end < len && chars[tag_end] == '$' {
+                    let tag: Vec<char> = chars[tag_start..=tag_end].to_vec();
+                    i = tag_end + 1;
+                    while i + tag.len() <= len {
+                        if chars[i..i + tag.len()] == tag[..] {
+                            i += tag.len();
+                            break;
+                        }
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
             '"' => {
                 let (token, next) = parse_quoted_identifier(i + 1);
                 let (last, after_chain) = parse_qualified_chain(token, next);
@@ -6605,6 +6625,10 @@ mod tests {
         assert!(has_aggregate_function("SELECT schema.AGGREGATE(revenue) FROM foo"));
         assert!(has_aggregate_function(
             "SELECT \"schema\".\"AGGREGATE\" (revenue) FROM foo"
+        ));
+        assert!(!has_aggregate_function("SELECT $$AGGREGATE(revenue)$$ AS note"));
+        assert!(!has_aggregate_function(
+            "SELECT $tag$AGGREGATE(revenue) AT (ALL)$tag$ AS note"
         ));
         assert!(!has_aggregate_function("SELECT TOTAL_AGGREGATE(revenue) FROM foo"));
         assert!(!has_aggregate_function("SELECT \"TOTAL_AGGREGATE\"(revenue) FROM foo"));

@@ -498,6 +498,25 @@ static bool StartsWithCreateViewStatement(const std::string &sql) {
     return ConsumeKeyword(sql, pos, "VIEW");
 }
 
+static bool IsTemporaryCreateViewStatement(const std::string &sql) {
+    size_t pos = SkipWhitespaceAndComments(sql, 0);
+    if (!ConsumeKeyword(sql, pos, "CREATE")) {
+        return false;
+    }
+
+    pos = SkipWhitespaceAndComments(sql, pos);
+    if (ConsumeKeyword(sql, pos, "OR")) {
+        pos = SkipWhitespaceAndComments(sql, pos);
+        if (!ConsumeKeyword(sql, pos, "REPLACE")) {
+            return false;
+        }
+        pos = SkipWhitespaceAndComments(sql, pos);
+    }
+
+    return ConsumeKeyword(sql, pos, "TEMPORARY") ||
+           ConsumeKeyword(sql, pos, "TEMP");
+}
+
 struct MeasureRewriteResult {
     bool had_measure_view = false;
     bool had_aggregate = false;
@@ -508,6 +527,14 @@ struct MeasureRewriteResult {
 static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::string &query) {
     MeasureRewriteResult rewrite_result;
     std::vector<std::string> rewritten_statements;
+    std::vector<std::string> temporary_measure_views;
+    auto cleanup_temporary_measure_views = [&temporary_measure_views]() {
+        for (auto it = temporary_measure_views.rbegin(); it != temporary_measure_views.rend(); ++it) {
+            std::string drop_sql = "DROP VIEW " + *it;
+            yardstick_drop_measure_view_from_sql(drop_sql.c_str());
+        }
+        temporary_measure_views.clear();
+    };
 
     for (auto statement : SplitSqlStatements(query)) {
         StringUtil::Trim(statement);
@@ -521,16 +548,21 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::s
         if (yardstick_has_as_measure(statement_body.c_str()) &&
             StartsWithCreateViewStatement(statement_body)) {
             std::string rewritten_statement = RewritePercentileWithinGroup(statement_body);
+            bool is_temporary_measure_view = IsTemporaryCreateViewStatement(statement_body);
             YardstickCreateViewResult result = yardstick_process_create_view(rewritten_statement.c_str());
 
             if (result.error) {
                 rewrite_result.error = result.error;
                 yardstick_free_create_view_result(result);
+                cleanup_temporary_measure_views();
                 return rewrite_result;
             }
 
             if (result.is_measure_view) {
                 rewrite_result.had_measure_view = true;
+                if (is_temporary_measure_view && result.view_name) {
+                    temporary_measure_views.emplace_back(result.view_name);
+                }
                 rewritten_statements.push_back(RewritePercentileWithinGroup(result.clean_sql));
             } else {
                 rewritten_statements.push_back(statement);
@@ -568,6 +600,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(const std::s
         rewrite_result.rewritten_sql += rewritten_statements[i];
     }
 
+    cleanup_temporary_measure_views();
     return rewrite_result;
 }
 

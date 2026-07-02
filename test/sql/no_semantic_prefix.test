@@ -181,6 +181,13 @@ SELECT year, revenue FROM batch_temp_result;
 2022	150.0
 2023	225.0
 
+statement error
+SELECT year, AGGREGATE(temp_revenue) AS revenue
+FROM batch_temp_v
+GROUP BY year;
+----
+Table with name batch_temp_v does not exist
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================
