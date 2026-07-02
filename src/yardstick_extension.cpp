@@ -45,6 +45,7 @@ extern "C" {
     bool yardstick_has_aggregate(const char *sql);
     bool yardstick_drop_measure_view_from_sql(const char *sql);
     char *yardstick_extract_view_name(const char *sql);
+    char *yardstick_extract_drop_view_name(const char *sql);
     void *yardstick_snapshot_measure_view(const char *view_name);
     void yardstick_restore_measure_view_snapshot(const char *view_name, void *snapshot);
     void yardstick_free_measure_view_snapshot(void *snapshot);
@@ -551,6 +552,20 @@ static MeasureViewSnapshot SnapshotMeasureView(const std::string &view_name) {
     return {view_name, yardstick_snapshot_measure_view(view_name.c_str())};
 }
 
+static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
+                                              std::vector<MeasureViewSnapshot> &snapshots) {
+    char *extracted_view_name = yardstick_extract_drop_view_name(sql.c_str());
+    if (!extracted_view_name) {
+        return false;
+    }
+
+    std::string view_name = extracted_view_name;
+    yardstick_free(extracted_view_name);
+    snapshots.push_back(SnapshotMeasureView(view_name));
+    yardstick_drop_measure_view_from_sql(sql.c_str());
+    return true;
+}
+
 static string EscapeSqlStringLiteral(const string &sql) {
     string escaped_sql;
     for (char c : sql) {
@@ -595,7 +610,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         }
 
         auto statement_body = statement.substr(SkipWhitespaceAndComments(statement, 0));
-        yardstick_drop_measure_view_from_sql(statement_body.c_str());
+        SnapshotAndDropMeasureViewFromSql(statement_body, permanent_snapshots);
 
         if (yardstick_has_as_measure(statement_body.c_str()) &&
             StartsWithCreateViewStatement(statement_body)) {
@@ -651,12 +666,18 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
             continue;
         }
 
-        if (!yardstick_has_aggregate(statement.c_str())) {
+        std::string aggregate_statement = statement_body;
+        std::string semantic_stripped;
+        if (StartsWithSemantic(aggregate_statement, semantic_stripped)) {
+            aggregate_statement = semantic_stripped;
+        }
+
+        if (!yardstick_has_aggregate(aggregate_statement.c_str())) {
             rewritten_statements.push_back(statement);
             continue;
         }
 
-        YardstickAggregateResult result = yardstick_expand_aggregate(statement.c_str());
+        YardstickAggregateResult result = yardstick_expand_aggregate(aggregate_statement.c_str());
         if (result.error) {
             yardstick_free_aggregate_result(result);
             rewritten_statements.push_back(statement);

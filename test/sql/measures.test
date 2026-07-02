@@ -55,6 +55,20 @@ SEMANTIC SELECT AGGREGATE(revenue), 1 AS measure FROM sales_v;
 ----
 375.0	1
 
+statement error
+DROP VIEW sales_v;
+CREATE VIEW rollback_other_v AS
+SELECT year, SUM(amount) AS MEASURE rollback_other_revenue
+FROM sales;
+SELEC
+----
+Parser Error
+
+query R
+SEMANTIC SELECT AGGREGATE(revenue) FROM sales_v;
+----
+375.0
+
 # Multi-statement batches should rewrite and register each measure view independently
 statement ok
 CREATE TABLE batch_notes(note TEXT);
@@ -187,6 +201,18 @@ SELECT year, SUM(amount) AS MEASURE batch_select_revenue
 FROM sales;
 SEMANTIC SELECT year, AGGREGATE(batch_select_revenue) AS revenue
 FROM batch_select_v
+GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
+query IR rowsort
+CREATE VIEW batch_mid_semantic_v AS
+SELECT year, SUM(amount) AS MEASURE batch_mid_semantic_revenue
+FROM sales;
+-- prefix applies only to the second statement in this batch
+SEMANTIC SELECT year, AGGREGATE(batch_mid_semantic_revenue) AS revenue
+FROM batch_mid_semantic_v
 GROUP BY year;
 ----
 2022	150.0

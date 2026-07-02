@@ -9,6 +9,7 @@ pub use measures::{
     expand_aggregate,
     expand_aggregate_with_at,
     expand_curly_braces,
+    extract_drop_view_name,
     extract_view_name,
     // Measure lookup
     get_measure_aggregation,

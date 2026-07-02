@@ -11,11 +11,11 @@ use std::os::raw::{c_char, c_void};
 use std::ptr;
 
 use crate::sql::{
-    drop_measure_view_from_sql, expand_aggregate_with_at, expand_curly_braces,
-    drop_measure_view, extract_view_name, get_measure_aggregation, get_measure_view,
+    drop_measure_view, drop_measure_view_from_sql, expand_aggregate_with_at, expand_curly_braces,
+    extract_drop_view_name, extract_view_name, get_measure_aggregation, get_measure_view,
     has_aggregate_function, has_as_measure, has_at_syntax, has_curly_brace_measure,
-    has_implicit_measure_refs, has_measure_at_refs,
-    process_create_view, restore_measure_view, MeasureView,
+    has_implicit_measure_refs, has_measure_at_refs, process_create_view, restore_measure_view,
+    MeasureView,
 };
 
 /// Result from processing CREATE VIEW with AS MEASURE
@@ -110,6 +110,25 @@ pub extern "C" fn yardstick_extract_view_name(sql: *const c_char) -> *mut c_char
     };
 
     extract_view_name(sql_str)
+        .map(|name| to_c_string(&name))
+        .unwrap_or(ptr::null_mut())
+}
+
+/// Extract the view name from a DROP VIEW statement.
+#[no_mangle]
+pub extern "C" fn yardstick_extract_drop_view_name(sql: *const c_char) -> *mut c_char {
+    if sql.is_null() {
+        return ptr::null_mut();
+    }
+
+    let sql_str = unsafe {
+        match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return ptr::null_mut(),
+        }
+    };
+
+    extract_drop_view_name(sql_str)
         .map(|name| to_c_string(&name))
         .unwrap_or(ptr::null_mut())
 }
