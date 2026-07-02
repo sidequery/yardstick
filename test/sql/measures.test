@@ -297,6 +297,17 @@ SELECT year, revenue FROM batch_temp_cte_result;
 2022	150.0
 2023	225.0
 
+statement error
+CREATE TEMP VIEW batch_temp_alias_only_v AS
+SELECT year, SUM(amount) AS MEASURE temp_alias_only_revenue
+FROM sales;
+CREATE TABLE batch_temp_alias_only_result AS
+SELECT AGGREGATE(revenue) AS revenue
+FROM sales_v
+JOIN (SELECT 1) batch_temp_alias_only_v ON true;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
+
 query IR rowsort
 CREATE VIEW batch_select_v AS
 SELECT year, SUM(amount) AS MEASURE batch_select_revenue
@@ -447,6 +458,32 @@ SELECT year, revenue FROM batch_shadow_after_temp_drop_result;
 ----
 2022	150.0
 2023	225.0
+
+statement ok
+CREATE VIEW batch_drop_temp_replace_v AS
+SELECT year, SUM(amount) AS MEASURE drop_temp_permanent_revenue
+FROM sales;
+
+statement ok
+DROP VIEW batch_drop_temp_replace_v;
+CREATE TEMP VIEW batch_drop_temp_replace_v AS
+SELECT year, SUM(amount * 10) AS MEASURE drop_temp_replacement_revenue
+FROM sales;
+CREATE TABLE batch_drop_temp_replace_result AS
+SELECT year, AGGREGATE(drop_temp_replacement_revenue) AS revenue
+FROM batch_drop_temp_replace_v
+GROUP BY year;
+
+query IR rowsort
+SELECT year, revenue FROM batch_drop_temp_replace_result;
+----
+2022	1500.0
+2023	2250.0
+
+statement error
+SEMANTIC SELECT AGGREGATE(drop_temp_permanent_revenue) FROM batch_drop_temp_replace_v;
+----
+<REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
 
 statement error
 CREATE TEMP VIEW batch_shadow_v AS

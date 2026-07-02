@@ -906,7 +906,8 @@ static bool StatementReadsFromView(const std::string &sql, const std::string &vi
 
     bool found = false;
     for (idx_t i = 0; i < info->table_count; i++) {
-        if (info->tables[i].table_name &&
+        if (!info->tables[i].is_subquery &&
+            info->tables[i].table_name &&
             TableRefMatchesView(info->tables[i].table_name, view_name)) {
             found = true;
             break;
@@ -1042,6 +1043,14 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         }
         deferred_drop_views.clear();
     };
+    auto has_deferred_drop_view = [&](const std::string &view_name) {
+        for (auto &drop_view : deferred_drop_views) {
+            if (EqualsCaseInsensitive(drop_view.view_name, view_name)) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     for (auto statement : SplitSqlStatements(query)) {
         StringUtil::Trim(statement);
@@ -1104,6 +1113,16 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                 snapshot = SnapshotMeasureView(view_name);
                 has_snapshot = true;
             }
+            bool preapplied_deferred_drop = false;
+            if (is_temporary_measure_view && !view_name.empty() &&
+                has_deferred_drop_view(view_name)) {
+                apply_deferred_drop_views();
+                if (has_snapshot) {
+                    yardstick_free_measure_view_snapshot(snapshot.snapshot);
+                    has_snapshot = false;
+                }
+                preapplied_deferred_drop = true;
+            }
             YardstickCreateViewResult result = yardstick_process_create_view(rewritten_statement.c_str());
 
             if (result.error) {
@@ -1122,7 +1141,9 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                 if (view_name.empty() && result.view_name) {
                     view_name = result.view_name;
                 }
-                apply_deferred_drop_views(view_name);
+                if (!preapplied_deferred_drop) {
+                    apply_deferred_drop_views(view_name);
+                }
                 if (is_temporary_measure_view && !view_name.empty()) {
                     if (has_snapshot) {
                         temporary_snapshots.push_back(snapshot);
