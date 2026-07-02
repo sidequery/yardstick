@@ -6332,7 +6332,10 @@ pub fn store_measure_view(
 
 pub fn get_measure_view(view_name: &str) -> Option<MeasureView> {
     let views = MEASURE_VIEWS.lock().unwrap();
-    views.get(view_name).cloned()
+    views
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(view_name))
+        .map(|(_, view)| view.clone())
 }
 
 pub fn restore_measure_view(view: MeasureView) {
@@ -7344,7 +7347,7 @@ FROM orders"#;
     fn test_drop_measure_view_from_sql() {
         clear_measure_views();
         store_measure_view(
-            "orders_v",
+            "Orders_V",
             vec![ViewMeasure {
                 column_name: "revenue".to_string(),
                 expression: "SUM(amount)".to_string(),
@@ -7355,6 +7358,7 @@ FROM orders"#;
         );
 
         assert!(get_measure_view("orders_v").is_some());
+        assert!(get_measure_view("ORDERS_V").is_some());
         assert!(!drop_measure_view_from_sql(
             "DROP VIEW orders_v /* invalid tail */ extra"
         ));

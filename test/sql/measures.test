@@ -69,6 +69,53 @@ SEMANTIC SELECT AGGREGATE(revenue) FROM sales_v;
 ----
 375.0
 
+statement ok
+CREATE VIEW false_measure_drop_v AS
+SELECT year, SUM(amount) AS MEASURE false_drop_revenue
+FROM sales;
+
+statement ok
+SELECT ' AS MEASURE ';
+DROP VIEW false_measure_drop_v;
+
+statement error
+SEMANTIC SELECT AGGREGATE(false_drop_revenue) FROM false_measure_drop_v;
+----
+Table with name false_measure_drop_v does not exist
+
+statement ok
+CREATE VIEW false_measure_recreate_v AS
+SELECT year, SUM(amount) AS MEASURE old_false_recreate_revenue
+FROM sales;
+
+statement ok
+SELECT ' AS MEASURE ';
+DROP VIEW false_measure_recreate_v;
+CREATE VIEW false_measure_recreate_v AS
+SELECT year, SUM(amount) AS MEASURE false_recreate_revenue
+FROM sales;
+
+query R
+SEMANTIC SELECT AGGREGATE(false_recreate_revenue) FROM false_measure_recreate_v;
+----
+375.0
+
+statement ok
+CREATE VIEW Sales_Case_V AS
+SELECT year, SUM(amount) AS MEASURE case_revenue
+FROM sales;
+
+statement error
+DROP VIEW sales_case_v;
+SELEC
+----
+Parser Error
+
+query R
+SEMANTIC SELECT AGGREGATE(case_revenue) FROM Sales_Case_V;
+----
+375.0
+
 statement error
 SELECT * FROM missing_false_positive_v /* AS MEASURE */;
 DROP VIEW sales_v;

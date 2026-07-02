@@ -978,6 +978,11 @@ static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
     return true;
 }
 
+struct PendingDropView {
+    std::string sql;
+    std::string view_name;
+};
+
 static string EscapeSqlStringLiteral(const string &sql) {
     string escaped_sql;
     for (char c : sql) {
@@ -1013,10 +1018,24 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
     std::vector<MeasureViewSnapshot> temporary_snapshots;
     std::vector<std::string> pending_temporary_views;
     std::vector<std::string> used_temporary_views;
+    std::vector<PendingDropView> deferred_drop_views;
     bool catalog_statement_seen = false;
     bool executable_since_catalog_mutation = false;
     auto cleanup_temporary_measure_views = [&temporary_snapshots]() {
         RestoreMeasureViewSnapshots(temporary_snapshots);
+    };
+    auto apply_deferred_drop_views = [&](const std::string &skip_view_name = "") {
+        for (auto &drop_view : deferred_drop_views) {
+            if (!skip_view_name.empty() &&
+                EqualsCaseInsensitive(drop_view.view_name, skip_view_name)) {
+                continue;
+            }
+            SnapshotAndDropMeasureViewFromSql(drop_view.sql, drop_view.view_name,
+                                              temporary_snapshots, pending_temporary_views,
+                                              used_temporary_views,
+                                              permanent_snapshots);
+        }
+        deferred_drop_views.clear();
     };
 
     for (auto statement : SplitSqlStatements(query)) {
@@ -1044,10 +1063,14 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                 return rewrite_result;
             }
             catalog_statement_seen = true;
-            SnapshotAndDropMeasureViewFromSql(statement_body, drop_view_name,
-                                              temporary_snapshots, pending_temporary_views,
-                                              used_temporary_views,
-                                              permanent_snapshots);
+            if (rewrite_result.had_measure_view) {
+                SnapshotAndDropMeasureViewFromSql(statement_body, drop_view_name,
+                                                  temporary_snapshots, pending_temporary_views,
+                                                  used_temporary_views,
+                                                  permanent_snapshots);
+            } else {
+                deferred_drop_views.push_back({statement_body, drop_view_name});
+            }
             executable_since_catalog_mutation = false;
             rewritten_statements.push_back(statement);
             continue;
@@ -1094,6 +1117,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                 if (view_name.empty() && result.view_name) {
                     view_name = result.view_name;
                 }
+                apply_deferred_drop_views(view_name);
                 if (is_temporary_measure_view && !view_name.empty()) {
                     if (has_snapshot) {
                         temporary_snapshots.push_back(snapshot);
