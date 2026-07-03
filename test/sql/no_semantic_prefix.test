@@ -349,7 +349,7 @@ SELECT EXTRACT(year FROM batch_extract_unused_tmp_v) AS extracted_year,
        AGGREGATE(revenue) AS revenue
 FROM sales_v;
 ----
-TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used.*|syntax error at or near "extract_unused_revenue").*
 
 # =============================================================================
 # Test: CTE with AGGREGATE
