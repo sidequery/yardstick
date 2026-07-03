@@ -212,6 +212,22 @@ SELECT year, revenue FROM batch_temp_cte_result;
 2022	150.0
 2023	225.0
 
+statement ok
+CREATE TEMP VIEW batch_temp_derived_v AS
+SELECT year, SUM(amount) AS MEASURE temp_derived_revenue
+FROM sales;
+CREATE TABLE batch_temp_derived_result AS
+SELECT *
+FROM (
+    SELECT AGGREGATE(temp_derived_revenue) AS revenue
+    FROM batch_temp_derived_v
+) s;
+
+query R
+SELECT revenue FROM batch_temp_derived_result;
+----
+375.0
+
 query IR rowsort
 CREATE VIEW batch_select_v AS
 SELECT year, SUM(amount) AS MEASURE batch_select_revenue

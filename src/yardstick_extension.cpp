@@ -1015,9 +1015,13 @@ static bool StatementReadsFromView(const std::string &sql,
     }
 
     bool found = false;
+    bool has_subquery = false;
     for (idx_t i = 0; i < info->table_count; i++) {
-        if (!info->tables[i].is_subquery &&
-            info->tables[i].table_name &&
+        if (info->tables[i].is_subquery) {
+            has_subquery = true;
+            continue;
+        }
+        if (info->tables[i].table_name &&
             TableRefMatchesView(info->tables[i].table_name, view_name, qualified_permanent)) {
             found = true;
             break;
@@ -1027,7 +1031,7 @@ static bool StatementReadsFromView(const std::string &sql,
     size_t select_pos = SkipWhitespaceAndComments(select_sql, 0);
     bool starts_with_with = ConsumeKeyword(select_sql, select_pos, "WITH");
     yardstick_free_select_info(info);
-    return found || ((qualified_permanent || starts_with_with) &&
+    return found || ((qualified_permanent || starts_with_with || has_subquery) &&
                      StatementTextReadsFromView(select_sql, view_name, qualified_permanent));
 }
 
