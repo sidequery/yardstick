@@ -1165,7 +1165,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                 deferred_drop_views.push_back(drop_view);
             }
             executable_since_catalog_mutation = false;
-            rewritten_statements.push_back(statement);
+            rewritten_statements.push_back(statement_body);
             continue;
         }
 
@@ -1198,7 +1198,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                 apply_deferred_drop_views();
                 if (has_snapshot) {
                     yardstick_free_measure_view_snapshot(snapshot.snapshot);
-                    has_snapshot = false;
+                    snapshot = SnapshotMeasureView(view_name);
                 }
                 preapplied_deferred_drop = true;
             }

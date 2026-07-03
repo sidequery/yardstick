@@ -556,6 +556,38 @@ SEMANTIC SELECT AGGREGATE(drop_temp_permanent_revenue) FROM batch_drop_temp_repl
 ----
 <REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
 
+statement error
+SEMANTIC SELECT AGGREGATE(drop_temp_replacement_revenue) FROM batch_drop_temp_replace_v;
+----
+<REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
+
+statement ok
+CREATE VIEW batch_drop_temp_direct_v AS
+SELECT year, SUM(amount) AS MEASURE drop_temp_direct_permanent_revenue
+FROM sales;
+
+statement error
+DROP VIEW batch_drop_temp_direct_v;
+CREATE TEMP VIEW batch_drop_temp_direct_v AS
+SELECT year, SUM(amount * 10) AS MEASURE drop_temp_direct_revenue
+FROM sales;
+SELECT year, AGGREGATE(drop_temp_direct_revenue) AS revenue
+FROM batch_drop_temp_direct_v
+GROUP BY year;
+----
+<REGEX>:.*TEMPORARY AS MEASURE views.*
+
+statement ok
+CREATE VIEW batch_semantic_drop_v AS
+SELECT year, SUM(amount) AS MEASURE semantic_drop_revenue
+FROM sales;
+SEMANTIC DROP VIEW batch_semantic_drop_v;
+
+statement error
+SEMANTIC SELECT AGGREGATE(semantic_drop_revenue) FROM batch_semantic_drop_v;
+----
+<REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
+
 statement ok
 CREATE TEMP VIEW batch_temp_replace_drop_v AS
 SELECT year, SUM(amount) AS MEASURE temp_replace_drop_revenue

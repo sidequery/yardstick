@@ -314,6 +314,22 @@ SELECT year, revenue FROM batch_qualified_shadow_drop_result;
 2022	6000.0
 2023	9000.0
 
+statement ok
+CREATE VIEW batch_drop_temp_direct_v AS
+SELECT year, SUM(amount) AS MEASURE drop_temp_direct_permanent_revenue
+FROM sales;
+
+statement error
+DROP VIEW batch_drop_temp_direct_v;
+CREATE TEMP VIEW batch_drop_temp_direct_v AS
+SELECT year, SUM(amount * 10) AS MEASURE drop_temp_direct_revenue
+FROM sales;
+SELECT year, AGGREGATE(drop_temp_direct_revenue) AS revenue
+FROM batch_drop_temp_direct_v
+GROUP BY year;
+----
+<REGEX>:.*TEMPORARY AS MEASURE views.*
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================
