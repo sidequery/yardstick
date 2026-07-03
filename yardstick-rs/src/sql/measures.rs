@@ -892,6 +892,24 @@ fn rewrite_measure_at_refs(sql: &str) -> String {
                 }
                 continue;
             }
+            b'$' => {
+                let mut tag_end = i + 1;
+                while tag_end < bytes.len() && bytes[tag_end] != b'$' {
+                    let tag_char = bytes[tag_end];
+                    if !tag_char.is_ascii_alphanumeric() && tag_char != b'_' {
+                        break;
+                    }
+                    tag_end += 1;
+                }
+                if tag_end < bytes.len() && bytes[tag_end] == b'$' {
+                    let tag = &sql[i..=tag_end];
+                    i = tag_end + 1;
+                    if let Some(relative_end) = sql[i..].find(tag) {
+                        i += relative_end + tag.len();
+                    }
+                    continue;
+                }
+            }
             _ => {}
         }
 
@@ -7293,6 +7311,26 @@ FROM orders"#;
         let rewritten = rewrite_measure_at_refs(sql);
         assert_eq!(rewritten, "SELECT AGGREGATE(revenue) AT (VISIBLE) FROM sales_v");
         assert!(has_measure_at_refs(sql));
+    }
+
+    #[test]
+    #[serial]
+    fn test_rewrite_measure_at_refs_skips_dollar_literals() {
+        clear_measure_views();
+        store_measure_view(
+            "sales_v",
+            vec![ViewMeasure {
+                column_name: "revenue".to_string(),
+                expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
+            }],
+            "SELECT year, SUM(amount) AS revenue FROM sales GROUP BY year",
+            Some("sales".to_string()),
+        );
+
+        let sql = "INSERT INTO notes VALUES ($tag$revenue AT (ALL)$tag$)";
+        assert_eq!(rewrite_measure_at_refs(sql), sql);
+        assert!(!has_measure_at_refs(sql));
     }
 
     #[test]

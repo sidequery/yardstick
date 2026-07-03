@@ -87,6 +87,17 @@ SELECT note FROM batch_literal_notes;
 ----
 AGGREGATE(literal_revenue)
 
+statement ok
+CREATE VIEW batch_at_literal_v AS
+SELECT year, SUM(amount) AS MEASURE at_literal_revenue
+FROM sales;
+INSERT INTO batch_literal_notes VALUES ($$at_literal_revenue AT (ALL)$$);
+
+query T
+SELECT note FROM batch_literal_notes WHERE note = 'at_literal_revenue AT (ALL)';
+----
+at_literal_revenue AT (ALL)
+
 query IR rowsort
 SELECT year, AGGREGATE(order_revenue) FROM batch_orders_v;
 ----
