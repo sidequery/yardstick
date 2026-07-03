@@ -228,6 +228,9 @@ static std::string RewritePercentileWithinGroup(const std::string &sql) {
 // TABLE FUNCTION: yardstick(sql) - Execute SQL with AGGREGATE() expansion
 //=============================================================================
 
+static std::string AggregateWarnings(YardstickAggregateResult &result);
+static void HandleAggregateWarnings(ClientContext &context, const string &warnings);
+
 struct YardstickQueryData : public TableFunctionData {
     string original_sql;
     string rewritten_sql;
@@ -241,6 +244,9 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
                                                      vector<string> &names) {
     auto data = make_uniq<YardstickQueryData>();
     data->original_sql = input.inputs[0].GetValue<string>();
+    if (input.inputs.size() > 1) {
+        HandleAggregateWarnings(context, input.inputs[1].GetValue<string>());
+    }
 
     // Rewrite the SQL using our Rust code
     if (yardstick_has_aggregate(data->original_sql.c_str())) {
@@ -252,6 +258,7 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
         }
         if (result.had_aggregate) {
             data->rewritten_sql = string(result.expanded_sql);
+            HandleAggregateWarnings(context, AggregateWarnings(result));
         } else {
             data->rewritten_sql = data->original_sql;
         }
@@ -302,6 +309,18 @@ static void YardstickQueryFunction(ClientContext &context, TableFunctionInput &d
     for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
         output.data[col].Reference(chunk->data[col]);
     }
+}
+
+static void YardstickWarningFunction(DataChunk &input, ExpressionState &state, Vector &result) {
+    if (input.ColumnCount() > 0 && input.size() > 0) {
+        auto warnings = input.data[0].GetValue(0);
+        if (!warnings.IsNull()) {
+            HandleAggregateWarnings(state.GetContext(), warnings.GetValue<string>());
+        }
+    }
+    result.SetVectorType(VectorType::CONSTANT_VECTOR);
+    ConstantVector::SetNull(result, false);
+    ConstantVector::GetData<bool>(result)[0] = true;
 }
 
 //=============================================================================
@@ -1118,8 +1137,43 @@ static string EscapeSqlStringLiteral(const string &sql) {
     return escaped_sql;
 }
 
+static std::string AggregateWarnings(YardstickAggregateResult &result) {
+    return result.warnings ? string(result.warnings) : string();
+}
+
+static bool WarningsAsErrors(ClientContext &context) {
+    Value setting;
+    if (!context.TryGetCurrentSetting("warnings_as_errors", setting) || setting.IsNull()) {
+        return false;
+    }
+    return setting.GetValue<bool>();
+}
+
+static void HandleAggregateWarnings(ClientContext &context, const string &warnings) {
+    if (warnings.empty()) {
+        return;
+    }
+    if (WarningsAsErrors(context)) {
+        throw InvalidInputException("%s", warnings);
+    }
+    DUCKDB_LOG_WARNING(context, "%s", warnings.c_str());
+}
+
+static string YardstickWrapperSql(const string &expanded_sql, const string &warnings) {
+    string wrapper_sql = "SELECT * FROM yardstick('" + EscapeSqlStringLiteral(expanded_sql) + "'";
+    if (!warnings.empty()) {
+        wrapper_sql += ", '" + EscapeSqlStringLiteral(warnings) + "'";
+    }
+    wrapper_sql += ")";
+    return wrapper_sql;
+}
+
 static string WrapYardstickSelect(const string &sql) {
-    return "SELECT * FROM yardstick('" + EscapeSqlStringLiteral(sql) + "')";
+    return YardstickWrapperSql(sql, "");
+}
+
+static string WarningStatementSql(const string &warnings) {
+    return "SELECT yardstick_warning('" + EscapeSqlStringLiteral(warnings) + "')";
 }
 
 static bool ParsesAsSingleSelect(const string &sql) {
@@ -1131,6 +1185,314 @@ static bool ParsesAsSingleSelect(const string &sql) {
     }
     return parser.statements.size() == 1 &&
            parser.statements[0]->type == StatementType::SELECT_STATEMENT;
+}
+
+static bool IsKeywordBoundary(char c) {
+    return !std::isalnum(static_cast<unsigned char>(c)) && c != '_';
+}
+
+static idx_t FindTopLevelKeyword(const string &sql, const string &keyword, idx_t start = 0) {
+    idx_t depth = 0;
+    for (idx_t i = start; i < sql.size(); i++) {
+        char c = sql[i];
+        if (c == '\'') {
+            i++;
+            while (i < sql.size()) {
+                if (sql[i] == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'') {
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == '\'') {
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (c == '"') {
+            i++;
+            while (i < sql.size()) {
+                if (sql[i] == '"' && i + 1 < sql.size() && sql[i + 1] == '"') {
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == '"') {
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            i += 2;
+            while (i < sql.size() && sql[i] != '\n' && sql[i] != '\r') {
+                i++;
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
+                i++;
+            }
+            if (i + 1 < sql.size()) {
+                i++;
+            }
+            continue;
+        }
+        if (c == '(') {
+            depth++;
+            continue;
+        }
+        if (c == ')' && depth > 0) {
+            depth--;
+            continue;
+        }
+        if (depth != 0 || i + keyword.size() > sql.size()) {
+            continue;
+        }
+        bool matched = true;
+        for (idx_t j = 0; j < keyword.size(); j++) {
+            if (std::toupper(static_cast<unsigned char>(sql[i + j])) != keyword[j]) {
+                matched = false;
+                break;
+            }
+        }
+        if (!matched) {
+            continue;
+        }
+        bool left_ok = i == 0 || IsKeywordBoundary(sql[i - 1]);
+        bool right_ok = i + keyword.size() >= sql.size() || IsKeywordBoundary(sql[i + keyword.size()]);
+        if (left_ok && right_ok) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+static idx_t SkipSqlWhitespace(const string &sql, idx_t i) {
+    while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
+        i++;
+    }
+    return i;
+}
+
+static idx_t SkipSqlWhitespaceAndComments(const string &sql, idx_t i) {
+    while (i < sql.size()) {
+        i = SkipSqlWhitespace(sql, i);
+        if (i + 1 < sql.size() && sql[i] == '-' && sql[i + 1] == '-') {
+            i += 2;
+            while (i < sql.size() && sql[i] != '\n' && sql[i] != '\r') {
+                i++;
+            }
+            continue;
+        }
+        if (i + 1 < sql.size() && sql[i] == '/' && sql[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
+                i++;
+            }
+            if (i + 1 < sql.size()) {
+                i += 2;
+            }
+            continue;
+        }
+        return i;
+    }
+    return i;
+}
+
+static bool KeywordAt(const string &sql, idx_t pos, const string &keyword) {
+    if (pos + keyword.size() > sql.size()) {
+        return false;
+    }
+    for (idx_t i = 0; i < keyword.size(); i++) {
+        if (std::toupper(static_cast<unsigned char>(sql[pos + i])) != keyword[i]) {
+            return false;
+        }
+    }
+    bool left_ok = pos == 0 || IsKeywordBoundary(sql[pos - 1]);
+    bool right_ok = pos + keyword.size() >= sql.size() || IsKeywordBoundary(sql[pos + keyword.size()]);
+    return left_ok && right_ok;
+}
+
+static string StripTrailingSemicolon(string sql) {
+    StringUtil::RTrim(sql);
+    if (!sql.empty() && sql.back() == ';') {
+        sql.pop_back();
+        StringUtil::RTrim(sql);
+    }
+    return sql;
+}
+
+static idx_t FindMatchingParen(const string &sql, idx_t open_pos) {
+    if (open_pos >= sql.size() || sql[open_pos] != '(') {
+        return std::string::npos;
+    }
+    idx_t depth = 0;
+    for (idx_t i = open_pos; i < sql.size(); i++) {
+        char c = sql[i];
+        if (c == '\'') {
+            i++;
+            while (i < sql.size()) {
+                if (sql[i] == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'') {
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == '\'') {
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (c == '"') {
+            i++;
+            while (i < sql.size()) {
+                if (sql[i] == '"' && i + 1 < sql.size() && sql[i + 1] == '"') {
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == '"') {
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            i += 2;
+            while (i < sql.size() && sql[i] != '\n' && sql[i] != '\r') {
+                i++;
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
+                i++;
+            }
+            if (i + 1 < sql.size()) {
+                i++;
+            }
+            continue;
+        }
+        if (c == '(') {
+            depth++;
+        } else if (c == ')') {
+            depth--;
+            if (depth == 0) {
+                return i;
+            }
+        }
+    }
+    return std::string::npos;
+}
+
+static bool IsWrappedInParens(const string &sql) {
+    idx_t start = SkipSqlWhitespace(sql, 0);
+    if (start >= sql.size() || sql[start] != '(') {
+        return false;
+    }
+    idx_t close = FindMatchingParen(sql, start);
+    if (close == std::string::npos) {
+        return false;
+    }
+    idx_t tail = SkipSqlWhitespace(sql, close + 1);
+    return tail == sql.size() || sql[tail] == ';';
+}
+
+static string UnwrapQueryBody(string sql) {
+    sql = StripTrailingSemicolon(sql);
+    while (IsWrappedInParens(sql)) {
+        idx_t start = SkipSqlWhitespace(sql, 0);
+        idx_t close = FindMatchingParen(sql, start);
+        sql = sql.substr(start + 1, close - start - 1);
+        sql = StripTrailingSemicolon(sql);
+    }
+    return sql;
+}
+
+static string WarningWrappedSelectSql(const string &query_sql, const string &warnings) {
+    string query = UnwrapQueryBody(query_sql);
+    return "WITH __yardstick_warning AS MATERIALIZED (" + WarningStatementSql(warnings) +
+           "), __yardstick_query AS MATERIALIZED (\n" + query +
+           "\n) SELECT __yardstick_query.* FROM __yardstick_warning CROSS JOIN __yardstick_query";
+}
+
+static idx_t FindParenthesizedQueryBodyAfter(const string &sql, idx_t start) {
+    idx_t i = start;
+    while (i < sql.size()) {
+        i = SkipSqlWhitespace(sql, i);
+        if (i >= sql.size()) {
+            return std::string::npos;
+        }
+        if (sql[i] == '(') {
+            auto close = FindMatchingParen(sql, i);
+            if (close == std::string::npos) {
+                return std::string::npos;
+            }
+            auto body_start = SkipSqlWhitespaceAndComments(sql, i + 1);
+            if (KeywordAt(sql, body_start, "SELECT") || KeywordAt(sql, body_start, "WITH")) {
+                return i;
+            }
+            i = close + 1;
+            continue;
+        }
+        i++;
+    }
+    return std::string::npos;
+}
+
+static bool TryWarningWrappedNonSelectSql(const string &expanded_sql,
+                                          const string &warnings,
+                                          string &rewritten_sql) {
+    string trimmed = expanded_sql;
+    StringUtil::LTrim(trimmed);
+    string upper = StringUtil::Upper(trimmed);
+
+    auto insert_pos = FindTopLevelKeyword(expanded_sql, "INSERT");
+    if (insert_pos != std::string::npos) {
+        auto select_pos = FindTopLevelKeyword(expanded_sql, "SELECT", insert_pos + strlen("INSERT"));
+        auto with_pos = FindTopLevelKeyword(expanded_sql, "WITH", insert_pos + strlen("INSERT"));
+        idx_t body_pos = std::string::npos;
+        if (select_pos != std::string::npos && with_pos != std::string::npos) {
+            body_pos = select_pos < with_pos ? select_pos : with_pos;
+        } else if (select_pos != std::string::npos) {
+            body_pos = select_pos;
+        } else {
+            body_pos = with_pos;
+        }
+        if (body_pos != std::string::npos) {
+            rewritten_sql = expanded_sql.substr(0, body_pos) +
+                            WarningWrappedSelectSql(expanded_sql.substr(body_pos), warnings);
+            return true;
+        }
+        body_pos = FindParenthesizedQueryBodyAfter(expanded_sql, insert_pos + strlen("INSERT"));
+        if (body_pos != std::string::npos) {
+            rewritten_sql = expanded_sql.substr(0, body_pos) +
+                            WarningWrappedSelectSql(expanded_sql.substr(body_pos), warnings);
+            return true;
+        }
+    }
+
+    auto create_pos = FindTopLevelKeyword(expanded_sql, "CREATE");
+    auto table_pos = create_pos == std::string::npos
+                         ? std::string::npos
+                         : FindTopLevelKeyword(expanded_sql, "TABLE", create_pos + strlen("CREATE"));
+    auto as_pos = table_pos == std::string::npos
+                      ? std::string::npos
+                      : FindTopLevelKeyword(expanded_sql, "AS", table_pos + strlen("TABLE"));
+    if (as_pos != std::string::npos && !StringUtil::StartsWith(upper, "CREATE VIEW")) {
+        auto body_pos = SkipSqlWhitespace(expanded_sql, as_pos + strlen("AS"));
+        if (body_pos < expanded_sql.size()) {
+            rewritten_sql = expanded_sql.substr(0, as_pos + strlen("AS")) + " " +
+                            WarningWrappedSelectSql(expanded_sql.substr(body_pos), warnings);
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
@@ -1339,6 +1701,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                 }
             }
             string expanded_sql(result.expanded_sql);
+            string warnings = AggregateWarnings(result);
             if (ParsesAsSingleSelect(expanded_sql)) {
                 if (reads_pending_temporary_view) {
                     rewrite_result.error = "TEMPORARY AS MEASURE views cannot be returned directly from a statement batch";
@@ -1347,9 +1710,18 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                     cleanup_temporary_measure_views();
                     return rewrite_result;
                 }
-                rewritten_statements.push_back(WrapYardstickSelect(expanded_sql));
+                rewritten_statements.push_back(YardstickWrapperSql(expanded_sql, warnings));
             } else {
-                rewritten_statements.push_back(expanded_sql);
+                if (!warnings.empty()) {
+                    string warning_sql;
+                    if (TryWarningWrappedNonSelectSql(expanded_sql, warnings, warning_sql)) {
+                        rewritten_statements.push_back(warning_sql);
+                    } else {
+                        rewritten_statements.push_back(WarningStatementSql(warnings) + ";\n" + expanded_sql);
+                    }
+                } else {
+                    rewritten_statements.push_back(expanded_sql);
+                }
             }
         } else {
             rewritten_statements.push_back(statement);
@@ -1433,10 +1805,11 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
 
         if (result.had_aggregate) {
             string expanded_sql(result.expanded_sql);
+            string warnings = AggregateWarnings(result);
             yardstick_free_aggregate_result(result);
 
             // Wrap in table function call
-            string wrapper_sql = WrapYardstickSelect(expanded_sql);
+            string wrapper_sql = YardstickWrapperSql(expanded_sql, warnings);
 
             Parser parser;
             parser.ParseQuery(wrapper_sql);
@@ -1538,6 +1911,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
 
         if (result.had_aggregate) {
             string expanded_sql(result.expanded_sql);
+            string warnings = AggregateWarnings(result);
             yardstick_free_aggregate_result(result);
 
             // Validate the expanded SQL parses. If expansion produced garbage
@@ -1559,9 +1933,23 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
                              validation_parser.statements[0]->type == StatementType::SELECT_STATEMENT;
 
             if (is_select) {
-                string wrapper_sql = WrapYardstickSelect(expanded_sql);
+                string wrapper_sql = YardstickWrapperSql(expanded_sql, warnings);
                 Parser parser;
                 parser.ParseQuery(wrapper_sql);
+                RestoreMeasureViewSnapshots(permanent_snapshots);
+                return ParserOverrideResult(std::move(parser.statements));
+            }
+
+            if (!warnings.empty()) {
+                string warning_sql;
+                if (TryWarningWrappedNonSelectSql(expanded_sql, warnings, warning_sql)) {
+                    Parser parser;
+                    parser.ParseQuery(warning_sql);
+                    RestoreMeasureViewSnapshots(permanent_snapshots);
+                    return ParserOverrideResult(std::move(parser.statements));
+                }
+                Parser parser;
+                parser.ParseQuery(WarningStatementSql(warnings) + "; " + expanded_sql);
                 RestoreMeasureViewSnapshots(permanent_snapshots);
                 return ParserOverrideResult(std::move(parser.statements));
             }
@@ -1640,20 +2028,11 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
 
             if (result.had_aggregate) {
                 string expanded_sql(result.expanded_sql);
+                string warnings = AggregateWarnings(result);
                 yardstick_free_aggregate_result(result);
 
-                // Escape single quotes for embedding in string literal
-                string escaped_sql;
-                for (char c : expanded_sql) {
-                    if (c == '\'') {
-                        escaped_sql += "''";
-                    } else {
-                        escaped_sql += c;
-                    }
-                }
-
                 // Rebind through table function so rewritten SQL executes with normal planning
-                string wrapper_sql = "SELECT * FROM yardstick('" + escaped_sql + "')";
+                string wrapper_sql = YardstickWrapperSql(expanded_sql, warnings);
                 Parser parser;
                 parser.ParseQuery(wrapper_sql);
                 auto statements = std::move(parser.statements);
@@ -1724,6 +2103,15 @@ static void LoadInternal(ExtensionLoader &loader) {
     TableFunction query_func("yardstick", {LogicalType::VARCHAR},
                              YardstickQueryFunction, YardstickQueryBind);
     loader.RegisterFunction(query_func);
+    TableFunction query_func_with_warnings("yardstick", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                           YardstickQueryFunction, YardstickQueryBind);
+    loader.RegisterFunction(query_func_with_warnings);
+
+    ScalarFunction warning_func("yardstick_warning", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+                                YardstickWarningFunction);
+    warning_func.SetVolatile();
+    warning_func.SetFallible();
+    loader.RegisterFunction(warning_func);
 }
 
 void YardstickExtension::Load(ExtensionLoader &loader) {

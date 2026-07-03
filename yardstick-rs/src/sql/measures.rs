@@ -74,6 +74,7 @@ pub struct AggregateExpandResult {
     pub had_aggregate: bool,
     pub expanded_sql: String,
     pub error: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 /// Context modifier for AGGREGATE() AT (...) syntax
@@ -1825,12 +1826,23 @@ fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usiz
     let mut in_double = false;
     let mut in_backtick = false;
     let mut in_bracket = false;
+    let mut in_dollar_quote: Option<String> = None;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
 
     let mut i = start;
     while i < bytes.len() {
         let c = bytes[i] as char;
+
+        if let Some(ref delimiter) = in_dollar_quote {
+            if sql[i..].starts_with(delimiter) {
+                i += delimiter.len();
+                in_dollar_quote = None;
+            } else {
+                i += sql[i..].chars().next().map(|ch| ch.len_utf8()).unwrap_or(1);
+            }
+            continue;
+        }
 
         if in_line_comment {
             if c == '\n' || c == '\r' {
@@ -1884,6 +1896,14 @@ fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usiz
             }
             i += 1;
             continue;
+        }
+
+        if let Some(delimiter) = dollar_quote_delimiter_at(sql, i) {
+            if sql[i + delimiter.len()..].contains(delimiter) {
+                in_dollar_quote = Some(delimiter.to_string());
+                i += delimiter.len();
+                continue;
+            }
         }
 
         if c == '-' && i + 1 < bytes.len() && bytes[i + 1] as char == '-' {
@@ -2087,6 +2107,7 @@ fn advance_after_group_by(query: &str, group_pos: usize) -> Option<usize> {
 struct CteExpansion {
     sql: String,
     had_aggregate: bool,
+    warnings: Vec<String>,
 }
 
 fn expand_cte_queries(sql: &str) -> CteExpansion {
@@ -2096,6 +2117,7 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
             return CteExpansion {
                 sql: sql.to_string(),
                 had_aggregate: false,
+                warnings: Vec::new(),
             };
         }
     };
@@ -2104,6 +2126,7 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
     let mut idx = with_pos + "WITH".len();
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
     let mut had_aggregate = false;
+    let mut warnings = Vec::new();
 
     idx = skip_whitespace(sql, idx);
     if matches_keyword_at(&upper, idx, "RECURSIVE") {
@@ -2116,6 +2139,7 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
             return CteExpansion {
                 sql: sql.to_string(),
                 had_aggregate: false,
+                warnings: Vec::new(),
             };
         }
 
@@ -2126,6 +2150,7 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
                 return CteExpansion {
                     sql: sql.to_string(),
                     had_aggregate: false,
+                    warnings: Vec::new(),
                 };
             }
         };
@@ -2140,6 +2165,7 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
                     return CteExpansion {
                         sql: sql.to_string(),
                         had_aggregate: false,
+                        warnings: Vec::new(),
                     };
                 }
             };
@@ -2152,6 +2178,7 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
             return CteExpansion {
                 sql: sql.to_string(),
                 had_aggregate: false,
+                warnings: Vec::new(),
             };
         }
         idx += "AS".len();
@@ -2161,6 +2188,7 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
             return CteExpansion {
                 sql: sql.to_string(),
                 had_aggregate: false,
+                warnings: Vec::new(),
             };
         }
 
@@ -2171,6 +2199,7 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
                 return CteExpansion {
                     sql: sql.to_string(),
                     had_aggregate: false,
+                    warnings: Vec::new(),
                 };
             }
         };
@@ -2181,6 +2210,11 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
         let expanded = expand_aggregate_with_at(query_sql);
         if expanded.had_aggregate {
             had_aggregate = true;
+        }
+        for warning in expanded.warnings {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
         }
         if expanded.expanded_sql != query_sql {
             replacements.push((query_start, query_end, expanded.expanded_sql));
@@ -2199,6 +2233,7 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
         return CteExpansion {
             sql: sql.to_string(),
             had_aggregate,
+            warnings,
         };
     }
 
@@ -2211,6 +2246,393 @@ fn expand_cte_queries(sql: &str) -> CteExpansion {
     CteExpansion {
         sql: result,
         had_aggregate,
+        warnings,
+    }
+}
+
+fn top_level_parenthesized_query_body_range(sql: &str) -> Option<(usize, usize)> {
+    let upper = sql.to_uppercase();
+    let mut idx = 0;
+    while let Some(as_pos) = find_top_level_keyword(sql, "AS", idx) {
+        let open_pos = skip_ws_and_comments(sql, as_pos + "AS".len());
+        if open_pos < sql.len() && sql.as_bytes()[open_pos] == b'(' {
+            let body_start = skip_ws_and_comments(sql, open_pos + 1);
+            if matches_keyword_at(&upper, body_start, "SELECT")
+                || matches_keyword_at(&upper, body_start, "WITH")
+            {
+                if let Ok((_, body)) = balanced_parens(&sql[open_pos + 1..]) {
+                    let start = open_pos + 1;
+                    return Some((start, start + body.len()));
+                }
+            }
+        }
+        idx = as_pos + "AS".len();
+    }
+    None
+}
+
+fn top_level_parenthesized_query_body(sql: &str) -> Option<&str> {
+    top_level_parenthesized_query_body_range(sql).map(|(start, end)| &sql[start..end])
+}
+
+fn find_top_level_open_paren(sql: &str, start: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut in_bracket = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+
+        if in_line_comment {
+            if c == '\n' || c == '\r' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if c == '*' && i + 1 < bytes.len() && bytes[i + 1] as char == '/' {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_single {
+            if c == '\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] as char == '\'' {
+                    i += 1;
+                } else {
+                    in_single = false;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            if c == '"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_backtick {
+            if c == '`' {
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_bracket {
+            if c == ']' {
+                in_bracket = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '-' && i + 1 < bytes.len() && bytes[i + 1] as char == '-' {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] as char == '*' {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+
+        match c {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            '`' => in_backtick = true,
+            '[' => in_bracket = true,
+            '(' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth += 1;
+            }
+            ')' => {
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn find_matching_paren_sql(sql: &str, open_pos: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    if open_pos >= bytes.len() || bytes[open_pos] != b'(' {
+        return None;
+    }
+
+    let mut depth: i32 = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut in_bracket = false;
+    let mut in_dollar_quote: Option<String> = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    let mut i = open_pos;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+
+        if let Some(ref delimiter) = in_dollar_quote {
+            if sql[i..].starts_with(delimiter) {
+                i += delimiter.len();
+                in_dollar_quote = None;
+            } else {
+                i += sql[i..].chars().next().map(|ch| ch.len_utf8()).unwrap_or(1);
+            }
+            continue;
+        }
+
+        if in_line_comment {
+            if c == '\n' || c == '\r' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if c == '*' && i + 1 < bytes.len() && bytes[i + 1] as char == '/' {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_single {
+            if c == '\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] as char == '\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            if c == '"' {
+                if i + 1 < bytes.len() && bytes[i + 1] as char == '"' {
+                    i += 2;
+                    continue;
+                }
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_backtick {
+            if c == '`' {
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_bracket {
+            if c == ']' {
+                in_bracket = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(delimiter) = dollar_quote_delimiter_at(sql, i) {
+            if sql[i + delimiter.len()..].contains(delimiter) {
+                in_dollar_quote = Some(delimiter.to_string());
+                i += delimiter.len();
+                continue;
+            }
+        }
+
+        if c == '-' && i + 1 < bytes.len() && bytes[i + 1] as char == '-' {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] as char == '*' {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+
+        match c {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            '`' => in_backtick = true,
+            '[' => in_bracket = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn top_level_parenthesized_insert_query_body_range(sql: &str) -> Option<(usize, usize)> {
+    let upper = sql.to_uppercase();
+    let insert_pos = find_top_level_keyword(sql, "INSERT", 0)?;
+    if insert_pos != skip_ws_and_comments(sql, 0) {
+        return None;
+    }
+
+    let mut idx = insert_pos + "INSERT".len();
+    while let Some(open_pos) = find_top_level_open_paren(sql, idx) {
+        let close_pos = find_matching_paren_sql(sql, open_pos)?;
+        let body_start = skip_ws_and_comments(sql, open_pos + 1);
+        if matches_keyword_at(&upper, body_start, "SELECT")
+            || matches_keyword_at(&upper, body_start, "WITH")
+        {
+            return Some((open_pos + 1, close_pos));
+        }
+        idx = close_pos + 1;
+    }
+
+    None
+}
+
+fn top_level_create_as_query_body_range(sql: &str) -> Option<(usize, usize)> {
+    let upper = sql.to_uppercase();
+    let create_pos = find_top_level_keyword(sql, "CREATE", 0)?;
+    if create_pos != skip_ws_and_comments(sql, 0) {
+        return None;
+    }
+
+    let as_pos = find_top_level_keyword(sql, "AS", create_pos + "CREATE".len())?;
+    let body_start = skip_ws_and_comments(sql, as_pos + "AS".len());
+    if body_start >= sql.len() {
+        return None;
+    }
+
+    if sql.as_bytes()[body_start] == b'(' {
+        let close_pos = find_matching_paren_sql(sql, body_start)?;
+        let inner_start = skip_ws_and_comments(sql, body_start + 1);
+        if matches_keyword_at(&upper, inner_start, "SELECT")
+            || matches_keyword_at(&upper, inner_start, "WITH")
+        {
+            return Some((body_start + 1, close_pos));
+        }
+        return None;
+    }
+
+    if matches_keyword_at(&upper, body_start, "SELECT")
+        || matches_keyword_at(&upper, body_start, "WITH")
+    {
+        return Some((body_start, sql.len()));
+    }
+
+    None
+}
+
+fn top_level_with_main_query_start(sql: &str) -> Option<usize> {
+    let with_pos = find_top_level_keyword(sql, "WITH", 0)?;
+    if with_pos != skip_ws_and_comments(sql, 0) {
+        return None;
+    }
+
+    let upper = sql.to_uppercase();
+    let mut idx = with_pos + "WITH".len();
+    idx = skip_ws_and_comments(sql, idx);
+    if matches_keyword_at(&upper, idx, "RECURSIVE") {
+        idx += "RECURSIVE".len();
+    }
+
+    loop {
+        idx = skip_ws_and_comments(sql, idx);
+        if idx >= sql.len() {
+            return None;
+        }
+
+        let rest = &sql[idx..];
+        let (after_ident, _) = identifier(rest).ok()?;
+        idx += rest.len() - after_ident.len();
+
+        idx = skip_ws_and_comments(sql, idx);
+        if idx < sql.len() && sql.as_bytes()[idx] == b'(' {
+            let sub = &sql[idx + 1..];
+            let (rest_after_cols, _) = balanced_parens(sub).ok()?;
+            let cols_len = sub.len() - rest_after_cols.len();
+            idx = idx + 1 + cols_len + 1;
+            idx = skip_ws_and_comments(sql, idx);
+        }
+
+        if !matches_keyword_at(&upper, idx, "AS") {
+            return None;
+        }
+        idx += "AS".len();
+        idx = skip_ws_and_comments(sql, idx);
+
+        if idx >= sql.len() || sql.as_bytes()[idx] != b'(' {
+            return None;
+        }
+
+        let sub = &sql[idx + 1..];
+        let (rest_after_query, _) = balanced_parens(sub).ok()?;
+        let query_len = sub.len() - rest_after_query.len();
+        idx = idx + 1 + query_len + 1;
+        idx = skip_ws_and_comments(sql, idx);
+
+        if idx < sql.len() && sql.as_bytes()[idx] == b',' {
+            idx += 1;
+            continue;
+        }
+
+        return Some(idx);
+    }
+}
+
+fn aggregate_context_sql(sql: &str) -> &str {
+    let body_sql = if top_level_with_main_query_start(sql).is_some() {
+        sql
+    } else {
+        top_level_create_as_query_body_range(sql)
+            .map(|(start, end)| &sql[start..end])
+            .or_else(|| {
+                top_level_parenthesized_insert_query_body_range(sql)
+                    .map(|(start, end)| &sql[start..end])
+            })
+            .or_else(|| top_level_parenthesized_query_body(sql))
+            .unwrap_or(sql)
+    };
+    if let Some(main_query_start) = top_level_with_main_query_start(body_sql) {
+        &body_sql[main_query_start..]
+    } else {
+        body_sql
     }
 }
 
@@ -2495,13 +2917,17 @@ fn source_dimension_names(source_view: &str) -> HashSet<String> {
     };
 
     let view_query = extract_view_query(&view.base_query).unwrap_or_else(|| view.base_query.clone());
-    extract_dimension_columns_from_select(&view_query)
+    let mut dims: HashSet<String> = extract_dimension_columns_from_select(&view_query)
         .into_iter()
         .map(|col| {
             let dim_name = col.split('.').next_back().unwrap_or(col.as_str()).trim();
             normalize_dimension_key(dim_name)
         })
-        .collect()
+        .collect();
+    dims.extend(view.dimension_exprs.keys().map(|alias| {
+        normalize_dimension_key(alias.split('.').next_back().unwrap_or(alias).trim())
+    }));
+    dims
 }
 
 fn can_use_view_measure_directly(resolved: &ResolvedMeasure, outer_group_by: &[String]) -> bool {
@@ -4217,6 +4643,7 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
             had_aggregate,
             expanded_sql: sql,
             error: None,
+            warnings: Vec::new(),
         };
     }
     had_aggregate = true;
@@ -4229,6 +4656,7 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
                 had_aggregate,
                 expanded_sql: sql,
                 error: Some(format!("SQL parse error: {e}")),
+                warnings: Vec::new(),
             };
         }
     };
@@ -4248,6 +4676,7 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
             had_aggregate: false,
             expanded_sql: sql.to_string(),
             error: None,
+            warnings: Vec::new(),
         };
     }
 
@@ -4328,6 +4757,7 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
         had_aggregate,
         expanded_sql: result_sql,
         error: None,
+        warnings: Vec::new(),
     }
 }
 
@@ -4344,6 +4774,11 @@ fn extract_dimension_columns_from_select_info(info: &SelectInfo) -> Vec<String> 
                 .unwrap_or_else(|| item.expression_sql.clone())
         })
         .collect()
+}
+
+fn is_star_select_expression(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    trimmed == "*" || trimmed.ends_with(".*") || trimmed.starts_with("* ")
 }
 
 fn normalize_dimension_key(ident: &str) -> String {
@@ -4384,7 +4819,7 @@ fn extract_dimension_exprs_from_query(sql: &str) -> HashMap<String, String> {
 fn extract_from_clause_info_ffi(sql: &str) -> FromClauseInfo {
     let mut info = FromClauseInfo::default();
 
-    if let Ok(select_info) = parser_ffi::parse_select(sql) {
+    if let Ok(Ok(select_info)) = std::panic::catch_unwind(|| parser_ffi::parse_select(sql)) {
         for (i, table_ref) in select_info.tables.iter().enumerate() {
             let effective_name = table_ref
                 .alias
@@ -4406,6 +4841,66 @@ fn extract_from_clause_info_ffi(sql: &str) -> FromClauseInfo {
     }
 
     info
+}
+
+fn extract_from_clause_info(sql: &str) -> FromClauseInfo {
+    #[cfg(test)]
+    let mut info = FromClauseInfo::default();
+    #[cfg(not(test))]
+    let mut info = extract_from_clause_info_ffi(sql);
+
+    supplement_from_clause_info_from_sql(&mut info, sql);
+    info
+}
+
+fn supplement_from_clause_info_from_sql(info: &mut FromClauseInfo, sql: &str) {
+    let mut search_pos = 0;
+    while let Some((keyword_pos, keyword)) = next_from_or_join_keyword(sql, search_pos) {
+        let table_start = skip_ws_and_comments(sql, keyword_pos + keyword.len());
+        if table_start >= sql.len() || sql.as_bytes()[table_start] == b'(' {
+            search_pos = table_start.saturating_add(1);
+            continue;
+        }
+
+        let Some(table_end) = parse_qualified_name_span(sql, table_start) else {
+            search_pos = table_start.saturating_add(1);
+            continue;
+        };
+        let raw_table = sql[table_start..table_end].trim();
+        let table_name =
+            extract_last_qualified_identifier(raw_table).unwrap_or_else(|| raw_table.to_string());
+
+        let alias_start = skip_ws_and_comments(sql, table_end);
+        let (effective_name, has_alias, next_pos) =
+            if let Some((alias_end, alias)) = parse_alias_span(sql, alias_start) {
+                (alias, true, alias_end)
+            } else {
+                (table_name.clone(), false, table_end)
+            };
+
+        let table_info = TableInfo {
+            name: table_name,
+            effective_name: effective_name.clone(),
+            has_alias,
+        };
+        if keyword.eq_ignore_ascii_case("FROM") && info.primary_table.is_none() {
+            info.primary_table = Some(table_info.clone());
+        }
+        info.tables.entry(effective_name).or_insert(table_info);
+        search_pos = next_pos;
+    }
+}
+
+fn next_from_or_join_keyword(sql: &str, search_pos: usize) -> Option<(usize, &'static str)> {
+    let from_pos = find_top_level_keyword(sql, "FROM", search_pos);
+    let join_pos = find_top_level_keyword(sql, "JOIN", search_pos);
+    match (from_pos, join_pos) {
+        (Some(from), Some(join)) if from <= join => Some((from, "FROM")),
+        (Some(_), Some(join)) => Some((join, "JOIN")),
+        (Some(from), None) => Some((from, "FROM")),
+        (None, Some(join)) => Some((join, "JOIN")),
+        (None, None) => None,
+    }
 }
 
 /// Information about a resolved measure
@@ -5878,11 +6373,768 @@ fn validate_set_expression_requirements(
     None
 }
 
+fn is_warning_identifier_keyword(ident: &str) -> bool {
+    [
+        "AND",
+        "OR",
+        "NOT",
+        "IN",
+        "IS",
+        "NULL",
+        "TRUE",
+        "FALSE",
+        "LIKE",
+        "BETWEEN",
+        "EXISTS",
+        "FROM",
+        "CASE",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "END",
+        "CAST",
+        "AS",
+        "CURRENT_DATE",
+        "CURRENT_TIME",
+        "CURRENT_TIMESTAMP",
+    ]
+    .iter()
+    .any(|kw| kw.eq_ignore_ascii_case(ident))
+}
+
+fn is_warning_date_part_keyword(ident: &str) -> bool {
+    [
+        "MICROSECOND",
+        "MICROSECONDS",
+        "MILLISECOND",
+        "MILLISECONDS",
+        "SECOND",
+        "SECONDS",
+        "MINUTE",
+        "MINUTES",
+        "HOUR",
+        "HOURS",
+        "DAY",
+        "DAYS",
+        "DOW",
+        "DOY",
+        "WEEK",
+        "WEEKS",
+        "MONTH",
+        "MONTHS",
+        "QUARTER",
+        "YEAR",
+        "YEARS",
+        "EPOCH",
+    ]
+    .iter()
+    .any(|kw| kw.eq_ignore_ascii_case(ident))
+}
+
+fn is_warning_typed_literal_keyword(ident: &str) -> bool {
+    ["DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL"]
+        .iter()
+        .any(|kw| kw.eq_ignore_ascii_case(ident))
+}
+
+fn is_warning_typed_literal_start(ident: &str, bytes: &[u8], after_ws: usize) -> bool {
+    is_warning_typed_literal_keyword(ident)
+        && after_ws < bytes.len()
+        && bytes[after_ws] == b'\''
+}
+
+fn is_warning_interval_unit_keyword(ident: &str) -> bool {
+    is_warning_date_part_keyword(ident)
+}
+
+fn skip_quoted_sql(bytes: &[u8], mut i: usize, quote: u8) -> usize {
+    i += 1;
+    while i < bytes.len() {
+        if bytes[i] == quote {
+            if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn read_unquoted_identifier(where_clause: &str, mut i: usize) -> (String, usize) {
+    let bytes = where_clause.as_bytes();
+    let start = i;
+    i += 1;
+    while i < bytes.len()
+        && ((bytes[i] as char).is_alphanumeric() || bytes[i] == b'_')
+    {
+        i += 1;
+    }
+    (where_clause[start..i].to_string(), i)
+}
+
+fn read_quoted_identifier(where_clause: &str, mut i: usize) -> (String, usize) {
+    let bytes = where_clause.as_bytes();
+    let mut token = String::new();
+    i += 1;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                token.push('"');
+                i += 2;
+                continue;
+            }
+            return (token, i + 1);
+        }
+        token.push(bytes[i] as char);
+        i += 1;
+    }
+    (token, i)
+}
+
+fn read_warning_dotted_identifier(
+    where_clause: &str,
+    first_token: String,
+    mut i: usize,
+) -> Option<(String, String, usize)> {
+    let bytes = where_clause.as_bytes();
+    let mut parts = vec![first_token];
+    loop {
+        let dot_pos = skip_sql_whitespace(bytes, i);
+        if dot_pos >= bytes.len() || bytes[dot_pos] != b'.' {
+            break;
+        }
+        let next_start = skip_sql_whitespace(bytes, dot_pos + 1);
+        if next_start >= bytes.len() {
+            break;
+        }
+        let (part, next_end) = if bytes[next_start] == b'"' {
+            read_quoted_identifier(where_clause, next_start)
+        } else if (bytes[next_start] as char).is_alphabetic() || bytes[next_start] == b'_' {
+            read_unquoted_identifier(where_clause, next_start)
+        } else {
+            break;
+        };
+        parts.push(part);
+        i = next_end;
+    }
+
+    if parts.len() < 2 {
+        return None;
+    }
+    let name = parts.pop().unwrap();
+    Some((parts.join("."), name, i))
+}
+
+fn skip_sql_whitespace(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn skip_warning_typed_literal(where_clause: &str, ident: &str, after_ws: usize) -> usize {
+    let bytes = where_clause.as_bytes();
+    let mut i = skip_quoted_sql(bytes, after_ws, b'\'');
+    if !ident.eq_ignore_ascii_case("INTERVAL") {
+        return i;
+    }
+
+    let unit_start = skip_sql_whitespace(bytes, i);
+    if unit_start < bytes.len()
+        && (((bytes[unit_start] as char).is_alphabetic()) || bytes[unit_start] == b'_')
+    {
+        let (unit, unit_end) = read_unquoted_identifier(where_clause, unit_start);
+        if is_warning_interval_unit_keyword(&unit) {
+            i = unit_end;
+        }
+    }
+    i
+}
+
+fn skip_extract_date_part_prefix(where_clause: &str, open_paren: usize) -> usize {
+    let bytes = where_clause.as_bytes();
+    let mut i = skip_sql_whitespace_and_warning_comments(bytes, open_paren + 1);
+    if i < bytes.len() && (((bytes[i] as char).is_alphabetic()) || bytes[i] == b'_') {
+        let (date_part, date_part_end) = read_unquoted_identifier(where_clause, i);
+        if is_warning_date_part_keyword(&date_part) {
+            i = date_part_end;
+        }
+    }
+    i = skip_sql_whitespace_and_warning_comments(bytes, i);
+    if warning_keyword_at(where_clause, i, "FROM") {
+        i += "FROM".len();
+    }
+    i
+}
+
+fn skip_warning_cast_target(where_clause: &str, mut i: usize) -> usize {
+    let bytes = where_clause.as_bytes();
+    i = skip_sql_whitespace_and_warning_comments(bytes, i);
+    if i >= bytes.len() {
+        return i;
+    }
+
+    if bytes[i] == b'"' {
+        let (_, after_token) = read_quoted_identifier(where_clause, i);
+        return skip_warning_cast_type_suffix(where_clause, after_token);
+    }
+
+    if (bytes[i] as char).is_alphabetic() || bytes[i] == b'_' {
+        let (_, after_token) = read_unquoted_identifier(where_clause, i);
+        return skip_warning_cast_type_suffix(where_clause, after_token);
+    }
+
+    i
+}
+
+fn skip_warning_cast_type_suffix(where_clause: &str, mut i: usize) -> usize {
+    let bytes = where_clause.as_bytes();
+    i = skip_sql_whitespace_and_warning_comments(bytes, i);
+    if i < bytes.len() && bytes[i] == b'(' {
+        i = skip_balanced_warning_parens(where_clause, i + 1);
+    }
+    skip_sql_whitespace_and_warning_comments(bytes, i)
+}
+
+fn skip_warning_identifier_comment(bytes: &[u8], i: usize) -> Option<usize> {
+    if i + 1 >= bytes.len() {
+        return None;
+    }
+
+    if bytes[i] == b'-' && bytes[i + 1] == b'-' {
+        let mut next = i + 2;
+        while next < bytes.len() && bytes[next] != b'\n' && bytes[next] != b'\r' {
+            next += 1;
+        }
+        return Some(next);
+    }
+
+    if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+        let mut next = i + 2;
+        while next + 1 < bytes.len() {
+            if bytes[next] == b'*' && bytes[next + 1] == b'/' {
+                return Some(next + 2);
+            }
+            next += 1;
+        }
+        return Some(bytes.len());
+    }
+
+    None
+}
+
+fn skip_sql_whitespace_and_warning_comments(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        i = skip_sql_whitespace(bytes, i);
+        if let Some(next) = skip_warning_identifier_comment(bytes, i) {
+            i = next;
+            continue;
+        }
+        return i;
+    }
+}
+
+fn warning_keyword_at(sql: &str, idx: usize, keyword: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    if idx + keyword_bytes.len() > bytes.len() {
+        return false;
+    }
+    if idx > 0 && (bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_') {
+        return false;
+    }
+    if idx + keyword_bytes.len() < bytes.len()
+        && (bytes[idx + keyword_bytes.len()].is_ascii_alphanumeric()
+            || bytes[idx + keyword_bytes.len()] == b'_')
+    {
+        return false;
+    }
+    bytes[idx..idx + keyword_bytes.len()]
+        .iter()
+        .zip(keyword_bytes)
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn skip_balanced_warning_parens(sql: &str, mut i: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_warning_identifier_comment(bytes, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'\'' => {
+                i = skip_quoted_sql(bytes, i, b'\'');
+            }
+            b'"' => {
+                i = skip_quoted_sql(bytes, i, b'"');
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                if depth == 0 {
+                    return i + 1;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    i
+}
+
+fn skip_parenthesized_warning_subquery(where_clause: &str, i: usize) -> Option<usize> {
+    let bytes = where_clause.as_bytes();
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return None;
+    }
+    let query_start = skip_sql_whitespace_and_warning_comments(bytes, i + 1);
+    if warning_keyword_at(where_clause, query_start, "SELECT")
+        || warning_keyword_at(where_clause, query_start, "WITH")
+    {
+        return Some(skip_balanced_warning_parens(where_clause, i + 1));
+    }
+    None
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct WarningFilterIdentifier {
+    qualifier: Option<String>,
+    name: String,
+}
+
+impl WarningFilterIdentifier {
+    fn new(qualifier: Option<&str>, name: &str) -> Self {
+        Self {
+            qualifier: qualifier.map(normalize_identifier_name),
+            name: normalize_identifier_name(name),
+        }
+    }
+}
+
+fn extract_where_filter_identifiers(where_clause: &str) -> Vec<WarningFilterIdentifier> {
+    let mut identifiers = Vec::new();
+    let bytes = where_clause.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if let Some(delimiter) = dollar_quote_delimiter_at(where_clause, i) {
+            if let Some(end_offset) = where_clause[i + delimiter.len()..].find(delimiter) {
+                i += delimiter.len() + end_offset + delimiter.len();
+                continue;
+            }
+        }
+        if let Some(next) = skip_warning_identifier_comment(bytes, i) {
+            i = next;
+            continue;
+        }
+        if let Some(next) = skip_parenthesized_warning_subquery(where_clause, i) {
+            i = next;
+            continue;
+        }
+
+        match bytes[i] {
+            b'\'' => {
+                i = skip_quoted_sql(bytes, i, b'\'');
+            }
+            b':' if i + 1 < bytes.len() && bytes[i + 1] == b':' => {
+                i = skip_warning_cast_target(where_clause, i + 2);
+            }
+            b'"' => {
+                let (token, after_token) = read_quoted_identifier(where_clause, i);
+                if let Some((qualifier, qualified_token, next_end)) =
+                    read_warning_dotted_identifier(where_clause, token.clone(), after_token)
+                {
+                    let next_after_ws = skip_sql_whitespace(bytes, next_end);
+                    if !is_warning_identifier_keyword(&qualified_token)
+                        && !(next_after_ws < bytes.len() && bytes[next_after_ws] == b'(')
+                    {
+                        identifiers.push(WarningFilterIdentifier::new(
+                            Some(&qualifier),
+                            &qualified_token,
+                        ));
+                    }
+                    i = next_end;
+                    continue;
+                }
+                identifiers.push(WarningFilterIdentifier::new(None, &token));
+                i = after_token;
+            }
+            c if (c as char).is_alphabetic() || c == b'_' => {
+                let (token, after_token) = read_unquoted_identifier(where_clause, i);
+                let after_ws = skip_sql_whitespace(bytes, after_token);
+
+                if let Some((qualifier, qualified_token, next_end)) =
+                    read_warning_dotted_identifier(where_clause, token.clone(), after_token)
+                {
+                    let next_after_ws = skip_sql_whitespace(bytes, next_end);
+                    if !is_warning_identifier_keyword(&qualified_token)
+                        && !is_warning_typed_literal_start(&qualified_token, bytes, next_after_ws)
+                        && !(next_after_ws < bytes.len() && bytes[next_after_ws] == b'(')
+                    {
+                        identifiers.push(WarningFilterIdentifier::new(
+                            Some(&qualifier),
+                            &qualified_token,
+                        ));
+                    }
+                    i = next_end;
+                    continue;
+                }
+
+                if is_warning_typed_literal_start(&token, bytes, after_ws) {
+                    i = skip_warning_typed_literal(where_clause, &token, after_ws);
+                    continue;
+                }
+                if token.eq_ignore_ascii_case("EXTRACT")
+                    && after_ws < bytes.len()
+                    && bytes[after_ws] == b'('
+                {
+                    i = skip_extract_date_part_prefix(where_clause, after_ws);
+                    continue;
+                }
+                if token.eq_ignore_ascii_case("AS") {
+                    i = skip_warning_cast_target(where_clause, after_ws);
+                    continue;
+                }
+                if !is_warning_identifier_keyword(&token)
+                    && !(after_ws < bytes.len() && bytes[after_ws] == b'(')
+                {
+                    identifiers.push(WarningFilterIdentifier::new(None, &token));
+                }
+                i = after_token;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    identifiers.sort_by(|left, right| {
+        left.qualifier
+            .cmp(&right.qualifier)
+            .then(left.name.cmp(&right.name))
+    });
+    identifiers.dedup();
+    identifiers
+}
+
+fn warning_filter_matches_source(
+    identifier: &WarningFilterIdentifier,
+    source_dims: &HashSet<String>,
+    source_qualifiers: &HashSet<String>,
+) -> bool {
+    if !source_dims.is_empty() && !source_dims.contains(&identifier.name) {
+        return false;
+    }
+    match identifier.qualifier.as_deref() {
+        Some(qualifier) => {
+            source_qualifiers.is_empty()
+                || source_qualifiers.iter().any(|source| {
+                    qualifier == source
+                        || qualifier
+                            .strip_suffix(source)
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                        || source
+                            .strip_suffix(qualifier)
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                })
+        }
+        None => true,
+    }
+}
+
+fn dimension_key_in_group_by(ident: &str, group_by_cols: &[String]) -> bool {
+    group_by_cols.iter().any(|col| {
+        if let Some((_, dim_name)) = parse_simple_measure_ref(col) {
+            return dim_name == ident;
+        }
+        let simple_name = col.split('.').next_back().unwrap_or(col).trim();
+        normalize_dimension_key(simple_name) == ident
+    })
+}
+
+fn effective_at_where_filter_identifiers(
+    modifiers: &[ContextModifier],
+    source_dims: &HashSet<String>,
+    source_qualifiers: &HashSet<String>,
+) -> Vec<String> {
+    if modifiers
+        .iter()
+        .any(|modifier| matches!(modifier, ContextModifier::AllGlobal))
+    {
+        return Vec::new();
+    }
+
+    modifiers
+        .iter()
+        .find_map(|modifier| {
+            if let ContextModifier::Where(condition) = modifier {
+                Some(
+                    extract_where_filter_identifiers(condition)
+                        .into_iter()
+                        .filter(|identifier| {
+                            warning_filter_matches_source(
+                                identifier,
+                                source_dims,
+                                source_qualifiers,
+                            )
+                        })
+                        .map(|identifier| identifier.name)
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn normalized_warning_expression(sql: &str) -> String {
+    sql.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn normalized_warning_expression_search_text(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut result = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(delimiter) = dollar_quote_delimiter_at(sql, i) {
+            if let Some(end_offset) = sql[i + delimiter.len()..].find(delimiter) {
+                i += delimiter.len() + end_offset + delimiter.len();
+                continue;
+            }
+        }
+        if let Some(next) = skip_warning_identifier_comment(bytes, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            i = skip_quoted_sql(bytes, i, b'\'');
+            continue;
+        }
+        let c = bytes[i] as char;
+        if !c.is_whitespace() {
+            result.extend(c.to_lowercase());
+        }
+        i += 1;
+    }
+    result
+}
+
+fn warning_expression_in_clause(expr: &str, clause: &str) -> bool {
+    let needle = normalized_warning_expression(expr);
+    if needle.is_empty() {
+        return false;
+    }
+
+    let haystack = normalized_warning_expression_search_text(clause);
+    let mut search_from = 0;
+    while let Some(relative_idx) = haystack[search_from..].find(&needle) {
+        let idx = search_from + relative_idx;
+        let before = haystack[..idx].chars().next_back();
+        let after = haystack[idx + needle.len()..].chars().next();
+        if !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            return true;
+        }
+        search_from = idx + needle.len();
+    }
+
+    false
+}
+
+fn append_unique_warnings(result: &mut AggregateExpandResult, warnings: Vec<String>) {
+    for warning in warnings {
+        if !result.warnings.contains(&warning) {
+            result.warnings.push(warning);
+        }
+    }
+}
+
+#[cfg(test)]
+fn warning_for_at_all_ungrouped_where(
+    measure_name: &str,
+    modifiers: &[ContextModifier],
+    outer_where: Option<&str>,
+    group_by_cols: &[String],
+    source_dims: &HashSet<String>,
+) -> Option<String> {
+    warning_for_at_all_ungrouped_where_with_qualifiers(
+        measure_name,
+        modifiers,
+        outer_where,
+        group_by_cols,
+        source_dims,
+        &HashSet::new(),
+    )
+}
+
+fn warning_for_at_all_ungrouped_where_with_qualifiers(
+    measure_name: &str,
+    modifiers: &[ContextModifier],
+    outer_where: Option<&str>,
+    group_by_cols: &[String],
+    source_dims: &HashSet<String>,
+    source_qualifiers: &HashSet<String>,
+) -> Option<String> {
+    let has_all_global = modifiers
+        .iter()
+        .any(|m| matches!(m, ContextModifier::AllGlobal));
+    if !has_all_global && !modifiers.iter().any(|m| matches!(m, ContextModifier::All(_))) {
+        return None;
+    }
+    let has_set = modifiers
+        .iter()
+        .any(|m| matches!(m, ContextModifier::Set(_, _)));
+    let visible_is_effective = modifiers.iter().enumerate().any(|(idx, modifier)| {
+        matches!(modifier, ContextModifier::Visible)
+            && !has_set
+            && !has_all_global
+            && !modifiers
+                .iter()
+                .take(idx)
+                .any(|earlier| matches!(earlier, ContextModifier::Where(_)))
+    });
+    if visible_is_effective {
+        return None;
+    }
+
+    let where_clause = outer_where?;
+    let removed_filter_dims: HashSet<String> = modifiers
+        .iter()
+        .filter_map(|modifier| {
+            if let ContextModifier::All(dim) = modifier {
+                Some(normalize_dimension_key(
+                    dim.split('.').next_back().unwrap_or(dim).trim(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let encoded_filter_dims: HashSet<String> = modifiers
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, modifier)| {
+            if let ContextModifier::Set(dim, _) = modifier {
+                let dim_key = normalize_dimension_key(dim.split('.').next_back().unwrap_or(dim).trim());
+                let removed_by_all =
+                    modifiers.iter().enumerate().any(|(all_idx, other)| {
+                        if all_idx == idx {
+                            return false;
+                        }
+                        match other {
+                            ContextModifier::AllGlobal => true,
+                        ContextModifier::All(all_dim) if all_idx > idx => {
+                            normalize_dimension_key(
+                                all_dim.split('.').next_back().unwrap_or(all_dim).trim(),
+                            ) == dim_key
+                        }
+                            _ => false,
+                        }
+                    });
+                if removed_by_all {
+                    None
+                } else {
+                    let mut encoded_dims = vec![dim_key];
+                    if warning_expression_in_clause(dim, where_clause) {
+                        encoded_dims.extend(
+                            extract_where_filter_identifiers(dim)
+                                .into_iter()
+                                .filter(|identifier| {
+                                    warning_filter_matches_source(
+                                        identifier,
+                                        source_dims,
+                                        source_qualifiers,
+                                    )
+                                })
+                                .map(|identifier| identifier.name),
+                        );
+                    }
+                    Some(encoded_dims)
+                }
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+    let encoded_filter_dims: HashSet<String> = encoded_filter_dims
+        .into_iter()
+        .chain(effective_at_where_filter_identifiers(
+            modifiers,
+            source_dims,
+            source_qualifiers,
+        ))
+        .collect();
+    let mut ungrouped_filters: Vec<String> = extract_where_filter_identifiers(where_clause)
+        .into_iter()
+        .filter(|identifier| {
+            warning_filter_matches_source(identifier, source_dims, source_qualifiers)
+        })
+        .map(|identifier| identifier.name)
+        .filter(|ident| {
+            !dimension_key_in_group_by(ident, group_by_cols)
+                || has_all_global
+                || removed_filter_dims.contains(ident)
+        })
+        .filter(|ident| !encoded_filter_dims.contains(ident))
+        .collect();
+
+    ungrouped_filters.sort();
+    ungrouped_filters.dedup();
+
+    if ungrouped_filters.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "AT (ALL ...) on AGGREGATE({measure_name}) does not preserve outer WHERE filter(s) on ungrouped dimension(s): {}. Add the filter dimension(s) to SELECT/GROUP BY or use an explicit AT modifier that encodes the intended denominator.",
+        ungrouped_filters.join(", ")
+    ))
+}
+
 /// Expand AGGREGATE() with AT modifiers in SQL
 pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
-    let cte_expansion = expand_cte_queries(sql);
+    let cte_expansion = if let Some((body_start, body_end)) =
+        top_level_parenthesized_query_body_range(sql)
+    {
+        let body_sql = &sql[body_start..body_end];
+        let body_expansion = expand_cte_queries(body_sql);
+        if body_expansion.had_aggregate
+            || body_expansion.sql != body_sql
+            || !body_expansion.warnings.is_empty()
+        {
+            let mut expanded_sql = sql.to_string();
+            if body_expansion.sql != body_sql {
+                expanded_sql.replace_range(body_start..body_end, &body_expansion.sql);
+            }
+            CteExpansion {
+                sql: expanded_sql,
+                had_aggregate: body_expansion.had_aggregate,
+                warnings: body_expansion.warnings,
+            }
+        } else {
+            expand_cte_queries(sql)
+        }
+    } else {
+        expand_cte_queries(sql)
+    };
     let mut sql = cte_expansion.sql;
     let mut had_aggregate = cte_expansion.had_aggregate;
+    let mut warnings = cte_expansion.warnings;
 
     if has_measure_at_refs(&sql) {
         sql = rewrite_measure_at_refs(&sql);
@@ -5903,6 +7155,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
             had_aggregate,
             expanded_sql: sql,
             error: None,
+            warnings,
         };
     }
     had_aggregate = true;
@@ -5912,7 +7165,8 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     // Prefer parser-FFI FROM extraction (supports JOIN aliases when SQL parses there),
     // then fall back to string extraction for AGGREGATE/AT syntax that parser-FFI cannot parse.
-    let mut from_info = extract_from_clause_info_ffi(&sql);
+    let context_sql = aggregate_context_sql(&sql);
+    let mut from_info = extract_from_clause_info(context_sql);
     let (primary_table_name, existing_alias) = if let Some(pt) = from_info.primary_table.clone() {
         let alias = if pt.has_alias {
             Some(pt.effective_name.clone())
@@ -5922,7 +7176,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         (pt.name, alias)
     } else {
         let (table_name, alias) =
-            extract_table_and_alias_from_sql(&sql).unwrap_or_else(|| ("t".to_string(), None));
+            extract_table_and_alias_from_sql(context_sql).unwrap_or_else(|| ("t".to_string(), None));
         let primary_table = TableInfo {
             name: table_name.clone(),
             effective_name: alias.clone().unwrap_or_else(|| table_name.clone()),
@@ -5936,11 +7190,11 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     };
 
     // Extract outer WHERE clause for VISIBLE semantics
-    let outer_where = extract_where_clause(&sql);
+    let outer_where = extract_where_clause(context_sql);
     let outer_where_ref = outer_where.as_deref();
 
     // Extract GROUP BY columns for AT (ALL dim) correlation
-    let group_by_cols = extract_group_by_columns(&sql);
+    let group_by_cols = extract_group_by_columns(context_sql);
 
     let default_set_qualifier = if let Some(alias) = existing_alias.as_deref() {
         Some(alias)
@@ -5958,12 +7212,13 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
             had_aggregate: true,
             expanded_sql: sql.to_string(),
             error: Some(error),
+            warnings: Vec::new(),
         };
     }
 
     // Extract dimension columns from original SQL for implicit GROUP BY
     // (must be done before expansion since expanded SQL has SUM() etc)
-    let original_dim_cols = extract_dimension_columns_from_select(&sql);
+    let original_dim_cols = extract_dimension_columns_from_select(context_sql);
     let effective_group_by_cols = if group_by_cols.is_empty() {
         original_dim_cols.clone()
     } else {
@@ -6004,7 +7259,6 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     let mut patterns = at_patterns;
     patterns.sort_by(|a, b| b.2.cmp(&a.2));
-
     for (measure_name, modifiers, start, end) in patterns {
         let measure_lookup_name = strip_measure_qualifier(&measure_name);
         // Look up which view contains this measure (for JOIN support)
@@ -6048,6 +7302,19 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         } else {
             measure_group_by_cols.clone()
         };
+
+        if let Some(warning) = warning_for_at_all_ungrouped_where_with_qualifiers(
+            &measure_lookup_name,
+            &modifiers,
+            outer_where_ref,
+            &eval_group_by_cols,
+            &source_dims,
+            &allowed_qualifiers,
+        ) {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
 
         // Non-decomposable measures are recomputed from base rows (including AT modifiers)
 
@@ -6107,6 +7374,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                         error: Some(format!(
                             "Failed to rewrite window measure {measure_lookup_name} with AT modifiers"
                         )),
+                        warnings: Vec::new(),
                     };
                 }
             };
@@ -6284,7 +7552,9 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     // Check if there are still any remaining AGGREGATE calls (shouldn't be, but just in case)
     if has_aggregate_function(&result_sql) {
-        return expand_aggregate(&result_sql);
+        let mut expanded = expand_aggregate(&result_sql);
+        append_unique_warnings(&mut expanded, warnings);
+        return expanded;
     }
 
     // If no GROUP BY, add explicit GROUP BY with dimension columns from original SQL
@@ -6317,6 +7587,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
         had_aggregate,
         expanded_sql: result_sql,
         error: None,
+        warnings,
     }
 }
 
@@ -6639,6 +7910,9 @@ fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
         if looks_like_sql_aggregate_expr(col) {
             continue;
         }
+        if is_star_select_expression(col) {
+            continue;
+        }
         if !col.is_empty() && !is_literal_constant(col) {
             columns.push(col.to_string());
         }
@@ -6722,6 +7996,19 @@ mod tests {
             "SELECT region, COUNT(*) AS c, SUM(amount) AS s, ANY_VALUE(flag) AS f FROM sales GROUP BY ROLLUP(region)",
         );
         assert_eq!(cols, vec!["region".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_dimension_columns_excludes_star() {
+        let cols = extract_dimension_columns_from_select(
+            "SELECT * FROM (SELECT AGGREGATE(revenue) AS revenue FROM sales_v) s",
+        );
+        assert!(cols.is_empty());
+
+        let cols = extract_dimension_columns_from_select(
+            "SELECT s.* FROM (SELECT AGGREGATE(revenue) AS revenue FROM sales_v) s",
+        );
+        assert!(cols.is_empty());
     }
 
     #[test]
@@ -7258,6 +8545,780 @@ FROM orders"#;
     }
 
     #[test]
+    fn test_at_all_warns_for_where_filter_on_ungrouped_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("AT (ALL ...)"));
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_does_not_warn_when_where_filter_dimension_is_grouped() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("year = 2024"),
+            &["year".to_string(), "region".to_string()],
+            &source_dims,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_warns_for_quoted_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some(r#""year" = 2024"#),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_warns_for_schema_qualified_source_filter() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let source_qualifiers = HashSet::from([normalize_identifier_name("sales_v")]);
+        let warning = warning_for_at_all_ungrouped_where_with_qualifiers(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("main.sales_v.year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+            &source_qualifiers,
+        )
+        .unwrap();
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_top_level_cte_uses_main_select_grouping_context() {
+        let sql = "WITH noop AS (SELECT 1) \
+                   SELECT year, region, AGGREGATE(revenue) AT (ALL year) AS region_total \
+                   FROM sales_v GROUP BY year, region";
+        let context_sql = aggregate_context_sql(sql);
+        let from_info = extract_from_clause_info(context_sql);
+
+        assert!(context_sql.trim_start().starts_with("SELECT year, region"));
+        assert_eq!(extract_group_by_columns(context_sql), vec!["year", "region"]);
+        assert_eq!(
+            from_info.primary_table.map(|table| table.name),
+            Some("sales_v".to_string())
+        );
+    }
+
+    #[test]
+    fn test_at_all_top_level_cte_warns_for_main_select_where_filter() {
+        let sql = "WITH noop AS (SELECT 1) \
+                   SELECT region, AGGREGATE(revenue) AT (ALL region) AS total_revenue \
+                   FROM sales_v WHERE year = 2024 GROUP BY region";
+        let context_sql = aggregate_context_sql(sql);
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            extract_where_clause(context_sql).as_deref(),
+            &extract_group_by_columns(context_sql),
+            &source_dims,
+        )
+        .unwrap();
+
+        assert!(context_sql.trim_start().starts_with("SELECT region"));
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_ctas_with_uses_main_select_grouping_context() {
+        let sql = "CREATE TABLE out AS WITH noop AS (SELECT 1) \
+                   SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS region_total \
+                   FROM sales_v GROUP BY year, region";
+        let context_sql = aggregate_context_sql(sql);
+
+        assert!(context_sql.trim_start().starts_with("SELECT year, region"));
+        assert!(context_sql.contains("FROM sales_v"));
+        assert!(context_sql.contains("GROUP BY year, region"));
+    }
+
+    #[test]
+    fn test_at_all_ctas_with_warns_for_main_select_where_filter() {
+        let sql = "CREATE TABLE out AS WITH noop AS (SELECT 1) \
+                   SELECT region, AGGREGATE(revenue) AT (ALL region) AS total_revenue \
+                   FROM sales_v WHERE year = 2024 GROUP BY region";
+        let context_sql = aggregate_context_sql(sql);
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            extract_where_clause(context_sql).as_deref(),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+
+        assert!(context_sql.trim_start().starts_with("SELECT region"));
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_parenthesized_insert_warns_for_select_where_filter() {
+        let sql = "INSERT INTO warning_insert_by_name_target BY NAME ( \
+                   SELECT region, AGGREGATE(revenue) AT (ALL region) AS total_revenue \
+                   FROM sales_v WHERE year = 2024 GROUP BY region \
+                   )";
+        let context_sql = aggregate_context_sql(sql);
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            extract_where_clause(context_sql).as_deref(),
+            &extract_group_by_columns(context_sql),
+            &source_dims,
+        )
+        .unwrap();
+
+        assert!(context_sql.trim_start().starts_with("SELECT region"));
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_parenthesized_insert_ignores_comment_parens_in_body() {
+        let sql = "INSERT INTO warning_insert_by_name_target BY NAME ( \
+                   SELECT region, AGGREGATE(revenue) AT (ALL region) AS total_revenue \
+                   FROM sales_v /* ) */ WHERE year = 2024 GROUP BY region \
+                   )";
+        let context_sql = aggregate_context_sql(sql);
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let group_by_cols = vec!["region".to_string()];
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            extract_where_clause(context_sql).as_deref(),
+            &group_by_cols,
+            &source_dims,
+        )
+        .unwrap();
+
+        assert!(context_sql.contains("WHERE year = 2024"));
+        assert!(context_sql.contains("GROUP BY region"));
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_warns_for_date_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("date"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("date = DATE '2023-01-01'"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("date"));
+    }
+
+    #[test]
+    fn test_at_all_ignores_where_filter_line_comment_identifiers() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("TRUE -- year"),
+            &["region".to_string()],
+            &source_dims,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_ignores_where_filter_dollar_quoted_literals() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("$tag$year$tag$ = $tag$year$tag$"),
+            &["region".to_string()],
+            &source_dims,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_ignores_at_where_block_comment_identifiers() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Where("1 = 1 /* year */".to_string()),
+            ],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_ignores_where_filter_subquery_identifiers() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("EXISTS (/* calendar */ SELECT 1 FROM calendar c WHERE c.year = 2024)"),
+            &["region".to_string()],
+            &source_dims,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_warns_for_source_qualified_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let source_qualifiers = HashSet::from([
+            normalize_identifier_name("sales_v"),
+            normalize_identifier_name("s"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where_with_qualifiers(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("s.year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+            &source_qualifiers,
+        )
+        .unwrap();
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_ignores_non_source_qualified_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let source_qualifiers = HashSet::from([
+            normalize_identifier_name("sales_v"),
+            normalize_identifier_name("s"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where_with_qualifiers(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("c.year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+            &source_qualifiers,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_ignores_non_source_quoted_qualified_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let source_qualifiers = HashSet::from([
+            normalize_identifier_name("sales_v"),
+            normalize_identifier_name("s"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where_with_qualifiers(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some(r#"c."year" = 2024"#),
+            &["region".to_string()],
+            &source_dims,
+            &source_qualifiers,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_ignores_non_source_three_part_qualified_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let source_qualifiers = HashSet::from([
+            normalize_identifier_name("sales_v"),
+            normalize_identifier_name("s"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where_with_qualifiers(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("main.calendar.year = 2023"),
+            &["region".to_string()],
+            &source_dims,
+            &source_qualifiers,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_ignores_interval_unit_as_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+            normalize_identifier_name("dt"),
+        ]);
+        let source_qualifiers = HashSet::from([
+            normalize_identifier_name("sales_v"),
+            normalize_identifier_name("s"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where_with_qualifiers(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("c.dt >= CURRENT_DATE - INTERVAL '1' YEAR"),
+            &["region".to_string()],
+            &source_dims,
+            &source_qualifiers,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_interval_unit_does_not_encode_dropped_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+            normalize_identifier_name("dt"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Where("dt >= CURRENT_DATE - INTERVAL '1' YEAR".to_string()),
+            ],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_ignores_extract_date_part_as_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+            normalize_identifier_name("dt"),
+        ]);
+        let source_qualifiers = HashSet::from([
+            normalize_identifier_name("sales_v"),
+            normalize_identifier_name("s"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where_with_qualifiers(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("EXTRACT(YEAR FROM c.dt) = 2024"),
+            &["region".to_string()],
+            &source_dims,
+            &source_qualifiers,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_extract_date_part_does_not_encode_dropped_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+            normalize_identifier_name("dt"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Where("EXTRACT(YEAR FROM dt) = 2024".to_string()),
+            ],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_ignores_cast_target_type_as_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("date"),
+            normalize_identifier_name("region"),
+            normalize_identifier_name("dt"),
+        ]);
+        let source_qualifiers = HashSet::from([
+            normalize_identifier_name("sales_v"),
+            normalize_identifier_name("s"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where_with_qualifiers(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("CAST(c.dt AS DATE) = DATE '2023-01-01'"),
+            &["region".to_string()],
+            &source_dims,
+            &source_qualifiers,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_ignores_postgres_cast_target_type_as_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("date"),
+            normalize_identifier_name("region"),
+            normalize_identifier_name("dt"),
+        ]);
+        let source_qualifiers = HashSet::from([
+            normalize_identifier_name("sales_v"),
+            normalize_identifier_name("s"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where_with_qualifiers(
+            "revenue",
+            &[ContextModifier::All("region".to_string())],
+            Some("c.dt::DATE = DATE '2023-01-01'"),
+            &["region".to_string()],
+            &source_dims,
+            &source_qualifiers,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_cast_target_does_not_encode_dropped_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("date"),
+            normalize_identifier_name("region"),
+            normalize_identifier_name("dt"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Where("CAST(dt AS DATE) = DATE '2023-01-01'".to_string()),
+            ],
+            Some("date = DATE '2023-01-01'"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("date"));
+    }
+
+    #[test]
+    fn test_at_all_does_not_warn_when_at_where_encodes_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Where("year = 2024".to_string()),
+            ],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_warns_when_filter_only_in_overwritten_at_where() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+            normalize_identifier_name("category"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Where("category = 'A'".to_string()),
+                ContextModifier::Where("year = 2024".to_string()),
+            ],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_does_not_warn_when_filter_in_effective_at_where() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+            normalize_identifier_name("category"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Where("year = 2024".to_string()),
+                ContextModifier::Where("category = 'A'".to_string()),
+            ],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_does_not_warn_when_set_encodes_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Set("year".to_string(), "2024".to_string()),
+            ],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_does_not_warn_when_expression_set_encodes_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("order_date"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Set("MONTH(order_date)".to_string(), "2".to_string()),
+            ],
+            Some("MONTH(order_date) = 2"),
+            &["region".to_string()],
+            &source_dims,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_expression_set_does_not_encode_base_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("order_date"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Set("MONTH(order_date)".to_string(), "2".to_string()),
+            ],
+            Some("order_date = DATE '2023-02-10'"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("order_date"));
+    }
+
+    #[test]
+    fn test_at_all_expression_set_does_not_match_expression_only_in_comment() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("order_date"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Set("MONTH(order_date)".to_string(), "2".to_string()),
+            ],
+            Some("order_date = DATE '2023-02-10' /* MONTH(order_date) */"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("order_date"));
+    }
+
+    #[test]
+    fn test_at_all_expression_set_does_not_match_expression_only_in_dollar_quote() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("order_date"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Set("MONTH(order_date)".to_string(), "2".to_string()),
+            ],
+            Some("order_date = DATE '2023-02-10' AND $tag$MONTH(order_date)$tag$ = 'x'"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("order_date"));
+    }
+
+    #[test]
+    fn test_at_all_preserves_warning_through_fallback_expansion_result() {
+        let mut result = AggregateExpandResult {
+            had_aggregate: true,
+            expanded_sql: "SELECT SUM(revenue) FROM sales_v".to_string(),
+            error: None,
+            warnings: vec!["existing warning".to_string()],
+        };
+
+        append_unique_warnings(
+            &mut result,
+            vec![
+                "AT (ALL ...) dropped year".to_string(),
+                "existing warning".to_string(),
+            ],
+        );
+
+        assert_eq!(result.warnings.len(), 2);
+        assert!(
+            result
+                .warnings
+                .contains(&"AT (ALL ...) dropped year".to_string())
+        );
+    }
+
+    #[test]
+    fn test_at_all_does_not_warn_when_visible_preserves_outer_where() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Visible,
+            ],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_at_all_warns_when_visible_is_bypassed_by_set() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[
+                ContextModifier::All("region".to_string()),
+                ContextModifier::Visible,
+                ContextModifier::Set("category".to_string(), "CURRENT(category)".to_string()),
+            ],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_warns_when_grouped_filter_dimension_is_removed() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::All("year".to_string())],
+            Some("year = 2024"),
+            &["year".to_string(), "region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
+    fn test_at_all_global_warns_for_where_filter_dimension() {
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+        let warning = warning_for_at_all_ungrouped_where(
+            "revenue",
+            &[ContextModifier::AllGlobal],
+            Some("year = 2024"),
+            &["region".to_string()],
+            &source_dims,
+        )
+        .unwrap();
+        assert!(warning.contains("year"));
+    }
+
+    #[test]
     fn test_extract_agg_function() {
         assert_eq!(extract_agg_function("SUM(amount)"), "SUM");
         assert_eq!(extract_agg_function("count(*)"), "COUNT");
@@ -7700,6 +9761,10 @@ FROM orders"#;
             extract_where_clause(sql3),
             Some("a = 1 AND b = 2".to_string())
         );
+
+        let sql4 = "SELECT $tag$WHERE year = 2023$tag$ AS note, region, \
+                    AGGREGATE(revenue) AT (ALL region) FROM sales_v GROUP BY region";
+        assert_eq!(extract_where_clause(sql4), None);
     }
 
     #[test]
@@ -8032,6 +10097,17 @@ GROUP BY s.year";
     }
 
     #[test]
+    fn test_extract_from_clause_info_string_fallback_join_aliases() {
+        let sql = "SELECT r.region, AGGREGATE(refunds) AT (ALL region) \
+                   FROM fact_orders_v o JOIN fact_returns_v r ON o.id = r.order_id";
+        let info = extract_from_clause_info(sql);
+
+        assert_eq!(info.primary_table.as_ref().unwrap().name, "fact_orders_v");
+        assert_eq!(find_alias_for_view(&info, "fact_orders_v"), Some("o"));
+        assert_eq!(find_alias_for_view(&info, "fact_returns_v"), Some("r"));
+    }
+
+    #[test]
     #[serial]
     fn test_expand_aggregate_with_join_measure_from_first_table() {
         clear_measure_views();
@@ -8082,6 +10158,33 @@ GROUP BY s.year";
         assert!(result.had_aggregate);
         // Should still use orders_v (the measure's source), not customers
         assert!(result.expanded_sql.contains("FROM orders_v"));
+    }
+
+    #[test]
+    fn test_at_all_warns_for_joined_measure_alias_where_filter() {
+        let sql = "SELECT r.region, AGGREGATE(refunds) AT (ALL region) AS all_region_refunds \
+                   FROM fact_orders_v o JOIN fact_returns_v r ON o.id = r.order_id";
+        let from_info = extract_from_clause_info(sql);
+        let mut source_qualifiers = HashSet::from([normalize_identifier_name("fact_returns_v")]);
+        if let Some(alias) = find_alias_for_view(&from_info, "fact_returns_v") {
+            source_qualifiers.insert(normalize_identifier_name(alias));
+        }
+        let source_dims = HashSet::from([
+            normalize_identifier_name("year"),
+            normalize_identifier_name("region"),
+        ]);
+
+        let warning = warning_for_at_all_ungrouped_where_with_qualifiers(
+            "refunds",
+            &[ContextModifier::All("region".to_string())],
+            Some("r.year = 2023"),
+            &["r.region".to_string()],
+            &source_dims,
+            &source_qualifiers,
+        )
+        .unwrap();
+
+        assert!(warning.contains("year"));
     }
 
     #[test]

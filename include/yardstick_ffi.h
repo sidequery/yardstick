@@ -313,6 +313,7 @@ struct YardstickAggregateResult {
     bool had_aggregate;
     char* expanded_sql;
     char* error;
+    char* warnings;
 };
 
 struct YardstickMeasureAggResult {

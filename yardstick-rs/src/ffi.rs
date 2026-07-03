@@ -40,6 +40,8 @@ pub struct YardstickAggregateResult {
     pub expanded_sql: *mut c_char,
     /// Error message (null if success)
     pub error: *mut c_char,
+    /// Warning message(s), separated by newlines (null if none)
+    pub warnings: *mut c_char,
 }
 
 /// Check if SQL contains "AS MEASURE" pattern
@@ -280,6 +282,7 @@ pub extern "C" fn yardstick_expand_aggregate(sql: *const c_char) -> YardstickAgg
             had_aggregate: false,
             expanded_sql: ptr::null_mut(),
             error: to_c_string("Error: null sql pointer"),
+            warnings: ptr::null_mut(),
         };
     }
 
@@ -291,6 +294,7 @@ pub extern "C" fn yardstick_expand_aggregate(sql: *const c_char) -> YardstickAgg
                     had_aggregate: false,
                     expanded_sql: ptr::null_mut(),
                     error: to_c_string(&format!("Error: invalid UTF-8: {e}")),
+                    warnings: ptr::null_mut(),
                 };
             }
         }
@@ -305,6 +309,11 @@ pub extern "C" fn yardstick_expand_aggregate(sql: *const c_char) -> YardstickAgg
             .error
             .map(|s| to_c_string(&s))
             .unwrap_or(ptr::null_mut()),
+        warnings: if result.warnings.is_empty() {
+            ptr::null_mut()
+        } else {
+            to_c_string(&result.warnings.join("\n"))
+        },
     }
 }
 
@@ -400,6 +409,7 @@ pub extern "C" fn yardstick_free_create_view_result(result: YardstickCreateViewR
 pub extern "C" fn yardstick_free_aggregate_result(result: YardstickAggregateResult) {
     yardstick_free(result.expanded_sql);
     yardstick_free(result.error);
+    yardstick_free(result.warnings);
 }
 
 // Helper: convert Rust string to C string

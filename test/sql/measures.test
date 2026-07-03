@@ -728,6 +728,414 @@ FROM sales_v;
 2023	EU	225.0
 2023	US	225.0
 
+# AT (ALL dim) drops outer WHERE filters on dimensions that are not grouped.
+# Surface a warning through DuckDB; warnings_as_errors makes this test assert it is emitted.
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET warnings_as_errors = true;
+
+statement error
+SEMANTIC SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+FROM sales_v
+WHERE year = 2023;
+----
+
+statement error
+SELECT * FROM yardstick('SELECT region, AGGREGATE(revenue) AT (ALL region) AS pct_of_total FROM sales_v WHERE year = 2023 GROUP BY region');
+----
+
+statement error
+SELECT region, AGGREGATE(revenue) AT (ALL) AS grand_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+statement error
+SELECT region, AGGREGATE(revenue) AT (ALL) AT (VISIBLE) AS grand_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+statement error
+SELECT region, AGGREGATE(revenue) AT (WHERE year = 2023) AT (ALL) AS grand_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+statement error
+SELECT region, AGGREGATE(revenue) AT (ALL) AT (WHERE year = 2023) AS grand_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+statement error
+SELECT region, AGGREGATE(revenue) AT (ALL) AT (SET year = 2023) AS grand_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+statement error
+WITH cte_warning AS (
+    SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+    FROM sales_v
+    WHERE year = 2023
+    GROUP BY region
+)
+SELECT * FROM cte_warning;
+----
+
+statement error
+CREATE VIEW warning_error_view AS
+SELECT region, AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+query TR rowsort
+SELECT region, AGGREGATE(revenue) AT (ALL region) AS all_region_revenue
+FROM sales_v
+WHERE EXISTS (/* calendar */ SELECT 1 FROM sales_v c WHERE c.year = 2023)
+GROUP BY region;
+----
+EU	375.0
+US	375.0
+
+statement ok
+CREATE TABLE warning_calendar (year INT);
+
+statement ok
+INSERT INTO warning_calendar VALUES (2023);
+
+query TR rowsort
+SELECT s.region, AGGREGATE(revenue) AT (ALL region) AS all_region_revenue
+FROM sales_v s JOIN warning_calendar c ON TRUE
+WHERE c.year = 2023
+GROUP BY s.region;
+----
+EU	375.0
+US	375.0
+
+query TR
+SELECT region, ROUND(100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region WHERE year = 2023), 1) AS pct_of_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region
+ORDER BY region;
+----
+EU	33.3
+US	66.7
+
+query TR
+SELECT region, ROUND(100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region SET year = 2023), 1) AS pct_of_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region
+ORDER BY region;
+----
+EU	33.3
+US	66.7
+
+query TR
+SELECT region, AGGREGATE(revenue) AT (ALL year) AT (SET year = 2023) AS region_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region
+ORDER BY region;
+----
+EU	75.0
+US	150.0
+
+query TR
+SELECT region, ROUND(100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region VISIBLE), 1) AS pct_of_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region
+ORDER BY region;
+----
+EU	33.3
+US	66.7
+
+statement error
+SELECT region, AGGREGATE(revenue) AT (ALL region) AT (WHERE region = 'US') AT (VISIBLE) AS region_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+statement error
+SELECT region, AGGREGATE(revenue) AT (ALL region VISIBLE SET region = CURRENT(region)) AS region_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+statement ok
+CREATE TABLE alias_warning_sales (fiscal_year INT, region TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO alias_warning_sales VALUES
+    (2023, 'US', 150), (2023, 'EU', 75),
+    (2024, 'US', 300), (2024, 'EU', 100);
+
+statement ok
+CREATE VIEW alias_warning_sales_v AS
+SELECT fiscal_year AS year, region, SUM(amount) AS MEASURE alias_warning_revenue
+FROM alias_warning_sales;
+
+statement error
+SELECT region, AGGREGATE(alias_warning_revenue) AT (ALL region) AS pct_of_total
+FROM alias_warning_sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+statement ok
+CREATE TABLE date_warning_sales (date DATE, region TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO date_warning_sales VALUES
+    (DATE '2023-01-01', 'US', 150), (DATE '2023-01-01', 'EU', 75),
+    (DATE '2024-01-01', 'US', 300), (DATE '2024-01-01', 'EU', 100);
+
+statement ok
+CREATE VIEW date_warning_sales_v AS
+SELECT date, region, SUM(amount) AS MEASURE date_warning_revenue
+FROM date_warning_sales;
+
+statement error
+SELECT region, AGGREGATE(date_warning_revenue) AT (ALL region) AS pct_of_total
+FROM date_warning_sales_v
+WHERE date = DATE '2023-01-01'
+GROUP BY region;
+----
+
+statement ok
+CREATE TABLE warning_cast_calendar (dt TIMESTAMP);
+
+statement ok
+INSERT INTO warning_cast_calendar VALUES (TIMESTAMP '2023-01-01 12:00:00');
+
+query TR rowsort
+SELECT s.region, AGGREGATE(date_warning_revenue) AT (ALL region) AS all_region_revenue
+FROM date_warning_sales_v s JOIN warning_cast_calendar c ON TRUE
+WHERE CAST(c.dt AS DATE) = DATE '2023-01-01'
+GROUP BY s.region;
+----
+EU	625.0
+US	625.0
+
+statement error
+SEMANTIC SELECT year, region, AGGREGATE(revenue) AT (ALL year) AS region_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY year, region;
+----
+
+statement error
+SELECT year, region, AGGREGATE(revenue) AT (SET year = 2023) AT (ALL year) AS region_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY year, region;
+----
+
+statement error
+CREATE TABLE ctas_warning_result AS
+SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+statement error
+CREATE TABLE ctas_warning_parenthesized_result AS (
+SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region
+);
+----
+
+statement error
+CREATE TABLE ctas_warning_parenthesized_cte_result AS (
+WITH cte_warning_parenthesized AS (
+    SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+    FROM sales_v
+    WHERE year = 2023
+    GROUP BY region
+)
+SELECT * FROM cte_warning_parenthesized
+);
+----
+
+statement error
+CREATE TABLE ctas_warning_empty_result AS
+SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+FROM sales_v
+WHERE year = 9999
+GROUP BY region;
+----
+
+statement ok
+CREATE TABLE warning_insert_target (region TEXT, pct_of_total DOUBLE);
+
+statement error
+INSERT INTO warning_insert_target
+SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+----
+
+statement error
+INSERT INTO warning_insert_target BY NAME (
+SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region
+);
+----
+
+statement ok
+SET warnings_as_errors = false;
+
+statement ok
+PREPARE warning_insert_stmt AS
+INSERT INTO warning_insert_target
+SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+
+statement ok
+EXECUTE warning_insert_stmt;
+
+statement ok
+DEALLOCATE warning_insert_stmt;
+
+query I
+SELECT COUNT(*) FROM warning_insert_target;
+----
+2
+
+statement ok
+CREATE TABLE warning_insert_by_name_target (region TEXT, pct_of_total DOUBLE);
+
+statement ok
+PREPARE warning_insert_parenthesized_stmt AS
+INSERT INTO warning_insert_by_name_target BY NAME (
+/* leading query comment */
+SELECT region, 100.0 * AGGREGATE(date_warning_revenue) / AGGREGATE(date_warning_revenue) AT (ALL region) AS pct_of_total
+FROM date_warning_sales_v
+WHERE date = DATE '2023-01-01'
+GROUP BY region
+);
+
+statement ok
+EXECUTE warning_insert_parenthesized_stmt;
+
+statement ok
+DEALLOCATE warning_insert_parenthesized_stmt;
+
+query I
+SELECT COUNT(*) FROM warning_insert_by_name_target;
+----
+2
+
+statement ok
+CREATE TABLE ctas_warning_cte_result AS
+WITH cte_warning AS (
+    SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+    FROM sales_v
+    WHERE year = 2023
+    GROUP BY region
+)
+SELECT * FROM cte_warning;
+
+query I
+SELECT COUNT(*) FROM ctas_warning_cte_result;
+----
+2
+
+statement ok
+CREATE TEMP TABLE warning_temp_sales (year INT, region TEXT, amount DOUBLE);
+
+statement ok
+INSERT INTO warning_temp_sales VALUES
+    (2023, 'US', 150), (2023, 'EU', 75),
+    (2024, 'US', 300), (2024, 'EU', 100);
+
+statement ok
+CREATE TEMP VIEW warning_temp_sales_v AS
+SELECT year, region, SUM(amount) AS MEASURE warning_temp_revenue
+FROM warning_temp_sales;
+CREATE TABLE ctas_warning_temp_result AS
+SELECT region, 100.0 * AGGREGATE(warning_temp_revenue) / AGGREGATE(warning_temp_revenue) AT (ALL region) AS pct_of_total
+FROM warning_temp_sales_v
+WHERE year = 2023
+GROUP BY region;
+
+query I
+SELECT COUNT(*) FROM ctas_warning_temp_result;
+----
+2
+
+statement ok
+CREATE TABLE ctas_warning_comment_result AS -- SELECT ignored by warning wrapper
+SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+
+query I
+SELECT COUNT(*) FROM ctas_warning_comment_result;
+----
+2
+
+statement ok
+CREATE TABLE ctas_warning_trailing_comment_result AS
+SELECT region, 100.0 * AGGREGATE(revenue) / AGGREGATE(revenue) AT (ALL region) AS pct_of_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region -- warning wrapper should not append after this comment
+;
+
+query I
+SELECT COUNT(*) FROM ctas_warning_trailing_comment_result;
+----
+2
+
+statement ok
+CREATE VIEW warning_persist_view AS
+SELECT region, AGGREGATE(revenue) AT (ALL region) AS year_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region;
+
+statement ok
+SET warnings_as_errors = true;
+
+query I
+SELECT COUNT(*) FROM warning_persist_view;
+----
+2
+
+statement ok
+SET warnings_as_errors = false;
+
+statement ok
+DROP TABLE ctas_warning_cte_result;
+
+statement ok
+DROP TABLE warning_insert_target;
+
 # ORDER BY expression referencing a named aggregate that expands to a subquery (#28)
 query IIRR
 SEMANTIC SELECT
@@ -1612,6 +2020,20 @@ CREATE VIEW daily_orders_v AS
 SELECT order_date, SUM(amount) AS MEASURE revenue
 FROM daily_orders;
 
+statement ok
+SET warnings_as_errors = true;
+
+query IR
+SEMANTIC SELECT MONTH(order_date), AGGREGATE(revenue) AT (ALL MONTH(order_date) SET MONTH(order_date) = 2) AS feb_revenue
+FROM daily_orders_v
+WHERE MONTH(order_date) = 2
+GROUP BY MONTH(order_date);
+----
+2	320.0
+
+statement ok
+SET warnings_as_errors = false;
+
 # SET with expression dimension: fix to a specific month
 # This generates WHERE MONTH(_inner.order_date) = 2
 query IRR rowsort
@@ -2245,6 +2667,19 @@ statement ok
 CREATE VIEW dated_sales_v AS
 SELECT sale_date, SUM(amount) AS MEASURE revenue
 FROM dated_sales;
+
+statement ok
+SET warnings_as_errors = true;
+
+statement error
+SELECT DATE_TRUNC('month', sale_date) AS month, AGGREGATE(revenue) AT (ALL) AS total
+FROM dated_sales_v
+WHERE sale_date >= DATE '2023-01-15'
+GROUP BY DATE_TRUNC('month', sale_date);
+----
+
+statement ok
+SET warnings_as_errors = false;
 
 # YEAR() and MONTH() in GROUP BY with AGGREGATE
 query IIR rowsort
