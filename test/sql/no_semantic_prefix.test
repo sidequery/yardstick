@@ -253,6 +253,26 @@ GROUP BY year;
 2022	150.0
 2023	225.0
 
+statement ok
+CREATE VIEW batch_qualified_shadow_drop_v AS
+SELECT year, SUM(amount) AS MEASURE qualified_shadow_revenue
+FROM sales;
+
+statement ok
+CREATE TEMP VIEW batch_qualified_shadow_drop_v AS
+SELECT year, SUM(amount * 40) AS MEASURE qualified_shadow_revenue
+FROM sales;
+DROP VIEW main.batch_qualified_shadow_drop_v;
+CREATE TABLE batch_qualified_shadow_drop_result AS
+SELECT year, AGGREGATE(qualified_shadow_revenue) AS revenue
+FROM batch_qualified_shadow_drop_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_qualified_shadow_drop_result;
+----
+2022	6000.0
+2023	9000.0
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================

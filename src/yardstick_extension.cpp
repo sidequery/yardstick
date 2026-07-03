@@ -47,6 +47,7 @@ extern "C" {
     char *yardstick_extract_view_name(const char *sql);
     char *yardstick_extract_drop_view_name(const char *sql);
     void *yardstick_snapshot_measure_view(const char *view_name);
+    void *yardstick_empty_measure_view_snapshot();
     void yardstick_restore_measure_view_snapshot(const char *view_name, void *snapshot);
     void yardstick_free_measure_view_snapshot(void *snapshot);
     YardstickCreateViewResult yardstick_process_create_view(const char *sql);
@@ -630,6 +631,19 @@ static bool HasMeasureSnapshot(const std::vector<MeasureViewSnapshot> &snapshots
     return false;
 }
 
+static bool TransferTemporarySnapshotForPermanentDrop(std::vector<MeasureViewSnapshot> &temporary_snapshots,
+                                                      const std::string &view_name,
+                                                      std::vector<MeasureViewSnapshot> &rollback_snapshots) {
+    for (auto &snapshot : temporary_snapshots) {
+        if (EqualsCaseInsensitive(snapshot.view_name, view_name)) {
+            rollback_snapshots.push_back({snapshot.view_name, snapshot.snapshot});
+            snapshot.snapshot = yardstick_empty_measure_view_snapshot();
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool TableRefMatchesView(const std::string &table_name, const std::string &view_name) {
     if (EqualsCaseInsensitive(table_name, view_name)) {
         return true;
@@ -807,6 +821,25 @@ static std::string ReadQualifiedIdentifier(const std::string &sql, size_t &pos) 
     return identifier;
 }
 
+static std::string LastQualifiedIdentifierPart(const std::string &qualified_name) {
+    size_t dot_pos = qualified_name.rfind('.');
+    return dot_pos == std::string::npos ? qualified_name : qualified_name.substr(dot_pos + 1);
+}
+
+static bool IsUnqualifiedOrTemporarySchemaDrop(const std::string &qualified_name) {
+    size_t dot_pos = qualified_name.rfind('.');
+    if (dot_pos == std::string::npos) {
+        return true;
+    }
+
+    std::string qualifier = qualified_name.substr(0, dot_pos);
+    size_t schema_dot = qualifier.rfind('.');
+    std::string schema = schema_dot == std::string::npos ? qualifier : qualifier.substr(schema_dot + 1);
+    return EqualsCaseInsensitive(schema, "temp") ||
+           EqualsCaseInsensitive(schema, "temporary") ||
+           EqualsCaseInsensitive(schema, "pg_temp");
+}
+
 static bool StatementTextReadsFromView(const std::string &sql, const std::string &view_name) {
     std::string dollar_quote_end;
     bool in_single_quote = false;
@@ -928,14 +961,13 @@ static bool StatementReadsFromView(const std::string &sql, const std::string &vi
     return found || StatementTextReadsFromView(select_sql, view_name);
 }
 
-static bool ExtractDropViewNameFromSql(const std::string &sql, std::string &view_name) {
-    char *extracted_view_name = yardstick_extract_drop_view_name(sql.c_str());
-    if (extracted_view_name) {
-        view_name = extracted_view_name;
-        yardstick_free(extracted_view_name);
-        return true;
-    }
+struct DropViewInfo {
+    std::string sql;
+    std::string view_name;
+    bool targets_temporary_view = true;
+};
 
+static bool ExtractDropViewInfoFromSql(const std::string &sql, DropViewInfo &drop_view) {
     size_t pos = SkipWhitespaceAndComments(sql, 0);
     if (!ConsumeKeyword(sql, pos, "DROP")) {
         return false;
@@ -970,22 +1002,28 @@ static bool ExtractDropViewNameFromSql(const std::string &sql, std::string &view
         return false;
     }
 
-    size_t dot_pos = qualified_name.rfind('.');
-    view_name = dot_pos == std::string::npos ? qualified_name : qualified_name.substr(dot_pos + 1);
+    drop_view.sql = sql;
+    drop_view.view_name = LastQualifiedIdentifierPart(qualified_name);
+    drop_view.targets_temporary_view = IsUnqualifiedOrTemporarySchemaDrop(qualified_name);
     return true;
 }
 
 static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
                                               const std::string &view_name,
+                                              bool targets_temporary_view,
                                               std::vector<MeasureViewSnapshot> &temporary_snapshots,
                                               std::vector<std::string> &pending_temporary_views,
                                               std::vector<std::string> &used_temporary_views,
                                               std::vector<MeasureViewSnapshot> &snapshots) {
-    if (HasMeasureSnapshot(temporary_snapshots, view_name)) {
+    if (targets_temporary_view && HasMeasureSnapshot(temporary_snapshots, view_name)) {
         RemoveCaseInsensitive(pending_temporary_views, view_name);
         RemoveCaseInsensitive(used_temporary_views, view_name);
         yardstick_drop_measure_view_from_sql(sql.c_str());
         RestoreAndRemoveTemporarySnapshot(temporary_snapshots, view_name);
+        return true;
+    }
+    if (!targets_temporary_view &&
+        TransferTemporarySnapshotForPermanentDrop(temporary_snapshots, view_name, snapshots)) {
         return true;
     }
 
@@ -993,11 +1031,6 @@ static bool SnapshotAndDropMeasureViewFromSql(const std::string &sql,
     yardstick_drop_measure_view_from_sql(sql.c_str());
     return true;
 }
-
-struct PendingDropView {
-    std::string sql;
-    std::string view_name;
-};
 
 static string EscapeSqlStringLiteral(const string &sql) {
     string escaped_sql;
@@ -1034,7 +1067,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
     std::vector<MeasureViewSnapshot> temporary_snapshots;
     std::vector<std::string> pending_temporary_views;
     std::vector<std::string> used_temporary_views;
-    std::vector<PendingDropView> deferred_drop_views;
+    std::vector<DropViewInfo> deferred_drop_views;
     bool catalog_statement_seen = false;
     bool executable_since_catalog_mutation = false;
     auto cleanup_temporary_measure_views = [&temporary_snapshots]() {
@@ -1047,6 +1080,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                 continue;
             }
             SnapshotAndDropMeasureViewFromSql(drop_view.sql, drop_view.view_name,
+                                              drop_view.targets_temporary_view,
                                               temporary_snapshots, pending_temporary_views,
                                               used_temporary_views,
                                               permanent_snapshots);
@@ -1073,14 +1107,14 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         if (StartsWithSemantic(statement_body, semantic_statement_body)) {
             statement_body = semantic_statement_body;
         }
-        std::string drop_view_name;
+        DropViewInfo drop_view;
         bool starts_with_drop_view = StartsWithDropViewStatement(statement_body);
         if (starts_with_drop_view && catalog_statement_seen && executable_since_catalog_mutation) {
             rewrite_result.error = "AS MEASURE batches cannot apply catalog changes after executable statements";
             cleanup_temporary_measure_views();
             return rewrite_result;
         }
-        if (ExtractDropViewNameFromSql(statement_body, drop_view_name)) {
+        if (ExtractDropViewInfoFromSql(statement_body, drop_view)) {
             if (catalog_statement_seen && executable_since_catalog_mutation) {
                 rewrite_result.error = "AS MEASURE batches cannot apply catalog changes after executable statements";
                 cleanup_temporary_measure_views();
@@ -1088,12 +1122,13 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
             }
             catalog_statement_seen = true;
             if (rewrite_result.had_measure_view) {
-                SnapshotAndDropMeasureViewFromSql(statement_body, drop_view_name,
+                SnapshotAndDropMeasureViewFromSql(statement_body, drop_view.view_name,
+                                                  drop_view.targets_temporary_view,
                                                   temporary_snapshots, pending_temporary_views,
                                                   used_temporary_views,
                                                   permanent_snapshots);
             } else {
-                deferred_drop_views.push_back({statement_body, drop_view_name});
+                deferred_drop_views.push_back(drop_view);
             }
             executable_since_catalog_mutation = false;
             rewritten_statements.push_back(statement);

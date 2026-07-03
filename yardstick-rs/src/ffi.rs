@@ -151,6 +151,13 @@ pub extern "C" fn yardstick_snapshot_measure_view(view_name: *const c_char) -> *
     Box::into_raw(Box::new(snapshot)) as *mut c_void
 }
 
+/// Create a snapshot representing an absent catalog entry.
+#[no_mangle]
+pub extern "C" fn yardstick_empty_measure_view_snapshot() -> *mut c_void {
+    let snapshot: Option<MeasureView> = None;
+    Box::into_raw(Box::new(snapshot)) as *mut c_void
+}
+
 /// Restore a previously snapped catalog entry, or drop the view if it did not exist.
 #[no_mangle]
 pub extern "C" fn yardstick_restore_measure_view_snapshot(
