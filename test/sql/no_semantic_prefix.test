@@ -319,16 +319,26 @@ CREATE VIEW batch_drop_temp_direct_v AS
 SELECT year, SUM(amount) AS MEASURE drop_temp_direct_permanent_revenue
 FROM sales;
 
-statement error
+statement ok
 DROP VIEW batch_drop_temp_direct_v;
 CREATE TEMP VIEW batch_drop_temp_direct_v AS
 SELECT year, SUM(amount * 10) AS MEASURE drop_temp_direct_revenue
 FROM sales;
+CREATE TABLE batch_drop_temp_direct_result AS
 SELECT year, AGGREGATE(drop_temp_direct_revenue) AS revenue
 FROM batch_drop_temp_direct_v
 GROUP BY year;
+
+query IR rowsort
+SELECT year, revenue FROM batch_drop_temp_direct_result;
 ----
-<REGEX>:.*TEMPORARY AS MEASURE views.*
+2022	1500.0
+2023	2250.0
+
+statement error
+SELECT AGGREGATE(drop_temp_direct_revenue) FROM batch_drop_temp_direct_v;
+----
+<REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
 
 # =============================================================================
 # Test: CTE with AGGREGATE

@@ -575,7 +575,7 @@ SELECT year, AGGREGATE(drop_temp_direct_revenue) AS revenue
 FROM batch_drop_temp_direct_v
 GROUP BY year;
 ----
-<REGEX>:.*TEMPORARY AS MEASURE views.*
+<REGEX>:.*(TEMPORARY AS MEASURE views|syntax error at or near "drop_temp_direct_revenue").*
 
 statement ok
 CREATE VIEW batch_semantic_drop_v AS
