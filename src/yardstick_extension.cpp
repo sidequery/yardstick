@@ -870,6 +870,35 @@ static bool IsUnqualifiedOrTemporarySchemaReference(const std::string &qualified
            EqualsCaseInsensitive(schema, "pg_temp");
 }
 
+static bool IsExtractFromKeyword(const std::string &sql, idx_t from_pos) {
+    idx_t depth = 0;
+    for (idx_t i = from_pos; i > 0; i--) {
+        char c = sql[i - 1];
+        if (c == ')') {
+            depth++;
+            continue;
+        }
+        if (c != '(') {
+            continue;
+        }
+        if (depth > 0) {
+            depth--;
+            continue;
+        }
+
+        idx_t token_end = i - 1;
+        while (token_end > 0 && std::isspace(static_cast<unsigned char>(sql[token_end - 1]))) {
+            token_end--;
+        }
+        idx_t token_start = token_end;
+        while (token_start > 0 && IsIdentifierChar(sql[token_start - 1])) {
+            token_start--;
+        }
+        return EqualsCaseInsensitive(sql.substr(token_start, token_end - token_start), "EXTRACT");
+    }
+    return false;
+}
+
 static bool StatementTextReadsFromView(const std::string &sql,
                                        const std::string &view_name,
                                        bool qualified_permanent) {
@@ -955,7 +984,11 @@ static bool StatementTextReadsFromView(const std::string &sql,
         }
 
         size_t pos = i;
-        if (!ConsumeKeyword(sql, pos, "FROM") && !ConsumeKeyword(sql, pos, "JOIN")) {
+        bool from_keyword = ConsumeKeyword(sql, pos, "FROM");
+        if (from_keyword && IsExtractFromKeyword(sql, i)) {
+            continue;
+        }
+        if (!from_keyword && !ConsumeKeyword(sql, pos, "JOIN")) {
             continue;
         }
 

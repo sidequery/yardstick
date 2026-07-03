@@ -566,9 +566,11 @@ CREATE TEMP VIEW batch_extract_unused_tmp_v AS
 SELECT year, SUM(amount) AS MEASURE extract_unused_revenue
 FROM sales;
 CREATE TABLE batch_extract_unused_result AS
-SELECT EXTRACT(year FROM batch_extract_unused_tmp_v) AS extracted_year,
-       AGGREGATE(revenue) AS revenue
-FROM sales_v;
+WITH x AS (
+    SELECT EXTRACT(year FROM batch_extract_unused_tmp_v) AS extracted_year
+)
+SELECT x.extracted_year, AGGREGATE(revenue) AS revenue
+FROM x, sales_v;
 ----
 <REGEX>:.*(TEMPORARY AS MEASURE views must be used.*|syntax error at or near "extract_unused_revenue").*
 
