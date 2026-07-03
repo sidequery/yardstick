@@ -991,8 +991,11 @@ static bool StatementReadsFromView(const std::string &sql,
         }
     }
 
+    size_t select_pos = SkipWhitespaceAndComments(select_sql, 0);
+    bool starts_with_with = ConsumeKeyword(select_sql, select_pos, "WITH");
     yardstick_free_select_info(info);
-    return found || StatementTextReadsFromView(select_sql, view_name, qualified_permanent);
+    return found || ((qualified_permanent || starts_with_with) &&
+                     StatementTextReadsFromView(select_sql, view_name, qualified_permanent));
 }
 
 struct DropViewInfo {
