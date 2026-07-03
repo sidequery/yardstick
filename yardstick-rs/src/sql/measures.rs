@@ -3634,11 +3634,25 @@ fn dollar_quote_delimiter_at(sql: &str, start: usize) -> Option<&str> {
     }
 }
 
+fn is_escape_string_quote_at(sql: &str, quote_pos: usize) -> bool {
+    let bytes = sql.as_bytes();
+    if quote_pos == 0 || quote_pos >= bytes.len() || bytes[quote_pos] != b'\'' {
+        return false;
+    }
+    let prefix_pos = quote_pos - 1;
+    if !matches!(bytes[prefix_pos], b'e' | b'E') {
+        return false;
+    }
+    prefix_pos == 0
+        || !(bytes[prefix_pos - 1].is_ascii_alphanumeric() || bytes[prefix_pos - 1] == b'_')
+}
+
 fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut i = 0;
     let mut in_single = false;
+    let mut single_allows_backslash = false;
     let mut in_double = false;
     let mut in_backtick = false;
     let mut in_dollar_quote: Option<String> = None;
@@ -3696,12 +3710,20 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
         if in_single {
             out.push(ch);
             i += ch.len_utf8();
+            if single_allows_backslash && ch == '\\' {
+                if let Some(next) = sql[i..].chars().next() {
+                    out.push(next);
+                    i += next.len_utf8();
+                }
+                continue;
+            }
             if ch == '\'' {
                 if i < bytes.len() && bytes[i] == b'\'' {
                     out.push('\'');
                     i += 1;
                 } else {
                     in_single = false;
+                    single_allows_backslash = false;
                 }
             }
             continue;
@@ -3757,7 +3779,10 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
         i += ch.len_utf8();
 
         match ch {
-            '\'' => in_single = true,
+            '\'' => {
+                in_single = true;
+                single_allows_backslash = is_escape_string_quote_at(sql, i - ch.len_utf8());
+            }
             '"' => in_double = true,
             '`' => in_backtick = true,
             _ => {}
@@ -6692,6 +6717,17 @@ FROM orders"#;
         let sanitized = sanitize_non_ascii_in_sql_comments(sql);
 
         assert!(sanitized.contains("[']']"));
+        assert!(!sanitized.ends_with("東京"));
+        assert!(sanitized.is_ascii());
+        assert_eq!(sanitized.len(), sql.len());
+    }
+
+    #[test]
+    fn test_comment_sanitizer_handles_escape_string_quotes() {
+        let sql = "SELECT E'can\\'t' AS label FROM sales -- 東京";
+        let sanitized = sanitize_non_ascii_in_sql_comments(sql);
+
+        assert!(sanitized.contains("E'can\\'t'"));
         assert!(!sanitized.ends_with("東京"));
         assert!(sanitized.is_ascii());
         assert_eq!(sanitized.len(), sql.len());
