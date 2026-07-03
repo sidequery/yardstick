@@ -450,6 +450,36 @@ GROUP BY year;
 2023	225.0
 
 statement ok
+CREATE VIEW batch_qualified_read_v AS
+SELECT year, SUM(amount) AS MEASURE qualified_read_revenue
+FROM sales;
+
+statement ok
+CREATE TEMP VIEW batch_qualified_read_v AS
+SELECT year, SUM(amount * 50) AS MEASURE qualified_read_revenue
+FROM sales;
+CREATE TABLE batch_qualified_permanent_read_result AS
+SELECT year, AGGREGATE(qualified_read_revenue) AS revenue
+FROM main.batch_qualified_read_v
+GROUP BY year;
+CREATE TABLE batch_qualified_temp_read_result AS
+SELECT year, AGGREGATE(qualified_read_revenue) AS revenue
+FROM batch_qualified_read_v
+GROUP BY year;
+
+query IR rowsort
+SELECT year, revenue FROM batch_qualified_permanent_read_result;
+----
+2022	150.0
+2023	225.0
+
+query IR rowsort
+SELECT year, revenue FROM batch_qualified_temp_read_result;
+----
+2022	7500.0
+2023	11250.0
+
+statement ok
 CREATE VIEW batch_shadow_drop_v AS
 SELECT year, SUM(amount) AS MEASURE shadow_drop_revenue
 FROM sales;

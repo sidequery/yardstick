@@ -644,19 +644,49 @@ static bool TransferTemporarySnapshotForPermanentDrop(std::vector<MeasureViewSna
     return false;
 }
 
-static bool TableRefMatchesView(const std::string &table_name, const std::string &view_name) {
-    if (EqualsCaseInsensitive(table_name, view_name)) {
+static bool RestoreShadowedPermanentMetadata(std::vector<MeasureViewSnapshot> &temporary_snapshots,
+                                             const std::string &view_name) {
+    for (auto &snapshot : temporary_snapshots) {
+        if (EqualsCaseInsensitive(snapshot.view_name, view_name)) {
+            void *permanent_snapshot = snapshot.snapshot;
+            snapshot.snapshot = yardstick_snapshot_measure_view(snapshot.view_name.c_str());
+            yardstick_restore_measure_view_snapshot(snapshot.view_name.c_str(), permanent_snapshot);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void RestoreTemporaryMetadata(std::vector<MeasureViewSnapshot> &temporary_snapshots,
+                                     const std::vector<std::string> &view_names) {
+    for (auto &view_name : view_names) {
+        for (auto &snapshot : temporary_snapshots) {
+            if (EqualsCaseInsensitive(snapshot.view_name, view_name)) {
+                void *permanent_snapshot = yardstick_snapshot_measure_view(snapshot.view_name.c_str());
+                yardstick_restore_measure_view_snapshot(snapshot.view_name.c_str(), snapshot.snapshot);
+                snapshot.snapshot = permanent_snapshot;
+                break;
+            }
+        }
+    }
+}
+
+static bool IsUnqualifiedOrTemporarySchemaReference(const std::string &qualified_name);
+
+static bool TableRefMatchesView(const std::string &table_name,
+                                const std::string &view_name,
+                                bool qualified_permanent) {
+    if (!qualified_permanent && EqualsCaseInsensitive(table_name, view_name)) {
         return true;
     }
     if (table_name.size() > view_name.size()) {
         idx_t suffix_start = table_name.size() - view_name.size();
-        return table_name[suffix_start - 1] == '.' &&
-               EqualsCaseInsensitive(table_name.substr(suffix_start), view_name);
-    }
-    if (view_name.size() > table_name.size()) {
-        idx_t suffix_start = view_name.size() - table_name.size();
-        return view_name[suffix_start - 1] == '.' &&
-               EqualsCaseInsensitive(view_name.substr(suffix_start), table_name);
+        if (table_name[suffix_start - 1] != '.' ||
+            !EqualsCaseInsensitive(table_name.substr(suffix_start), view_name)) {
+            return false;
+        }
+        bool temporary_reference = IsUnqualifiedOrTemporarySchemaReference(table_name);
+        return qualified_permanent ? !temporary_reference : temporary_reference;
     }
     return false;
 }
@@ -826,7 +856,7 @@ static std::string LastQualifiedIdentifierPart(const std::string &qualified_name
     return dot_pos == std::string::npos ? qualified_name : qualified_name.substr(dot_pos + 1);
 }
 
-static bool IsUnqualifiedOrTemporarySchemaDrop(const std::string &qualified_name) {
+static bool IsUnqualifiedOrTemporarySchemaReference(const std::string &qualified_name) {
     size_t dot_pos = qualified_name.rfind('.');
     if (dot_pos == std::string::npos) {
         return true;
@@ -840,7 +870,9 @@ static bool IsUnqualifiedOrTemporarySchemaDrop(const std::string &qualified_name
            EqualsCaseInsensitive(schema, "pg_temp");
 }
 
-static bool StatementTextReadsFromView(const std::string &sql, const std::string &view_name) {
+static bool StatementTextReadsFromView(const std::string &sql,
+                                       const std::string &view_name,
+                                       bool qualified_permanent) {
     std::string dollar_quote_end;
     bool in_single_quote = false;
     bool in_double_quote = false;
@@ -929,7 +961,7 @@ static bool StatementTextReadsFromView(const std::string &sql, const std::string
 
         pos = SkipWhitespaceAndComments(sql, pos);
         std::string table_name = ReadQualifiedIdentifier(sql, pos);
-        if (!table_name.empty() && TableRefMatchesView(table_name, view_name)) {
+        if (!table_name.empty() && TableRefMatchesView(table_name, view_name, qualified_permanent)) {
             return true;
         }
     }
@@ -937,28 +969,30 @@ static bool StatementTextReadsFromView(const std::string &sql, const std::string
     return false;
 }
 
-static bool StatementReadsFromView(const std::string &sql, const std::string &view_name) {
+static bool StatementReadsFromView(const std::string &sql,
+                                   const std::string &view_name,
+                                   bool qualified_permanent = false) {
     std::string select_sql = SelectPortionForTableAnalysis(sql);
     YardstickSelectInfo *info = yardstick_parse_select(select_sql.c_str());
     if (!info || info->error) {
         if (info) {
             yardstick_free_select_info(info);
         }
-        return StatementTextReadsFromView(select_sql, view_name);
+        return StatementTextReadsFromView(select_sql, view_name, qualified_permanent);
     }
 
     bool found = false;
     for (idx_t i = 0; i < info->table_count; i++) {
         if (!info->tables[i].is_subquery &&
             info->tables[i].table_name &&
-            TableRefMatchesView(info->tables[i].table_name, view_name)) {
+            TableRefMatchesView(info->tables[i].table_name, view_name, qualified_permanent)) {
             found = true;
             break;
         }
     }
 
     yardstick_free_select_info(info);
-    return found || StatementTextReadsFromView(select_sql, view_name);
+    return found || StatementTextReadsFromView(select_sql, view_name, qualified_permanent);
 }
 
 struct DropViewInfo {
@@ -1004,7 +1038,7 @@ static bool ExtractDropViewInfoFromSql(const std::string &sql, DropViewInfo &dro
 
     drop_view.sql = sql;
     drop_view.view_name = LastQualifiedIdentifierPart(qualified_name);
-    drop_view.targets_temporary_view = IsUnqualifiedOrTemporarySchemaDrop(qualified_name);
+    drop_view.targets_temporary_view = IsUnqualifiedOrTemporarySchemaReference(qualified_name);
     return true;
 }
 
@@ -1237,8 +1271,17 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
             return rewrite_result;
         }
 
+        std::vector<std::string> restored_shadowed_permanent_views;
+        for (auto &view_name : pending_temporary_views) {
+            if (StatementReadsFromView(aggregate_statement, view_name, true) &&
+                RestoreShadowedPermanentMetadata(temporary_snapshots, view_name)) {
+                restored_shadowed_permanent_views.push_back(view_name);
+            }
+        }
+
         YardstickAggregateResult result = yardstick_expand_aggregate(aggregate_statement.c_str());
         if (result.error) {
+            RestoreTemporaryMetadata(temporary_snapshots, restored_shadowed_permanent_views);
             yardstick_free_aggregate_result(result);
             rewritten_statements.push_back(statement);
             if (catalog_statement_seen) {
@@ -1260,6 +1303,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                 if (reads_pending_temporary_view) {
                     rewrite_result.error = "TEMPORARY AS MEASURE views cannot be returned directly from a statement batch";
                     yardstick_free_aggregate_result(result);
+                    RestoreTemporaryMetadata(temporary_snapshots, restored_shadowed_permanent_views);
                     cleanup_temporary_measure_views();
                     return rewrite_result;
                 }
@@ -1270,6 +1314,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         } else {
             rewritten_statements.push_back(statement);
         }
+        RestoreTemporaryMetadata(temporary_snapshots, restored_shadowed_permanent_views);
         if (catalog_statement_seen) {
             executable_since_catalog_mutation = true;
         }
