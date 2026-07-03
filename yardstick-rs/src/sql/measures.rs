@@ -312,6 +312,26 @@ pub fn has_aggregate_function(sql: &str) -> bool {
                     i += 1;
                 }
             }
+            '$' => {
+                let tag_start = i;
+                let mut tag_end = i + 1;
+                while tag_end < len && is_ident_char(chars[tag_end]) {
+                    tag_end += 1;
+                }
+                if tag_end < len && chars[tag_end] == '$' {
+                    let tag: Vec<char> = chars[tag_start..=tag_end].to_vec();
+                    i = tag_end + 1;
+                    while i + tag.len() <= len {
+                        if chars[i..i + tag.len()] == tag[..] {
+                            i += tag.len();
+                            break;
+                        }
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
             '"' => {
                 let (token, next) = parse_quoted_identifier(i + 1);
                 let (last, after_chain) = parse_qualified_chain(token, next);
@@ -872,6 +892,24 @@ fn rewrite_measure_at_refs(sql: &str) -> String {
                 }
                 continue;
             }
+            b'$' => {
+                let mut tag_end = i + 1;
+                while tag_end < bytes.len() && bytes[tag_end] != b'$' {
+                    let tag_char = bytes[tag_end];
+                    if !tag_char.is_ascii_alphanumeric() && tag_char != b'_' {
+                        break;
+                    }
+                    tag_end += 1;
+                }
+                if tag_end < bytes.len() && bytes[tag_end] == b'$' {
+                    let tag = &sql[i..=tag_end];
+                    i = tag_end + 1;
+                    if let Some(relative_end) = sql[i..].find(tag) {
+                        i += relative_end + tag.len();
+                    }
+                    continue;
+                }
+            }
             _ => {}
         }
 
@@ -1187,24 +1225,155 @@ fn aggregate_with_at(input: &str) -> IResult<&str, (&str, Vec<ContextModifier>)>
 }
 
 /// Extract all AGGREGATE(...) [AT (...)]+ patterns from SQL with full modifier list
+fn aggregate_call_starts_outside_literals(sql: &str) -> Vec<usize> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut starts = Vec::new();
+    let mut i = 0;
+
+    let is_ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+    let is_ident_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let skip_whitespace = |mut idx: usize| -> usize {
+        while idx < len && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        idx
+    };
+
+    while i < len {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < len && bytes[i + 1] == b'\'' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'"' {
+                        if i + 1 < len && bytes[i + 1] == b'"' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < len {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'$' => {
+                let tag_start = i;
+                let mut tag_end = i + 1;
+                while tag_end < len && is_ident_char(bytes[tag_end]) {
+                    tag_end += 1;
+                }
+                if tag_end < len && bytes[tag_end] == b'$' {
+                    let tag = &sql[tag_start..tag_end + 1];
+                    if let Some(end_offset) = sql[tag_end + 1..].find(tag) {
+                        i = tag_end + 1 + end_offset + tag.len();
+                    } else {
+                        i = tag_end + 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            b if is_ident_start(b) => {
+                let mut token_start = i;
+                let mut token_end = i + 1;
+                while token_end < len && is_ident_char(bytes[token_end]) {
+                    token_end += 1;
+                }
+
+                let mut pos = token_end;
+                loop {
+                    pos = skip_whitespace(pos);
+                    if pos >= len || bytes[pos] != b'.' {
+                        break;
+                    }
+                    pos += 1;
+                    pos = skip_whitespace(pos);
+                    if pos < len && is_ident_start(bytes[pos]) {
+                        token_start = pos;
+                        token_end = pos + 1;
+                        while token_end < len && is_ident_char(bytes[token_end]) {
+                            token_end += 1;
+                        }
+                        pos = token_end;
+                    } else if pos < len && bytes[pos] == b'"' {
+                        pos += 1;
+                        while pos < len {
+                            if bytes[pos] == b'"' {
+                                if pos + 1 < len && bytes[pos + 1] == b'"' {
+                                    pos += 2;
+                                } else {
+                                    pos += 1;
+                                    break;
+                                }
+                            } else {
+                                pos += 1;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                let after_ws = skip_whitespace(pos);
+                if after_ws < len
+                    && bytes[after_ws] == b'('
+                    && sql[token_start..token_end].eq_ignore_ascii_case("AGGREGATE")
+                {
+                    starts.push(token_start);
+                }
+                i = pos;
+            }
+            _ => i += 1,
+        }
+    }
+
+    starts
+}
+
 pub fn extract_aggregate_with_at_full(
     sql: &str,
 ) -> Vec<(String, Vec<ContextModifier>, usize, usize)> {
     let mut results = Vec::new();
-    let sql_upper = sql.to_uppercase();
-    let mut search_pos = 0;
 
-    while let Some(agg_offset) = sql_upper[search_pos..].find("AGGREGATE") {
-        let start = search_pos + agg_offset;
-
+    for start in aggregate_call_starts_outside_literals(sql) {
         if let Ok((remaining, (measure, modifiers))) = aggregate_with_at(&sql[start..]) {
             if !modifiers.is_empty() {
                 let end = sql.len() - remaining.len();
                 results.push((measure.to_string(), modifiers, start, end));
             }
         }
-
-        search_pos = start + 1;
     }
 
     results
@@ -1237,12 +1406,8 @@ pub fn extract_aggregate_with_at(sql: &str) -> Vec<(String, ContextModifier, usi
 /// Extract all AGGREGATE() calls without AT
 pub fn extract_all_aggregate_calls(sql: &str) -> Vec<(String, usize, usize)> {
     let mut results = Vec::new();
-    let sql_upper = sql.to_uppercase();
-    let mut search_pos = 0;
 
-    while let Some(agg_offset) = sql_upper[search_pos..].find("AGGREGATE") {
-        let start = search_pos + agg_offset;
-
+    for start in aggregate_call_starts_outside_literals(sql) {
         if let Ok((remaining, (measure, modifiers))) = aggregate_with_at(&sql[start..]) {
             // Only include calls WITHOUT AT modifier, and only when the argument
             // is a simple identifier (measure name). This avoids intercepting
@@ -1252,8 +1417,6 @@ pub fn extract_all_aggregate_calls(sql: &str) -> Vec<(String, usize, usize)> {
                 results.push((measure.to_string(), start, end));
             }
         }
-
-        search_pos = start + 1;
     }
 
     results
@@ -1274,6 +1437,12 @@ fn create_view_header(input: &str) -> IResult<&str, &str> {
         tag_no_case("OR"),
         multispace1,
         tag_no_case("REPLACE"),
+        multispace1,
+    )))(input)?;
+
+    // Optional TEMP/TEMPORARY
+    let (input, _) = opt(tuple((
+        alt((tag_no_case("TEMPORARY"), tag_no_case("TEMP"))),
         multispace1,
     )))(input)?;
 
@@ -1318,7 +1487,13 @@ pub fn extract_drop_view_name(sql: &str) -> Option<String> {
     }
 
     let end = parse_qualified_name_span(sql, idx)?;
-    if !is_statement_tail(sql, end) {
+    let mut tail = skip_ws_and_comments(sql, end);
+    if matches_keyword_at(&upper, tail, "CASCADE") {
+        tail += "CASCADE".len();
+    } else if matches_keyword_at(&upper, tail, "RESTRICT") {
+        tail += "RESTRICT".len();
+    }
+    if !is_statement_tail(sql, tail) {
         return None;
     }
     extract_last_qualified_identifier(&sql[idx..end])
@@ -6170,12 +6345,22 @@ pub fn store_measure_view(
     };
 
     let mut views = MEASURE_VIEWS.lock().unwrap();
+    remove_measure_view_case_insensitive(&mut views, view_name);
     views.insert(view_name.to_string(), measure_view);
 }
 
 pub fn get_measure_view(view_name: &str) -> Option<MeasureView> {
     let views = MEASURE_VIEWS.lock().unwrap();
-    views.get(view_name).cloned()
+    views
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(view_name))
+        .map(|(_, view)| view.clone())
+}
+
+pub fn restore_measure_view(view: MeasureView) {
+    let mut views = MEASURE_VIEWS.lock().unwrap();
+    remove_measure_view_case_insensitive(&mut views, &view.view_name);
+    views.insert(view.view_name.clone(), view);
 }
 
 pub fn clear_measure_views() {
@@ -6328,6 +6513,21 @@ fn is_literal_constant(expr: &str) -> bool {
     false
 }
 
+fn remove_measure_view_case_insensitive(
+    views: &mut HashMap<String, MeasureView>,
+    view_name: &str,
+) -> bool {
+    let key = views
+        .keys()
+        .find(|name| name.eq_ignore_ascii_case(view_name))
+        .cloned();
+    if let Some(key) = key {
+        views.remove(&key);
+        return true;
+    }
+    false
+}
+
 /// Extract non-AGGREGATE columns from SELECT clause to use as implicit GROUP BY columns
 fn looks_like_sql_aggregate_expr(expr: &str) -> bool {
     // Prefer parser-backed detection when parser FFI is available.
@@ -6474,6 +6674,10 @@ mod tests {
         assert!(has_aggregate_function("SELECT schema.AGGREGATE(revenue) FROM foo"));
         assert!(has_aggregate_function(
             "SELECT \"schema\".\"AGGREGATE\" (revenue) FROM foo"
+        ));
+        assert!(!has_aggregate_function("SELECT $$AGGREGATE(revenue)$$ AS note"));
+        assert!(!has_aggregate_function(
+            "SELECT $tag$AGGREGATE(revenue) AT (ALL)$tag$ AS note"
         ));
         assert!(!has_aggregate_function("SELECT TOTAL_AGGREGATE(revenue) FROM foo"));
         assert!(!has_aggregate_function("SELECT \"TOTAL_AGGREGATE\"(revenue) FROM foo"));
@@ -6906,6 +7110,24 @@ FROM orders"#;
     }
 
     #[test]
+    fn test_extract_aggregate_skips_dollar_quoted_literals() {
+        assert!(extract_all_aggregate_calls(
+            "SELECT $$AGGREGATE(revenue)$$ AS note"
+        )
+        .is_empty());
+        assert!(extract_aggregate_with_at_full(
+            "SELECT $tag$AGGREGATE(revenue) AT (ALL)$tag$ AS note"
+        )
+        .is_empty());
+
+        let calls = extract_all_aggregate_calls(
+            "SELECT AGGREGATE(revenue), $$AGGREGATE(cost)$$ FROM sales_v",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "revenue");
+    }
+
+    #[test]
     fn test_expand_at_to_sql_all() {
         // With no group_by_cols, AT (ALL dim) acts like grand total
         let expanded = expand_at_to_sql(
@@ -7092,6 +7314,26 @@ FROM orders"#;
     }
 
     #[test]
+    #[serial]
+    fn test_rewrite_measure_at_refs_skips_dollar_literals() {
+        clear_measure_views();
+        store_measure_view(
+            "sales_v",
+            vec![ViewMeasure {
+                column_name: "revenue".to_string(),
+                expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
+            }],
+            "SELECT year, SUM(amount) AS revenue FROM sales GROUP BY year",
+            Some("sales".to_string()),
+        );
+
+        let sql = "INSERT INTO notes VALUES ($tag$revenue AT (ALL)$tag$)";
+        assert_eq!(rewrite_measure_at_refs(sql), sql);
+        assert!(!has_measure_at_refs(sql));
+    }
+
+    #[test]
     #[ignore = "requires C++ parser FFI"]
     #[serial]
     fn test_rewrite_implicit_measure_refs_uses_default_context() {
@@ -7145,6 +7387,14 @@ FROM orders"#;
             extract_view_name("CREATE OR REPLACE VIEW bar AS SELECT 1"),
             Some("bar".to_string())
         );
+        assert_eq!(
+            extract_view_name("CREATE TEMP VIEW temp_foo AS SELECT 1"),
+            Some("temp_foo".to_string())
+        );
+        assert_eq!(
+            extract_view_name("CREATE OR REPLACE TEMPORARY VIEW temp_bar AS SELECT 1"),
+            Some("temp_bar".to_string())
+        );
     }
 
     #[test]
@@ -7152,7 +7402,7 @@ FROM orders"#;
     fn test_drop_measure_view_from_sql() {
         clear_measure_views();
         store_measure_view(
-            "orders_v",
+            "Orders_V",
             vec![ViewMeasure {
                 column_name: "revenue".to_string(),
                 expression: "SUM(amount)".to_string(),
@@ -7163,12 +7413,45 @@ FROM orders"#;
         );
 
         assert!(get_measure_view("orders_v").is_some());
+        assert!(get_measure_view("ORDERS_V").is_some());
         assert!(!drop_measure_view_from_sql(
             "DROP VIEW orders_v /* invalid tail */ extra"
         ));
         assert!(get_measure_view("orders_v").is_some());
         assert!(drop_measure_view_from_sql("DROP VIEW orders_v;"));
         assert!(get_measure_view("orders_v").is_none());
+
+        store_measure_view(
+            "sales_v",
+            vec![ViewMeasure {
+                column_name: "new_revenue".to_string(),
+                expression: "SUM(new_amount)".to_string(),
+                is_decomposable: true,
+            }],
+            "SELECT year, SUM(new_amount) AS new_revenue FROM sales GROUP BY year",
+            Some("sales".to_string()),
+        );
+        restore_measure_view(MeasureView {
+            view_name: "Sales_V".to_string(),
+            measures: vec![ViewMeasure {
+                column_name: "revenue".to_string(),
+                expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
+            }],
+            base_query: "SELECT year, SUM(amount) AS revenue FROM sales GROUP BY year".to_string(),
+            base_table: Some("sales".to_string()),
+            base_relation_sql: None,
+            dimension_exprs: HashMap::new(),
+            group_by_cols: vec!["year".to_string()],
+        });
+        let restored = get_measure_view("sales_v").unwrap();
+        assert_eq!(restored.view_name, "Sales_V");
+        assert_eq!(restored.measures[0].column_name, "revenue");
+        let views = MEASURE_VIEWS.lock().unwrap();
+        assert!(views.contains_key("Sales_V"));
+        assert!(!views.contains_key("sales_v"));
+        drop(views);
+        clear_measure_views();
     }
 
     #[test]
@@ -7184,6 +7467,14 @@ FROM orders"#;
         assert_eq!(
             extract_drop_view_name("DROP VIEW /* keep */ IF EXISTS [dbo].[Orders View]"),
             Some("Orders View".to_string())
+        );
+        assert_eq!(
+            extract_drop_view_name("DROP VIEW orders_v CASCADE"),
+            Some("orders_v".to_string())
+        );
+        assert_eq!(
+            extract_drop_view_name("DROP VIEW orders_v RESTRICT;"),
+            Some("orders_v".to_string())
         );
         assert_eq!(extract_drop_view_name("DROP VIEW orders_v extra"), None);
     }

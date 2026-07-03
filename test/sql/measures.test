@@ -50,6 +50,604 @@ SEMANTIC SELECT year, region, AGGREGATE(revenue) FROM sales_unicode_comment_v;
 2023	EU	75.0
 2023	US	150.0
 
+query RI
+SEMANTIC SELECT AGGREGATE(revenue), 1 AS measure FROM sales_v;
+----
+375.0	1
+
+statement error
+DROP VIEW sales_v;
+CREATE VIEW rollback_other_v AS
+SELECT year, SUM(amount) AS MEASURE rollback_other_revenue
+FROM sales;
+SELECT (
+----
+<REGEX>:.*(Parser Error|Catalog Error).*
+
+statement ok
+CREATE OR REPLACE VIEW sales_v AS
+SELECT year, region, SUM(amount) AS MEASURE revenue
+FROM sales;
+
+query R
+SEMANTIC SELECT AGGREGATE(revenue) FROM sales_v;
+----
+375.0
+
+statement ok
+CREATE VIEW false_measure_drop_v AS
+SELECT year, SUM(amount) AS MEASURE false_drop_revenue
+FROM sales;
+
+statement ok
+SELECT ' AS MEASURE ';
+DROP VIEW false_measure_drop_v;
+
+statement error
+SEMANTIC SELECT AGGREGATE(false_drop_revenue) FROM false_measure_drop_v;
+----
+Table with name false_measure_drop_v does not exist
+
+statement ok
+CREATE VIEW false_measure_recreate_v AS
+SELECT year, SUM(amount) AS MEASURE old_false_recreate_revenue
+FROM sales;
+
+statement ok
+SELECT ' AS MEASURE ';
+DROP VIEW false_measure_recreate_v;
+CREATE VIEW false_measure_recreate_v AS
+SELECT year, SUM(amount) AS MEASURE false_recreate_revenue
+FROM sales;
+
+query R
+SEMANTIC SELECT AGGREGATE(false_recreate_revenue) FROM false_measure_recreate_v;
+----
+375.0
+
+statement ok
+CREATE VIEW Sales_Case_V AS
+SELECT year, SUM(amount) AS MEASURE case_revenue
+FROM sales;
+
+statement error
+DROP VIEW sales_case_v;
+SELECT (
+----
+<REGEX>:.*(Parser Error|Catalog Error).*
+
+statement ok
+CREATE OR REPLACE VIEW Sales_Case_V AS
+SELECT year, SUM(amount) AS MEASURE case_revenue
+FROM sales;
+
+query R
+SEMANTIC SELECT AGGREGATE(case_revenue) FROM Sales_Case_V;
+----
+375.0
+
+statement error
+SELECT * FROM missing_false_positive_v /* AS MEASURE */;
+DROP VIEW sales_v;
+----
+Catalog Error
+
+query R
+SEMANTIC SELECT AGGREGATE(revenue) FROM sales_v;
+----
+375.0
+
+# Multi-statement batches should rewrite and register each measure view independently
+statement ok
+CREATE TABLE batch_notes(note TEXT);
+
+statement ok
+INSERT INTO batch_notes VALUES ($$a;b$$);
+CREATE VIEW batch_orders_v AS
+SELECT year, SUM(amount) AS MEASURE order_revenue
+FROM sales;
+CREATE VIEW batch_regions_v AS
+SELECT region, SUM(amount) AS MEASURE regional_revenue
+FROM sales;
+
+query T
+SELECT note FROM batch_notes;
+----
+a;b
+
+statement ok
+CREATE TABLE batch_literal_notes(note TEXT);
+
+statement ok
+CREATE VIEW batch_literal_v AS
+SELECT year, SUM(amount) AS MEASURE literal_revenue
+FROM sales;
+INSERT INTO batch_literal_notes VALUES ($$AGGREGATE(literal_revenue)$$);
+
+query T
+SELECT note FROM batch_literal_notes;
+----
+AGGREGATE(literal_revenue)
+
+statement ok
+CREATE VIEW batch_at_literal_v AS
+SELECT year, SUM(amount) AS MEASURE at_literal_revenue
+FROM sales;
+INSERT INTO batch_literal_notes VALUES ($$at_literal_revenue AT (ALL)$$);
+
+query T
+SELECT note FROM batch_literal_notes WHERE note = 'at_literal_revenue AT (ALL)';
+----
+at_literal_revenue AT (ALL)
+
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(order_revenue) FROM batch_orders_v;
+----
+2022	150.0
+2023	225.0
+
+query TR rowsort
+SEMANTIC SELECT region, AGGREGATE(regional_revenue) FROM batch_regions_v;
+----
+EU	125.0
+US	250.0
+
+statement ok
+CREATE VIEW batch_inline_v AS
+SELECT year, SUM(amount) AS MEASURE inline_revenue
+FROM sales;
+CREATE TABLE batch_inline_result AS
+SELECT year, AGGREGATE(inline_revenue) AS revenue
+FROM batch_inline_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_inline_result;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE VIEW batch_drop_v AS
+SELECT year, SUM(amount) AS MEASURE dropped_revenue
+FROM sales;
+
+statement ok
+DROP VIEW batch_drop_v;
+CREATE VIEW batch_after_drop_v AS
+SELECT year, SUM(amount) AS MEASURE after_drop_revenue
+FROM sales;
+
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(after_drop_revenue) FROM batch_after_drop_v;
+----
+2022	150.0
+2023	225.0
+
+statement error
+SEMANTIC SELECT year, AGGREGATE(dropped_revenue) AT (ALL)
+FROM batch_after_drop_v
+GROUP BY year;
+----
+Binder Error
+
+statement ok
+CREATE VIEW batch_drop_cascade_v AS
+SELECT year, SUM(amount) AS MEASURE cascade_drop_revenue
+FROM sales;
+
+statement ok
+DROP VIEW batch_drop_cascade_v CASCADE;
+CREATE VIEW batch_after_cascade_drop_v AS
+SELECT year, SUM(amount) AS MEASURE after_cascade_drop_revenue
+FROM sales;
+
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(after_cascade_drop_revenue) FROM batch_after_cascade_drop_v;
+----
+2022	150.0
+2023	225.0
+
+statement error
+SEMANTIC SELECT year, AGGREGATE(cascade_drop_revenue) AT (ALL)
+FROM batch_after_cascade_drop_v
+GROUP BY year;
+----
+Binder Error
+
+statement ok
+CREATE VIEW batch_order_v AS
+SELECT year, SUM(amount) AS MEASURE order_sensitive_revenue
+FROM sales;
+CREATE TABLE batch_order_result AS
+SELECT year, AGGREGATE(order_sensitive_revenue) AS revenue
+FROM batch_order_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_order_result;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+DROP VIEW batch_order_v;
+
+statement ok
+-- leading comment should not prevent measure registration
+CREATE VIEW batch_comment_v AS
+SELECT year, SUM(amount) AS MEASURE comment_revenue
+FROM sales;
+CREATE TABLE batch_comment_result AS
+SELECT year, AGGREGATE(comment_revenue) AS revenue
+FROM batch_comment_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_comment_result;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE TEMP VIEW batch_temp_v AS
+SELECT year, SUM(amount) AS MEASURE temp_revenue
+FROM sales;
+CREATE TABLE batch_temp_result AS
+SELECT year, AGGREGATE(temp_revenue) AS revenue
+FROM batch_temp_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_temp_result;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE TEMP VIEW batch_temp_cte_v AS
+SELECT year, SUM(amount) AS MEASURE temp_cte_revenue
+FROM sales;
+CREATE TABLE batch_temp_cte_result AS
+WITH x AS (
+    SELECT year, AGGREGATE(temp_cte_revenue) AS revenue
+    FROM batch_temp_cte_v
+    GROUP BY year
+)
+SELECT * FROM x;
+
+query IR rowsort
+SELECT year, revenue FROM batch_temp_cte_result;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE TEMP VIEW batch_temp_derived_v AS
+SELECT year, SUM(amount) AS MEASURE temp_derived_revenue
+FROM sales;
+CREATE TABLE batch_temp_derived_result AS
+SELECT *
+FROM (
+    SELECT AGGREGATE(temp_derived_revenue) AS revenue
+    FROM batch_temp_derived_v
+) s;
+
+query R
+SELECT revenue FROM batch_temp_derived_result;
+----
+375.0
+
+statement error
+CREATE TEMP VIEW batch_temp_alias_only_v AS
+SELECT year, SUM(amount) AS MEASURE temp_alias_only_revenue
+FROM sales;
+CREATE TABLE batch_temp_alias_only_result AS
+SELECT AGGREGATE(revenue) AS revenue
+FROM sales_v
+JOIN (SELECT 1) batch_temp_alias_only_v ON true;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
+
+query IR rowsort
+CREATE VIEW batch_select_v AS
+SELECT year, SUM(amount) AS MEASURE batch_select_revenue
+FROM sales;
+SEMANTIC SELECT year, AGGREGATE(batch_select_revenue) AS revenue
+FROM batch_select_v
+GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
+query IR rowsort
+CREATE VIEW batch_mid_semantic_v AS
+SELECT year, SUM(amount) AS MEASURE batch_mid_semantic_revenue
+FROM sales;
+-- prefix applies only to the second statement in this batch
+SEMANTIC SELECT year, AGGREGATE(batch_mid_semantic_revenue) AS revenue
+FROM batch_mid_semantic_v
+GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE TABLE batch_semantic_create_marker(i INT);
+SEMANTIC CREATE VIEW batch_semantic_create_v AS
+SELECT year, SUM(amount) AS MEASURE semantic_create_revenue
+FROM sales;
+CREATE TABLE batch_semantic_create_result AS
+SELECT year, AGGREGATE(semantic_create_revenue) AS revenue
+FROM batch_semantic_create_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_semantic_create_result;
+----
+2022	150.0
+2023	225.0
+
+statement error
+CREATE TEMP VIEW batch_temp_select_v AS
+SELECT year, SUM(amount) AS MEASURE temp_select_revenue
+FROM sales;
+SELECT year, AGGREGATE(temp_select_revenue) AS revenue
+FROM batch_temp_select_v
+GROUP BY year;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
+
+statement error
+CREATE TEMP VIEW batch_temp_reuse_v AS
+SELECT year, SUM(amount) AS MEASURE temp_reuse_revenue
+FROM sales;
+CREATE TABLE batch_temp_reuse_result AS
+SELECT year, AGGREGATE(temp_reuse_revenue) AS revenue
+FROM batch_temp_reuse_v;
+SELECT year, AGGREGATE(temp_reuse_revenue) AS revenue
+FROM batch_temp_reuse_v
+GROUP BY year;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
+
+query IR rowsort
+CREATE VIEW batch_catalog_guard_v AS
+SELECT year, SUM(amount) AS MEASURE catalog_guard_revenue
+FROM sales;
+SELECT year, AGGREGATE(catalog_guard_revenue) AS revenue
+FROM batch_catalog_guard_v
+GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
+statement error
+SEMANTIC SELECT year, AGGREGATE(temp_revenue) AS revenue
+FROM batch_temp_v
+GROUP BY year;
+----
+Table with name batch_temp_v does not exist
+
+statement error
+CREATE TEMP VIEW batch_temp_standalone_v AS
+SELECT year, SUM(amount) AS MEASURE standalone_temp_revenue
+FROM sales;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
+
+statement error
+CREATE TEMP VIEW batch_temp_unused_v AS
+SELECT year, SUM(amount) AS MEASURE unused_temp_revenue
+FROM sales;
+CREATE TABLE batch_temp_unused_result AS
+SELECT AGGREGATE(revenue) AS revenue FROM sales_v;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
+
+statement error
+CREATE TEMP VIEW batch_temp_alias_v AS
+SELECT year, SUM(amount) AS MEASURE alias_temp_revenue
+FROM sales;
+CREATE TABLE batch_temp_alias_result AS
+SELECT AGGREGATE(revenue) AS batch_temp_alias_v FROM sales_v;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
+
+statement ok
+CREATE VIEW batch_shadow_v AS
+SELECT year, SUM(amount) AS MEASURE shadow_revenue
+FROM sales;
+
+statement ok
+CREATE TEMP VIEW batch_shadow_v AS
+SELECT year, SUM(amount * 10) AS MEASURE shadow_revenue
+FROM sales;
+CREATE TABLE batch_shadow_temp_result AS
+SELECT year, AGGREGATE(shadow_revenue) AS revenue
+FROM batch_shadow_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_shadow_temp_result;
+----
+2022	1500.0
+2023	2250.0
+
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(shadow_revenue) AS revenue
+FROM batch_shadow_v
+GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE VIEW batch_qualified_read_v AS
+SELECT year, SUM(amount) AS MEASURE qualified_read_revenue
+FROM sales;
+
+statement ok
+CREATE TEMP VIEW batch_qualified_read_v AS
+SELECT year, SUM(amount * 50) AS MEASURE qualified_read_revenue
+FROM sales;
+CREATE TABLE batch_qualified_permanent_read_result AS
+SELECT year, AGGREGATE(qualified_read_revenue) AS revenue
+FROM main.batch_qualified_read_v
+GROUP BY year;
+CREATE TABLE batch_qualified_temp_read_result AS
+SELECT year, AGGREGATE(qualified_read_revenue) AS revenue
+FROM batch_qualified_read_v
+GROUP BY year;
+
+query IR rowsort
+SELECT year, revenue FROM batch_qualified_permanent_read_result;
+----
+2022	150.0
+2023	225.0
+
+query IR rowsort
+SELECT year, revenue FROM batch_qualified_temp_read_result;
+----
+2022	7500.0
+2023	11250.0
+
+statement ok
+CREATE VIEW batch_shadow_drop_v AS
+SELECT year, SUM(amount) AS MEASURE shadow_drop_revenue
+FROM sales;
+
+statement ok
+CREATE TEMP VIEW batch_shadow_drop_v AS
+SELECT year, SUM(amount * 30) AS MEASURE shadow_drop_revenue
+FROM sales;
+DROP VIEW batch_shadow_drop_v;
+CREATE TABLE batch_shadow_after_temp_drop_result AS
+SELECT year, AGGREGATE(shadow_drop_revenue) AS revenue
+FROM batch_shadow_drop_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_shadow_after_temp_drop_result;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE VIEW batch_qualified_shadow_drop_v AS
+SELECT year, SUM(amount) AS MEASURE qualified_shadow_revenue
+FROM sales;
+
+statement ok
+CREATE TEMP VIEW batch_qualified_shadow_drop_v AS
+SELECT year, SUM(amount * 40) AS MEASURE qualified_shadow_revenue
+FROM sales;
+DROP VIEW main.batch_qualified_shadow_drop_v;
+CREATE TABLE batch_qualified_shadow_drop_result AS
+SELECT year, AGGREGATE(qualified_shadow_revenue) AS revenue
+FROM batch_qualified_shadow_drop_v;
+
+query IR rowsort
+SELECT year, revenue FROM batch_qualified_shadow_drop_result;
+----
+2022	6000.0
+2023	9000.0
+
+statement ok
+CREATE VIEW batch_drop_temp_replace_v AS
+SELECT year, SUM(amount) AS MEASURE drop_temp_permanent_revenue
+FROM sales;
+
+statement ok
+DROP VIEW batch_drop_temp_replace_v;
+CREATE TEMP VIEW batch_drop_temp_replace_v AS
+SELECT year, SUM(amount * 10) AS MEASURE drop_temp_replacement_revenue
+FROM sales;
+CREATE TABLE batch_drop_temp_replace_result AS
+SELECT year, AGGREGATE(drop_temp_replacement_revenue) AS revenue
+FROM batch_drop_temp_replace_v
+GROUP BY year;
+
+query IR rowsort
+SELECT year, revenue FROM batch_drop_temp_replace_result;
+----
+2022	1500.0
+2023	2250.0
+
+statement error
+SEMANTIC SELECT AGGREGATE(drop_temp_permanent_revenue) FROM batch_drop_temp_replace_v;
+----
+<REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
+
+statement error
+SEMANTIC SELECT AGGREGATE(drop_temp_replacement_revenue) FROM batch_drop_temp_replace_v;
+----
+<REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
+
+statement error
+CREATE TEMP VIEW batch_extract_unused_tmp_v AS
+SELECT year, SUM(amount) AS MEASURE extract_unused_revenue
+FROM sales;
+CREATE TABLE batch_extract_unused_result AS
+WITH x AS (
+    SELECT EXTRACT(year FROM batch_extract_unused_tmp_v) AS extracted_year
+)
+SELECT x.extracted_year, AGGREGATE(revenue) AS revenue
+FROM x, sales_v;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used.*|syntax error at or near "extract_unused_revenue").*
+
+statement ok
+CREATE VIEW batch_drop_temp_direct_v AS
+SELECT year, SUM(amount) AS MEASURE drop_temp_direct_permanent_revenue
+FROM sales;
+
+statement error
+DROP VIEW batch_drop_temp_direct_v;
+CREATE TEMP VIEW batch_drop_temp_direct_v AS
+SELECT year, SUM(amount * 10) AS MEASURE drop_temp_direct_revenue
+FROM sales;
+SELECT year, AGGREGATE(drop_temp_direct_revenue) AS revenue
+FROM batch_drop_temp_direct_v
+GROUP BY year;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views|syntax error at or near "drop_temp_direct_revenue").*
+
+statement ok
+CREATE VIEW batch_semantic_drop_v AS
+SELECT year, SUM(amount) AS MEASURE semantic_drop_revenue
+FROM sales;
+SEMANTIC DROP VIEW batch_semantic_drop_v;
+
+statement error
+SEMANTIC SELECT AGGREGATE(semantic_drop_revenue) FROM batch_semantic_drop_v;
+----
+<REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
+
+statement ok
+CREATE TEMP VIEW batch_temp_replace_drop_v AS
+SELECT year, SUM(amount) AS MEASURE temp_replace_drop_revenue
+FROM sales;
+CREATE OR REPLACE TEMP VIEW batch_temp_replace_drop_v AS
+SELECT year, SUM(amount * 10) AS MEASURE temp_replace_drop_revenue
+FROM sales;
+DROP VIEW batch_temp_replace_drop_v;
+
+statement error
+SEMANTIC SELECT AGGREGATE(temp_replace_drop_revenue) FROM batch_temp_replace_drop_v;
+----
+<REGEX>:.*(Catalog Error|Binder Error|Invalid Input Error).*
+
+statement error
+CREATE TEMP VIEW batch_shadow_v AS
+SELECT year, SUM(amount * 20) AS MEASURE shadow_revenue
+FROM sales;
+DROP VIEW batch_shadow_v;
+SELECT (
+----
+<REGEX>:.*(Parser Error|Catalog Error).*
+
+query IR rowsort
+SEMANTIC SELECT year, AGGREGATE(shadow_revenue) AS revenue
+FROM batch_shadow_v
+GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
 # =============================================================================
 # Test: CTE with AGGREGATE
 # =============================================================================

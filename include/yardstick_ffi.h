@@ -327,6 +327,12 @@ bool yardstick_has_curly_brace(const char* sql);
 bool yardstick_has_at_syntax(const char* sql);
 
 char* yardstick_expand_curly_braces(const char* sql);
+char* yardstick_extract_view_name(const char* sql);
+char* yardstick_extract_drop_view_name(const char* sql);
+void* yardstick_snapshot_measure_view(const char* view_name);
+void* yardstick_empty_measure_view_snapshot(void);
+void yardstick_restore_measure_view_snapshot(const char* view_name, void* snapshot);
+void yardstick_free_measure_view_snapshot(void* snapshot);
 struct YardstickCreateViewResult yardstick_process_create_view(const char* sql);
 struct YardstickAggregateResult yardstick_expand_aggregate(const char* sql);
 struct YardstickMeasureAggResult yardstick_get_measure_aggregation(const char* column_name);
