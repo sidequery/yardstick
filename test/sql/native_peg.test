@@ -1,0 +1,215 @@
+# name: test/sql/native_peg.test
+# description: Native structured modifiers feed shared measure semantics.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE native_sales (year INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO native_sales VALUES (2022, 'US', 100), (2022, 'EU', 50), (2023, 'US', 150), (2023, 'EU', 75);
+
+# Exercise both transformer modes. The connection's grammar setting stays empty:
+# LOAD alone must enable Yardstick's native adapter.
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+statement ok
+CREATE OR REPLACE VIEW native_sales_v AS
+SELECT year, region, SUM(amount)AS/* measure trivia */MEASURE native_revenue
+FROM native_sales;
+
+statement ok
+CREATE OR REPLACE VIEW native_alias_v AS
+SELECT year, region, SUM(amount)AS/**/MEASURE native_alias_revenue
+FROM native_sales;
+
+query R
+SELECT AGGREGATE(native_alias_revenue) FROM native_alias_v;
+----
+375.0
+
+# A quoted function name is accepted by DuckDB, but the legacy AT scanner does
+# not recognize it. This query must consume native structured modifier output.
+query R
+SELECT "AGGREGATE"(native_revenue) AT (ALL) FROM native_sales_v;
+----
+375.0
+
+# Expanding the CTE changes offsets before the outer modifier is lowered.
+query R
+WITH totals AS (
+    SELECT "AGGREGATE"(native_revenue) AT (ALL) AS total FROM native_sales_v
+)
+SELECT "AGGREGATE"(native_revenue) AT (ALL) FROM native_sales_v;
+----
+375.0
+
+# The comment between the operand and AT belongs to the normalized suffix.
+query R
+SELECT "AGGREGATE"(native_revenue)/* operand trivia */AT(/* mode trivia */ALL)
+FROM native_sales_v;
+----
+375.0
+
+query R
+SELECT v.native_revenue/* implicit measure */AT(ALL) FROM native_sales_v v;
+----
+375.0
+
+query RR
+SELECT "AGGREGATE"(native_revenue) AT (ALL/* dimension trivia */year region) AS compound_total,
+       "AGGREGATE"(native_revenue) AT (ALL year)/* chain trivia */AT(ALL region) AS chained_total
+FROM native_sales_v;
+----
+375.0	375.0
+
+query IR rowsort
+SELECT year, "AGGREGATE"(native_revenue) AT (SET/* assignment trivia */year = 2022)
+FROM native_sales_v;
+----
+2022	150.0
+2023	150.0
+
+query IR rowsort
+SELECT year, "AGGREGATE"(native_revenue) AT (ALL year) FROM native_sales_v;
+----
+2022	375.0
+2023	375.0
+
+# The complete nested RHS comes from DuckDB's expression parser.
+query IR rowsort
+SELECT year, "AGGREGATE"(native_revenue) AT (SET year = coalesce(NULL, 2022))
+FROM native_sales_v;
+----
+2022	150.0
+2023	150.0
+
+query IR rowsort
+SELECT year, "AGGREGATE"(native_revenue) AT (SET year = year - 1)
+FROM native_sales_v;
+----
+2022	NULL
+2023	150.0
+
+# CURRENT dimension retains the legacy path; a global CURRENT grammar rule
+# would also claim ordinary column/alias pairs such as SELECT current year.
+query IR rowsort
+SELECT year, AGGREGATE(native_revenue) AT (SET year = CURRENT year - 1)
+FROM native_sales_v;
+----
+2022	NULL
+2023	150.0
+
+query R
+SELECT "AGGREGATE"(native_revenue) AT (WHERE/* predicate trivia */year = 2023)
+FROM native_sales_v;
+----
+225.0
+
+# A newline between adjacent string literals is significant to DuckDB.
+query R
+SELECT "AGGREGATE"(native_revenue) AT (WHERE region = 'U'
+'S') FROM native_sales_v;
+----
+250.0
+
+query R
+SELECT "AGGREGATE"(native_revenue) AT (/* visibility trivia */VISIBLE)
+FROM native_sales_v WHERE year = 2022;
+----
+150.0
+
+query IR rowsort
+SELECT year, "AGGREGATE"(native_revenue) AT (ALL/* compound trivia */region SET year = 2022)
+FROM native_sales_v;
+----
+2022	150.0
+2023	NULL
+
+query IR rowsort
+SELECT year, "AGGREGATE"(native_revenue) AT (ALL region/* compound trivia */WHERE year = 2023)
+FROM native_sales_v;
+----
+2022	NULL
+2023	225.0
+
+query R
+SELECT "AGGREGATE"(native_revenue) AT (ALL region/* compound trivia */VISIBLE)
+FROM native_sales_v WHERE year = 2022;
+----
+150.0
+
+query TR
+SELECT 'café', "AGGREGATE"(native_revenue) AT (/* 東京 */ALL)
+FROM native_sales_v;
+----
+café	375.0
+
+# Fake grammar in literals/comments must not affect ordinary SQL or registration.
+query TTI
+SELECT 'AS MEASURE fake', $$AGGREGATE(fake) AT (ALL)$$, 1 AS measure
+/* AS MEASURE fake AT (ALL) */;
+----
+AS MEASURE fake	AGGREGATE(fake) AT (ALL)	1
+
+endloop
+
+# A newly opened connection inherits the registered adapter without a SET.
+query R second_connection
+SELECT "AGGREGATE"(native_revenue) AT (/* second connection */ALL)
+FROM native_sales_v;
+----
+375.0
+
+# Explicit activation must also work, preserving the caller's compiled grammar.
+statement ok
+SET active_grammar_extensions=['yardstick'];
+
+# CURRENT remains an ordinary identifier outside AT expressions.
+query I
+SELECT current year FROM (SELECT 2023 AS current);
+----
+2023
+
+query RI
+SEMANTIC SELECT AGGREGATE(native_revenue), 1 AS measure FROM native_sales_v;
+----
+375.0	1
+
+query R
+SELECT "AGGREGATE"(native_revenue) AT (/* explicitly active */ALL)
+FROM native_sales_v;
+----
+375.0
+
+# Internal markers must never bind as user functions without semantic lowering.
+statement ok
+CREATE MACRO __yardstick_at(x) AS x;
+
+statement ok
+CREATE MACRO __yardstick_measure(x) AS x;
+
+statement ok
+SET allow_parser_override_extension='default';
+
+statement error
+SELECT native_revenue AT (ALL) FROM native_sales_v;
+----
+Yardstick syntax must be processed by the Yardstick parser override
+
+statement error
+SELECT SUM(amount) AS MEASURE shadowed_measure FROM native_sales;
+----
+Yardstick syntax must be processed by the Yardstick parser override
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+RESET active_grammar_extensions;

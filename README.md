@@ -154,6 +154,14 @@ On DuckDB 1.5+, queries containing `AGGREGATE()` are automatically intercepted b
 
 ## Building
 
+On DuckDB builds with grammar-extension support, Yardstick recognizes `AS MEASURE` and `AT (...)` through native PEG grammar rules. `LOAD yardstick` enables this adapter without setting `active_grammar_extensions`. Native AT clauses supply structured modifier chains to shared Rust lowering after CTE and implicit-reference rewrites. DuckDB parses the modifier expressions; measure registration and context semantics remain shared with DuckDB 1.5.5.
+
+If other grammar extensions are active, include `yardstick` alongside them in `active_grammar_extensions` to use that combined grammar. Rewritten parses and the internal execution connection preserve it. Otherwise Yardstick keeps its legacy frontend for that connection.
+
+This is a staged frontend migration: forms the native grammar cannot parse, including `CURRENT dimension`, retain the legacy path. Brace shorthand remains a separate Rust helper, not a fully supported SQL frontend. Comments between `AGGREGATE` and its opening parenthesis are still a limitation of the shared scanner.
+
+For the combined-grammar regression suite, configure with `-DYARDSTICK_BUILD_GRAMMAR_TEST_EXTENSION=ON`, build `yardstick_test_grammar_loadable_extension`, and run the SQL tests with `YARDSTICK_NATIVE_PEG=1` and `YARDSTICK_GRAMMAR_TEST_EXTENSION` set to the fixture extension's absolute path. The fixture is excluded from normal builds.
+
 Supported build targets are DuckDB **v1.5.5** and the upcoming **v2.0-cyanoptera release branch**. The latter is a moving branch, not a released version. CI requires both targets to build and pass tests; DuckDB `main` runs separately as a scheduled, advisory canary.
 
 Prerequisites:

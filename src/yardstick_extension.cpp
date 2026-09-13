@@ -2,11 +2,15 @@
 
 #include "yardstick_extension.hpp"
 #include "yardstick_parser_extension.hpp"
+#include "frontend_peg.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
+#if YARDSTICK_GRAMMAR_EXTENSION
+#include "duckdb/main/client_config.hpp"
+#endif
 #include "duckdb/logging/logger.hpp"
 
 #include <type_traits>
@@ -81,6 +85,17 @@ extern "C" {
 }
 
 namespace duckdb {
+
+// Rewrites must preserve the caller's grammar while avoiding parser-override
+// recursion. Outside an override, legacy callers retain the default parser.
+static ParserOptions YardstickParserOptions() {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    if (auto *options = CurrentNativeYardstickParserOptions()) {
+        return *options;
+    }
+#endif
+    return ParserOptions();
+}
 
 static std::string RewritePercentileWithinGroup(const std::string &sql) {
     std::string out;
@@ -250,6 +265,9 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
                                                      TableFunctionBindInput &input,
                                                      vector<LogicalType> &return_types,
                                                      vector<YardstickColumnName> &names) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    NativeYardstickParseScope native_scope(nullptr, context.GetParserOptions());
+#endif
     auto data = make_uniq<YardstickQueryData>();
     data->original_sql = input.inputs[0].GetValue<string>();
     if (input.inputs.size() > 1) {
@@ -277,6 +295,14 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
 
     // Execute the rewritten query to get schema
     Connection con(*context.db);
+#if YARDSTICK_GRAMMAR_EXTENSION
+    // The wrapper executes on another connection; preserve the caller's grammar
+    // there too, without changing the caller's activation settings.
+    auto &source_config = ClientConfig::GetConfig(context);
+    auto &execution_config = ClientConfig::GetConfig(*con.context);
+    execution_config.active_grammar_extensions = source_config.active_grammar_extensions;
+    execution_config.cached_grammar = source_config.cached_grammar;
+#endif
     auto query_result = con.Query(data->rewritten_sql);
 
     if (query_result->HasError()) {
@@ -1189,7 +1215,7 @@ static string WarningStatementSql(const string &warnings) {
 }
 
 static bool ParsesAsSingleSelect(const string &sql) {
-    Parser parser;
+    Parser parser(YardstickParserOptions());
     try {
         parser.ParseQuery(sql);
     } catch (...) {
@@ -1823,7 +1849,7 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
             // Wrap in table function call
             string wrapper_sql = YardstickWrapperSql(expanded_sql, warnings);
 
-            Parser parser;
+            Parser parser(YardstickParserOptions());
             parser.ParseQuery(wrapper_sql);
             auto statements = std::move(parser.statements);
 
@@ -1842,7 +1868,7 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
     }
 
     if (had_measure_rewrite) {
-        Parser parser;
+        Parser parser(YardstickParserOptions());
         try {
             parser.ParseQuery(sql_to_check);
         } catch (std::exception &e) {
@@ -1873,9 +1899,12 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
 // PARSER OVERRIDE: intercepts ALL queries before DuckDB's native parser
 //=============================================================================
 
-ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
+ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
                                                 const std::string &query,
                                                 ParserOptions &options) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    NativeYardstickParseScope native_scope(info, options);
+#endif
     // Strip SEMANTIC prefix if present (backwards compatibility)
     std::string sql_to_check = query;
     std::string semantic_stripped;
@@ -1883,6 +1912,12 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
     if (had_semantic_prefix) {
         sql_to_check = semantic_stripped;
     }
+
+    bool native_has_measure = false;
+    bool native_parsed = false;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    native_parsed = NormalizeYardstickGrammar(info, options, sql_to_check, native_has_measure);
+#endif
 
     // Check for DROP VIEW on measure views
     if (yardstick_drop_measure_view_from_sql(sql_to_check.c_str())) {
@@ -1892,7 +1927,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
 
     bool had_measure_rewrite = false;
     std::vector<MeasureViewSnapshot> permanent_snapshots;
-    if (yardstick_has_as_measure(sql_to_check.c_str())) {
+    if (native_parsed ? native_has_measure : yardstick_has_as_measure(sql_to_check.c_str())) {
         auto measure_rewrite = RewriteMeasureViewsStatementByStatement(sql_to_check, permanent_snapshots);
         if (!measure_rewrite.error.empty()) {
             RestoreMeasureViewSnapshots(permanent_snapshots);
@@ -1929,7 +1964,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
             // Validate the expanded SQL parses. If expansion produced garbage
             // (e.g. because AGGREGATE() was actually DuckDB's list aggregate
             // function, not a yardstick measure), fall through to the native parser.
-            Parser validation_parser;
+            Parser validation_parser(YardstickParserOptions());
             try {
                 validation_parser.ParseQuery(expanded_sql);
             } catch (...) {
@@ -1946,7 +1981,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
 
             if (is_select) {
                 string wrapper_sql = YardstickWrapperSql(expanded_sql, warnings);
-                Parser parser;
+                Parser parser(YardstickParserOptions());
                 parser.ParseQuery(wrapper_sql);
                 RestoreMeasureViewSnapshots(permanent_snapshots);
                 return ParserOverrideResult(std::move(parser.statements));
@@ -1955,12 +1990,12 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
             if (!warnings.empty()) {
                 string warning_sql;
                 if (TryWarningWrappedNonSelectSql(expanded_sql, warnings, warning_sql)) {
-                    Parser parser;
+                    Parser parser(YardstickParserOptions());
                     parser.ParseQuery(warning_sql);
                     RestoreMeasureViewSnapshots(permanent_snapshots);
                     return ParserOverrideResult(std::move(parser.statements));
                 }
-                Parser parser;
+                Parser parser(YardstickParserOptions());
                 parser.ParseQuery(WarningStatementSql(warnings) + "; " + expanded_sql);
                 RestoreMeasureViewSnapshots(permanent_snapshots);
                 return ParserOverrideResult(std::move(parser.statements));
@@ -1975,7 +2010,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
 
     if (had_measure_rewrite) {
         try {
-            Parser parser;
+            Parser parser(YardstickParserOptions());
             parser.ParseQuery(sql_to_check);
             FreeMeasureViewSnapshots(permanent_snapshots);
             return ParserOverrideResult(std::move(parser.statements));
@@ -2045,7 +2080,7 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
 
                 // Rebind through table function so rewritten SQL executes with normal planning
                 string wrapper_sql = YardstickWrapperSql(expanded_sql, warnings);
-                Parser parser;
+                Parser parser(YardstickParserOptions());
                 parser.ParseQuery(wrapper_sql);
                 auto statements = std::move(parser.statements);
 
@@ -2098,6 +2133,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
     // Register parser extension
     YardstickParserExtension parser;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    parser.parser_info = RegisterYardstickGrammar(db);
+#endif
     #if __has_include("duckdb/main/extension_callback_manager.hpp")
     ParserExtension::Register(config, parser);
     #else
