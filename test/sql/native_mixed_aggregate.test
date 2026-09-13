@@ -1,0 +1,65 @@
+# name: test/sql/native_mixed_aggregate.test
+# description: DuckDB list aggregates do not discard native measure call spans.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE mixed_aggregate_sales(amount INTEGER);
+
+statement ok
+INSERT INTO mixed_aggregate_sales VALUES (10), (20);
+
+statement ok
+CREATE VIEW mixed_aggregate_v AS SELECT SUM(amount) AS MEASURE revenue FROM mixed_aggregate_sales;
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+query IR
+SELECT aggregate([1,2], 'sum'), "AGGREGATE"/*c*/(revenue) FROM mixed_aggregate_v;
+----
+3	30.0
+
+query RI
+SELECT "AGGREGATE"/*c*/(revenue), aggregate([1,2], 'sum') FROM mixed_aggregate_v;
+----
+30.0	3
+
+query IR
+SELECT aggregate([1,2], 'sum'), "AGGREGATE"/*c*/(revenue) AT (ALL) FROM mixed_aggregate_v;
+----
+3	30.0
+
+query I
+SELECT aggregate([1,2], 'sum');
+----
+3
+
+query R
+SELECT aggregate(["AGGREGATE"/* nested */(revenue), 1], 'sum') FROM mixed_aggregate_v;
+----
+31.0
+
+endloop
+
+# The list aggregate is a scalar dimension, not a Yardstick measure. A
+# row-dependent input must remain correlated to the selected dimension.
+statement ok
+CREATE TABLE mixed_list_sales(bucket INTEGER[], amount INTEGER);
+
+statement ok
+INSERT INTO mixed_list_sales VALUES ([1,2], 10), ([1,2], 20), ([3,4], 40);
+
+statement ok
+CREATE VIEW mixed_list_v AS SELECT bucket, SUM(amount) AS MEASURE revenue FROM mixed_list_sales;
+
+query IR rowsort
+SELECT aggregate(bucket, 'sum'), "AGGREGATE"/*c*/(revenue) FROM mixed_list_v;
+----
+3	30.0
+7	40.0

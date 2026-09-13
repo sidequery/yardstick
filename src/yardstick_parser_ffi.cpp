@@ -1717,6 +1717,7 @@ extern "C" YardstickExpressionInfo* yardstick_parse_expression(const char* expr_
     result->inner_expr = nullptr;
     result->is_aggregate = false;
     result->is_identifier = false;
+    result->is_scalar = false;
     result->error = nullptr;
 
     if (!expr_str) {
@@ -1736,6 +1737,7 @@ extern "C" YardstickExpressionInfo* yardstick_parse_expression(const char* expr_
 
         result->sql = safe_strdup(expr->ToString());
         result->is_identifier = expr->GetExpressionClass() == ExpressionClass::COLUMN_REF;
+        result->is_scalar = expr->IsScalar();
         result->is_aggregate = ExpressionContainsAggregate(expr.get());
 
         // If it's a simple aggregate function, extract the function name and inner expr

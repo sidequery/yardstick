@@ -120,6 +120,7 @@ pub struct YardstickExpressionInfo {
     pub is_aggregate: bool,
     pub is_identifier: bool,
     pub error: *const c_char,
+    pub is_scalar: bool,
 }
 
 /// Measure definition from CREATE VIEW AS MEASURE
@@ -452,6 +453,8 @@ pub struct ExpressionInfo {
     pub inner_expr: Option<String>,
     pub is_aggregate: bool,
     pub is_identifier: bool,
+    /// Syntactic independence from column references and subqueries, not foldability.
+    pub is_scalar: bool,
 }
 
 /// Safe wrapper for measure definition
@@ -665,6 +668,9 @@ pub fn parse_select(sql: &str) -> Result<SelectInfo, String> {
 /// assert_eq!(info.aggregate_func, Some("SUM".to_string()));
 /// ```
 pub fn parse_expression(expr: &str) -> Result<ExpressionInfo, String> {
+    if FN_PARSE_EXPRESSION.load(Ordering::SeqCst).is_null() {
+        return Err("Parser FFI not initialized".to_string());
+    }
     let c_expr = CString::new(expr).map_err(|e| format!("Invalid expression string: {e}"))?;
 
     unsafe {
@@ -688,6 +694,7 @@ pub fn parse_expression(expr: &str) -> Result<ExpressionInfo, String> {
             inner_expr: c_str_to_string(info.inner_expr),
             is_aggregate: info.is_aggregate,
             is_identifier: info.is_identifier,
+            is_scalar: info.is_scalar,
         };
 
         yardstick_free_expression_info(info_ptr);

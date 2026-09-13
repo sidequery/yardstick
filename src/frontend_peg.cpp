@@ -333,6 +333,13 @@ YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql_p) {
         result->view_name = duplicate(view.GetViewName().GetIdentifierName());
         result->native_parsed = true;
         result->is_measure_view = !capture.measures.empty();
+        if (!capture.measures.empty() && !view.aliases.empty()) {
+            // Header aliases rename both dimensions and measures after SELECT
+            // binding, including star expansion. Shared metadata is extracted
+            // before binding and cannot safely map those output positions.
+            result->error = duplicate("AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead");
+            return result.release();
+        }
         for (auto &measure : capture.measures) {
             bool top_level = false;
             if (view.query && view.query->node && view.query->node->type == QueryNodeType::SELECT_NODE) {
@@ -416,6 +423,7 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             // suffixes; modifier contents come entirely from ParseResult nodes.
             idx_t depth = 1;
             idx_t close = i + 2;
+            bool multiple_arguments = false;
             for (; close < significant.size(); close++) {
                 auto &text = significant[close]->text;
                 if (text == "(" || text == "[" || text == "{") {
@@ -426,11 +434,16 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
                     }
                 } else if (text == "," && depth == 1) {
                     // DuckDB's list aggregate(list, function) is not a measure.
-                    return nullptr;
+                    multiple_arguments = true;
                 }
             }
             if (close >= significant.size() || close == i + 2) {
                 return nullptr;
+            }
+            if (multiple_arguments) {
+                // Keep scanning for measure calls elsewhere, including inside
+                // the list arguments. Only this function belongs to DuckDB.
+                continue;
             }
             idx_t name_start = i;
             while (name_start >= 2 && significant[name_start - 1]->text == "." &&

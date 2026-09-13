@@ -114,6 +114,7 @@ typedef struct {
     bool is_aggregate;
     bool is_identifier;         /* True if just a column reference */
     const char* error;          /* NULL if success */
+    bool is_scalar;             /* Parser reports no column/subquery dependency, not foldability */
 } YardstickExpressionInfo;
 
 /* =============================================================================

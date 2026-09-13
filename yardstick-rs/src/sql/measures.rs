@@ -5222,14 +5222,27 @@ fn correlation_exprs_for_dim(
 
     // Expression dimensions (function calls, operators, CASE): strip the source
     // table qualifier so inner/outer qualification works, then wrap the outer side
-    // in ANY_VALUE so DuckDB accepts it in grouped context. Only the known table
+    // in ANY_VALUE when it depends on outer rows so DuckDB accepts grouped
+    // context. Only the known table
     // name is stripped; schema qualifiers and struct field access are preserved.
     if is_expression_dim(dim_trim) {
         let table_to_strip = outer_alias.unwrap_or("");
         let unqualified = strip_table_qualifier(dim_trim, table_to_strip);
         let inner_expr = qualify_where_for_inner(&unqualified);
+        let is_scalar = parser_ffi::parse_expression(&unqualified)
+            .map(|info| info.is_scalar)
+            .unwrap_or(false);
         let outer_expr = outer_alias
-            .map(|alias| format!("ANY_VALUE({})", qualify_where_for_outer(&unqualified, alias)))
+            .map(|alias| {
+                let qualified = qualify_where_for_outer(&unqualified, alias);
+                if is_scalar {
+                    // No outer column needs aggregate binding. ANY_VALUE here
+                    // would instead become an aggregate in the inner WHERE.
+                    qualified
+                } else {
+                    format!("ANY_VALUE({qualified})")
+                }
+            })
             .unwrap_or_else(|| dim_trim.to_string());
         return (inner_expr, outer_expr);
     }
