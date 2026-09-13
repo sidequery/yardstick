@@ -2,6 +2,7 @@
 
 #include "yardstick_extension.hpp"
 #include "yardstick_parser_extension.hpp"
+#include "frontend_peg.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
@@ -1873,7 +1874,7 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
 // PARSER OVERRIDE: intercepts ALL queries before DuckDB's native parser
 //=============================================================================
 
-ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
+ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
                                                 const std::string &query,
                                                 ParserOptions &options) {
     // Strip SEMANTIC prefix if present (backwards compatibility)
@@ -1884,6 +1885,12 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
         sql_to_check = semantic_stripped;
     }
 
+    bool native_has_measure = false;
+    bool native_parsed = false;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    native_parsed = NormalizeYardstickGrammar(info, options, sql_to_check, native_has_measure);
+#endif
+
     // Check for DROP VIEW on measure views
     if (yardstick_drop_measure_view_from_sql(sql_to_check.c_str())) {
         // Catalog cleanup done; let DuckDB handle the actual DROP
@@ -1892,7 +1899,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *,
 
     bool had_measure_rewrite = false;
     std::vector<MeasureViewSnapshot> permanent_snapshots;
-    if (yardstick_has_as_measure(sql_to_check.c_str())) {
+    if (native_parsed ? native_has_measure : yardstick_has_as_measure(sql_to_check.c_str())) {
         auto measure_rewrite = RewriteMeasureViewsStatementByStatement(sql_to_check, permanent_snapshots);
         if (!measure_rewrite.error.empty()) {
             RestoreMeasureViewSnapshots(permanent_snapshots);
@@ -2098,6 +2105,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
     // Register parser extension
     YardstickParserExtension parser;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    parser.parser_info = RegisterYardstickGrammar(db);
+#endif
     #if __has_include("duckdb/main/extension_callback_manager.hpp")
     ParserExtension::Register(config, parser);
     #else

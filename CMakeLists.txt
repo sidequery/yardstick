@@ -29,6 +29,7 @@ function(yardstick_detect_apis)
     unset(YARDSTICK_TOKEN_PARSE_FN CACHE)
     unset(YARDSTICK_NEW_EXPR_API CACHE)
     unset(YARDSTICK_RESULT_ACCESSORS CACHE)
+    unset(YARDSTICK_GRAMMAR_EXTENSION CACHE)
     check_cxx_source_compiles("
         #include <duckdb/parser/parser_extension.hpp>
         #include <type_traits>
@@ -44,6 +45,14 @@ function(yardstick_detect_apis)
         #include <duckdb/main/query_result.hpp>
         void probe(duckdb::QueryResult &result) { result.GetTypes(); }
     " YARDSTICK_RESULT_ACCESSORS)
+    check_cxx_source_compiles("
+        #include <duckdb/parser/grammar_extension.hpp>
+        #include <duckdb/parser/peg/compiled_grammar.hpp>
+        void probe(const duckdb::ClientContext &context) {
+            duckdb::CompiledGrammar::Create(context, {\"yardstick\"});
+            duckdb::GrammarChange::PrependChoice(\"Indirection\", \"YardstickAtModifier\");
+        }
+    " YARDSTICK_GRAMMAR_EXTENSION)
     configure_file(src/include/yardstick_compat.hpp.in yardstick_compat.hpp)
     cmake_pop_check_state()
 endfunction()
@@ -139,6 +148,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/yardstick-rs/include)
 set(EXTENSION_SOURCES
     src/yardstick_extension.cpp
     src/yardstick_parser_ffi.cpp
+    src/frontend_peg.cpp
 )
 
 if(NOT COMMAND build_static_extension)
