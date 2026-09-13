@@ -1,0 +1,93 @@
+# name: test/sql/native_view_column_aliases.test
+# description: Explicit view column lists cannot silently rename measure metadata.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE native_column_sales(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO native_column_sales VALUES (2022, 100), (2022, 50), (2023, 225);
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+# Default fallback mode must also reject the view, even though DuckDB replaces
+# the extension diagnostic with its own parse error.
+statement error
+CREATE VIEW native_column_fallback(year, total) AS
+SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
+----
+Parser Error
+
+statement ok
+SET allow_parser_override_extension='strict';
+
+# An output list renames the measure independently of its declaration.
+statement error
+CREATE VIEW native_column_conflict(year, total) AS
+SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
+----
+AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead
+
+# A partial list can rename only a dimension; mapping measure names alone is
+# insufficient to keep correlation metadata correct.
+statement error
+CREATE VIEW native_column_partial(fiscal_year) AS
+SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
+----
+AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead
+
+# Matching lists follow the same explicit unsupported contract.
+statement error
+CREATE VIEW native_column_matching(year, revenue) AS
+SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
+----
+AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead
+
+# Star expansion happens at binding, so projection offsets cannot determine the
+# final output position of a measure.
+statement error
+CREATE VIEW native_column_star(fiscal_year, value, total) AS
+SELECT *, SUM(amount) AS MEASURE revenue FROM native_column_sales;
+----
+AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead
+
+# Rejected replacements must preserve both the view and its existing metadata.
+statement ok
+CREATE OR REPLACE VIEW native_column_existing AS
+SELECT year AS fiscal_year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
+
+statement error
+CREATE OR REPLACE VIEW native_column_existing(year, total) AS
+SELECT year, SUM(amount * 10) AS MEASURE revenue FROM native_column_sales;
+----
+AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead
+
+query IR rowsort
+SELECT fiscal_year, AGGREGATE(revenue) FROM native_column_existing;
+----
+2022	150.0
+2023	225.0
+
+# Ordinary views, including a column called measure, still support header lists.
+statement ok
+CREATE OR REPLACE VIEW native_column_ordinary(fiscal_year, total) AS
+SELECT year, amount AS measure FROM native_column_sales;
+
+query II
+SELECT fiscal_year, total FROM native_column_ordinary ORDER BY fiscal_year, total;
+----
+2022	50
+2022	100
+2023	225
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+endloop

@@ -68,6 +68,7 @@ pub struct YardstickAggregateCallList {
     pub calls: *mut YardstickAggregateCall,
     pub count: usize,
     pub error: *const c_char,
+    pub native_parsed: bool,
 }
 
 /// Information about a single SELECT item
@@ -119,6 +120,7 @@ pub struct YardstickExpressionInfo {
     pub is_aggregate: bool,
     pub is_identifier: bool,
     pub error: *const c_char,
+    pub is_scalar: bool,
 }
 
 /// Measure definition from CREATE VIEW AS MEASURE
@@ -129,6 +131,9 @@ pub struct YardstickMeasureDef {
     pub expression: *const c_char,
     pub aggregate_func: *const c_char,
     pub is_derived: bool,
+    pub expr_start: u32,
+    pub name_end: u32,
+    pub alias_sql: *const c_char,
 }
 
 /// Result from parsing CREATE VIEW with AS MEASURE
@@ -141,6 +146,7 @@ pub struct YardstickCreateViewInfo {
     pub measures: *mut YardstickMeasureDef,
     pub measure_count: usize,
     pub error: *const c_char,
+    pub native_parsed: bool,
 }
 
 /// Single replacement in SQL text
@@ -447,6 +453,8 @@ pub struct ExpressionInfo {
     pub inner_expr: Option<String>,
     pub is_aggregate: bool,
     pub is_identifier: bool,
+    /// Syntactic independence from column references and subqueries, not foldability.
+    pub is_scalar: bool,
 }
 
 /// Safe wrapper for measure definition
@@ -456,6 +464,9 @@ pub struct MeasureDef {
     pub expression: String,
     pub aggregate_func: Option<String>,
     pub is_derived: bool,
+    pub expr_start: u32,
+    pub name_end: u32,
+    pub alias_sql: String,
 }
 
 /// Safe wrapper for CREATE VIEW info
@@ -465,6 +476,8 @@ pub struct CreateViewInfo {
     pub view_name: Option<String>,
     pub clean_sql: Option<String>,
     pub measures: Vec<MeasureDef>,
+    pub native_parsed: bool,
+    pub error: Option<String>,
 }
 
 /// Replacement operation (safe Rust type)
@@ -508,6 +521,10 @@ unsafe fn c_str_to_string(ptr: *const c_char) -> Option<String> {
 /// assert_eq!(calls[0].measure_name, "revenue");
 /// ```
 pub fn find_aggregates(sql: &str) -> Result<Vec<AggregateCall>, String> {
+    find_aggregates_with_source(sql).map(|(calls, _)| calls)
+}
+
+pub(crate) fn find_aggregates_with_source(sql: &str) -> Result<(Vec<AggregateCall>, bool), String> {
     if FN_FIND_AGGREGATES.load(Ordering::SeqCst).is_null() {
         return Err("Parser FFI not initialized".to_string());
     }
@@ -558,8 +575,9 @@ pub fn find_aggregates(sql: &str) -> Result<Vec<AggregateCall>, String> {
             });
         }
 
+        let native_parsed = list.native_parsed;
         yardstick_free_aggregate_list(list_ptr);
-        Ok(result)
+        Ok((result, native_parsed))
     }
 }
 
@@ -650,6 +668,9 @@ pub fn parse_select(sql: &str) -> Result<SelectInfo, String> {
 /// assert_eq!(info.aggregate_func, Some("SUM".to_string()));
 /// ```
 pub fn parse_expression(expr: &str) -> Result<ExpressionInfo, String> {
+    if FN_PARSE_EXPRESSION.load(Ordering::SeqCst).is_null() {
+        return Err("Parser FFI not initialized".to_string());
+    }
     let c_expr = CString::new(expr).map_err(|e| format!("Invalid expression string: {e}"))?;
 
     unsafe {
@@ -673,6 +694,7 @@ pub fn parse_expression(expr: &str) -> Result<ExpressionInfo, String> {
             inner_expr: c_str_to_string(info.inner_expr),
             is_aggregate: info.is_aggregate,
             is_identifier: info.is_identifier,
+            is_scalar: info.is_scalar,
         };
 
         yardstick_free_expression_info(info_ptr);
@@ -684,9 +706,12 @@ pub fn parse_expression(expr: &str) -> Result<ExpressionInfo, String> {
 ///
 /// # Example
 /// ```ignore
-/// let info = parse_create_view("CREATE VIEW metrics AS SELECT SUM(amount) AS revenue AS MEASURE FROM sales")?;
+/// let info = parse_create_view("CREATE VIEW metrics AS SELECT SUM(amount) AS MEASURE revenue FROM sales")?;
 /// ```
 pub fn parse_create_view(sql: &str) -> Result<CreateViewInfo, String> {
+    if FN_PARSE_CREATE_VIEW.load(Ordering::SeqCst).is_null() {
+        return Err("Parser FFI not initialized".to_string());
+    }
     let c_sql = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
 
     unsafe {
@@ -698,7 +723,7 @@ pub fn parse_create_view(sql: &str) -> Result<CreateViewInfo, String> {
         let info = &*info_ptr;
 
         // Check for error
-        if !info.error.is_null() {
+        if !info.error.is_null() && !info.native_parsed {
             let error_msg = c_str_to_string(info.error).unwrap_or_else(|| "Unknown error".to_string());
             yardstick_free_create_view_info(info_ptr);
             return Err(error_msg);
@@ -713,6 +738,9 @@ pub fn parse_create_view(sql: &str) -> Result<CreateViewInfo, String> {
                 expression: c_str_to_string(measure.expression).unwrap_or_default(),
                 aggregate_func: c_str_to_string(measure.aggregate_func),
                 is_derived: measure.is_derived,
+                expr_start: measure.expr_start,
+                name_end: measure.name_end,
+                alias_sql: c_str_to_string(measure.alias_sql).unwrap_or_default(),
             });
         }
 
@@ -721,6 +749,8 @@ pub fn parse_create_view(sql: &str) -> Result<CreateViewInfo, String> {
             view_name: c_str_to_string(info.view_name),
             clean_sql: c_str_to_string(info.clean_sql),
             measures,
+            native_parsed: info.native_parsed,
+            error: c_str_to_string(info.error),
         };
 
         yardstick_free_create_view_info(info_ptr);

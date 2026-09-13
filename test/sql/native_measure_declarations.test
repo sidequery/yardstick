@@ -1,0 +1,254 @@
+# name: test/sql/native_measure_declarations.test
+# description: Native measure declarations preserve expression and alias boundaries.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE native_decl_sales(year INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO native_decl_sales VALUES
+    (2022, 'US', 100), (2022, 'EU', 50),
+    (2023, 'US', 150), (2023, 'EU', 75);
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+# These are ordinary views. Marker text must not become a declaration merely
+# because it occurs in CREATE VIEW source rather than a standalone SELECT.
+statement ok
+CREATE OR REPLACE VIEW native_decl_literals AS
+SELECT 'AS MEASURE fake_single' AS single_text,
+       $$AS MEASURE fake_dollar$$ AS dollar_text,
+       $note$SUM(amount) AS MEASURE fake_tagged$note$ AS tagged_text,
+       7 AS measure
+/* SUM(amount) AS MEASURE fake_block */
+-- SUM(amount) AS MEASURE fake_line
+;
+
+query TTTI
+SELECT * FROM native_decl_literals;
+----
+AS MEASURE fake_single	AS MEASURE fake_dollar	SUM(amount) AS MEASURE fake_tagged	7
+
+# Unicode and marker-looking literals precede the real declaration. Native
+# source offsets must identify the aggregate expression, not a byte in a literal.
+statement ok
+CREATE OR REPLACE VIEW native_decl_trivia AS
+SELECT '東京' AS label,
+       'AS MEASURE phantom' AS note,
+       SUM(COALESCE(amount, 0))AS/* 東京, AS MEASURE fake */MEASURE/* alias */revenue,
+       AVG(amount) AS -- AS MEASURE fake_line
+       MEASURE average_amount
+FROM native_decl_sales;
+
+query TRR
+SELECT label, AGGREGATE(revenue), AGGREGATE(average_amount)
+FROM native_decl_trivia;
+----
+東京	375.0	93.75
+
+# Aliases are identifiers even when they contain spaces, doubled quotes, or
+# non-ASCII characters. Single-quoted aliases are allowed by ColLabelOrString.
+statement ok
+CREATE OR REPLACE VIEW native_decl_aliases AS
+SELECT year,
+       SUM(amount) AS MEASURE "Gross revenue",
+       SUM(amount) AS MEASURE "rev""enue",
+       SUM(amount) AS MEASURE "売上",
+       SUM(amount) AS MEASURE 'Single revenue',
+       SUM(amount) AS MEASURE 'owner''s revenue',
+       SUM(amount) AS MEASURE """surrounded"""
+FROM native_decl_sales;
+
+query RRRRRR
+SELECT AGGREGATE("Gross revenue") AS gross, AGGREGATE("rev""enue") AS escaped,
+       AGGREGATE("売上") AS unicode_name, AGGREGATE("Single revenue") AS single_quoted,
+       AGGREGATE("owner's revenue") AS apostrophe, AGGREGATE("""surrounded""") AS surrounding_quotes
+FROM native_decl_aliases;
+----
+375.0	375.0	375.0	375.0	375.0	375.0
+
+# Plain calls also consume native spans: the legacy scanner cannot recognize
+# the quoted function or trivia between its name and opening parenthesis.
+query RR
+SELECT "AGGREGATE"/* function trivia */("売上") AS unicode_name,
+       "AGGREGATE"("Gross revenue") AS gross
+FROM native_decl_aliases;
+----
+375.0	375.0
+
+# Commas and SELECT tokens inside expressions do not delimit select-list items.
+statement ok
+CREATE OR REPLACE VIEW native_decl_nested AS
+SELECT year,
+       SUM(COALESCE(amount, 0) + (SELECT COALESCE(NULL, 1))) AS MEASURE adjusted,
+       SUM(CASE WHEN region IN ('US', 'EU') THEN amount ELSE 0 END) AS MEASURE revenue
+FROM native_decl_sales;
+
+query IRR rowsort
+SELECT year, AGGREGATE(adjusted), AGGREGATE(revenue) FROM native_decl_nested;
+----
+2022	152.0	150.0
+2023	227.0	225.0
+
+# COUNT DISTINCT must retain nondecomposable classification: adding the two
+# yearly counts would yield four, while recomputing over base rows yields two.
+statement ok
+CREATE OR REPLACE VIEW native_decl_distinct AS
+SELECT year, COUNT(DISTINCT region) AS/* native */MEASURE unique_regions
+FROM native_decl_sales;
+
+query I
+SELECT AGGREGATE(unique_regions) FROM native_decl_distinct;
+----
+2
+
+query II rowsort
+SELECT year, AGGREGATE(unique_regions) FROM native_decl_distinct;
+----
+2022	2
+2023	2
+
+# Metadata extraction must find the query beyond comments, schema qualification,
+# and escaped view names so computed dimensions remain usable in AT modifiers.
+statement ok
+CREATE/* header */OR REPLACE VIEW main."native_decl_""header" AS/* query */
+SELECT year + 1 AS next_year, SUM(amount) AS MEASURE header_revenue
+FROM native_decl_sales;
+
+query R
+SELECT AGGREGATE(header_revenue) AT (SET next_year = 2023)
+FROM main."native_decl_""header";
+----
+150.0
+
+# GROUP BY inside literals or comments cannot suppress root-level grouping for
+# a materialized aggregate projected alongside dimensions.
+statement ok
+CREATE OR REPLACE VIEW native_decl_group_text AS
+SELECT 'GROUP BY' AS label, year,
+       COUNT(DISTINCT region) AS MEASURE regions
+FROM native_decl_sales /* GROUP BY is only a comment */;
+
+query TII rowsort
+SELECT label, year, regions FROM native_decl_group_text;
+----
+GROUP BY	2022	2
+GROUP BY	2023	2
+
+# Window expressions retain their OVER clause and existing measure semantics.
+statement ok
+CREATE OR REPLACE VIEW native_decl_window AS
+SELECT year, region,
+       SUM(amount) OVER (ORDER BY year) AS/* native */MEASURE running_total,
+       SUM(amount) OVER () AS MEASURE "Global total"
+FROM native_decl_sales;
+
+query ITR rowsort
+SELECT year, region, running_total FROM native_decl_window;
+----
+2022	EU	150.0
+2022	US	150.0
+2023	EU	375.0
+2023	US	375.0
+
+query R
+SELECT AGGREGATE("Global total") AT (ALL) FROM native_decl_window;
+----
+375.0
+
+query R
+SELECT AGGREGATE("Global total") FROM native_decl_window;
+----
+1500.0
+
+# Quoted dots are part of a view name, not schema separators. Dropping a
+# temporary shadow must restore the permanent view's original metadata.
+statement ok
+CREATE OR REPLACE VIEW "native.decl_""shadow" AS
+SELECT year, SUM(amount) AS MEASURE shadow_revenue FROM native_decl_sales;
+
+# Both implicit and explicit grouping must quote the correlation's qualifier
+# without introducing an alias that hides the original view name.
+query IR rowsort
+SELECT year, AGGREGATE(shadow_revenue) FROM "native.decl_""shadow";
+----
+2022	150.0
+2023	225.0
+
+query IR rowsort
+SELECT year, AGGREGATE(shadow_revenue)
+FROM "native.decl_""shadow" GROUP BY year;
+----
+2022	150.0
+2023	225.0
+
+query IR rowsort
+SELECT "native.decl_""shadow".year, AGGREGATE(shadow_revenue)
+FROM "native.decl_""shadow" GROUP BY "native.decl_""shadow".year;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE TEMP VIEW "native.decl_""shadow" AS
+SELECT year, SUM(amount * 10) AS MEASURE shadow_revenue FROM native_decl_sales;
+DROP VIEW "native.decl_""shadow";
+CREATE OR REPLACE TABLE native_decl_shadow_restored AS
+SELECT year, AGGREGATE(shadow_revenue) AS revenue FROM "native.decl_""shadow";
+
+query IR rowsort
+SELECT year, revenue FROM native_decl_shadow_restored;
+----
+2022	150.0
+2023	225.0
+
+# Explicit permanent-schema qualification must still distinguish the permanent
+# view from the temporary shadow, including trivia around the separator.
+statement ok
+CREATE TEMP VIEW "native.decl_""shadow" AS
+SELECT year, SUM(amount * 10) AS MEASURE shadow_revenue FROM native_decl_sales;
+DROP VIEW main /* schema */ . "native.decl_""shadow";
+CREATE OR REPLACE TABLE native_decl_shadow_remaining AS
+SELECT year, AGGREGATE(shadow_revenue) AS revenue FROM "native.decl_""shadow";
+
+query IR rowsort
+SELECT year, revenue FROM native_decl_shadow_remaining;
+----
+2022	1500.0
+2023	2250.0
+
+# A declaration in another SELECT scope cannot be registered as a measure of
+# the outer view, even when another declaration is at the root projection.
+# Strict override exposes the extension diagnostic; fallback reports DuckDB's
+# subsequent parse error for the same rejected statement.
+statement ok
+SET allow_parser_override_extension='strict';
+
+statement error
+CREATE OR REPLACE VIEW native_decl_bad_nested AS
+SELECT (SELECT SUM(amount) AS MEASURE hidden FROM native_decl_sales) AS value,
+       SUM(amount) AS MEASURE revenue
+FROM native_decl_sales;
+----
+AS MEASURE declarations must be in the top-level CREATE VIEW projection
+
+statement error
+CREATE OR REPLACE VIEW native_decl_bad_cte AS
+WITH inner_values AS (
+    SELECT SUM(amount) AS MEASURE hidden FROM native_decl_sales
+)
+SELECT * FROM inner_values;
+----
+AS MEASURE declarations must be in the top-level CREATE VIEW projection
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+endloop

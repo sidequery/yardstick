@@ -126,39 +126,34 @@ fn identifier(input: &str) -> IResult<&str, &str> {
 
 /// Parse content with balanced parentheses, handling quoted strings
 fn balanced_parens(input: &str) -> IResult<&str, &str> {
-    let start = input;
     let mut depth = 0;
     let mut i = 0;
-    let chars: Vec<char> = input.chars().collect();
+    let bytes = input.as_bytes();
 
-    while i < chars.len() {
-        match chars[i] {
-            '(' => depth += 1,
-            ')' => {
+    while i < bytes.len() {
+        let after_trivia = skip_ws_and_comments(input, i);
+        if after_trivia != i {
+            i = after_trivia;
+            continue;
+        }
+        if let Some(delimiter) = dollar_quote_delimiter_at(input, i) {
+            let body_start = i + delimiter.len();
+            i = input[body_start..]
+                .find(delimiter)
+                .map_or(bytes.len(), |end| body_start + end + delimiter.len());
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
                 if depth == 0 {
-                    return Ok((&input[i..], &start[..i]));
+                    return Ok((&input[i..], &input[..i]));
                 }
                 depth -= 1;
             }
-            '\'' => {
-                // Skip single-quoted string
-                i += 1;
-                while i < chars.len() && chars[i] != '\'' {
-                    if chars[i] == '\\' && i + 1 < chars.len() {
-                        i += 1; // Skip escaped char
-                    }
-                    i += 1;
-                }
-            }
-            '"' => {
-                // Skip double-quoted string
-                i += 1;
-                while i < chars.len() && chars[i] != '"' {
-                    if chars[i] == '\\' && i + 1 < chars.len() {
-                        i += 1;
-                    }
-                    i += 1;
-                }
+            b'\'' | b'"' | b'`' => {
+                i = skip_source_quote(input, i);
+                continue;
             }
             _ => {}
         }
@@ -166,7 +161,7 @@ fn balanced_parens(input: &str) -> IResult<&str, &str> {
     }
 
     // If we exhausted input without finding closing paren at depth 0
-    Ok(("", start))
+    Ok(("", input))
 }
 
 /// Parse a function call: IDENTIFIER(content)
@@ -206,6 +201,9 @@ pub fn has_as_measure(sql: &str) -> bool {
 
 /// Check if SQL contains AGGREGATE( function
 pub fn has_aggregate_function(sql: &str) -> bool {
+    if let Ok((calls, true)) = parser_ffi::find_aggregates_with_source(sql) {
+        return !calls.is_empty();
+    }
     let chars: Vec<char> = sql.chars().collect();
     let len = chars.len();
     let mut i = 0;
@@ -361,70 +359,32 @@ pub fn has_aggregate_function(sql: &str) -> bool {
 }
 
 fn normalize_identifier_name(name: &str) -> String {
-    name.trim()
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_ascii_lowercase()
+    decode_identifier_name(name.trim()).to_ascii_lowercase()
+}
+
+fn decode_identifier_name(name: &str) -> String {
+    // Decode only a complete quoted token. Catalog names may already contain
+    // literal quote characters, which must not be stripped indiscriminately.
+    if let Some((end, true)) = parse_identifier_token(name, 0) {
+        if end == name.len() {
+            let delimiter = match name.as_bytes()[0] {
+                b'[' => "]",
+                b'`' => "`",
+                _ => "\"",
+            };
+            return name[1..name.len() - 1].replace(&delimiter.repeat(2), delimiter);
+        }
+    }
+    name.to_string()
 }
 
 fn parse_simple_measure_ref(expr: &str) -> Option<(Option<String>, String)> {
-    let trimmed = expr.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    // Validate that the expression is a simple identifier or qualifier.identifier.
-    // Allow any characters inside matched quotes (e.g. "total revenue").
-    let chars: Vec<char> = trimmed.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            '"' => {
-                // Skip quoted identifier contents (any characters allowed inside)
-                i += 1;
-                while i < chars.len() && chars[i] != '"' {
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    return None; // unmatched quote
-                }
-                i += 1;
-            }
-            '`' => {
-                i += 1;
-                while i < chars.len() && chars[i] != '`' {
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    return None;
-                }
-                i += 1;
-            }
-            '[' => {
-                i += 1;
-                while i < chars.len() && chars[i] != ']' {
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    return None;
-                }
-                i += 1;
-            }
-            c if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c.is_ascii_whitespace() => {
-                i += 1;
-            }
-            _ => return None, // disallowed character outside quotes (commas, parens, etc.)
-        }
-    }
-
-    let parts: Vec<&str> = trimmed.split('.').collect();
+    let parts = qualified_identifier_parts(expr)?;
     match parts.as_slice() {
-        [measure] => Some((None, normalize_identifier_name(measure.trim()))),
+        [measure] => Some((None, normalize_identifier_name(measure))),
         [qualifier, measure] => Some((
-            Some(normalize_identifier_name(qualifier.trim())),
-            normalize_identifier_name(measure.trim()),
+            Some(normalize_identifier_name(qualifier)),
+            normalize_identifier_name(measure),
         )),
         _ => None,
     }
@@ -449,7 +409,7 @@ fn measure_columns_for_query_tables(
         let measures: HashSet<String> = view
             .measures
             .iter()
-            .map(|m| normalize_identifier_name(&m.column_name))
+            .map(|m| m.column_name.to_ascii_lowercase())
             .collect();
         if measures.is_empty() {
             continue;
@@ -789,7 +749,7 @@ fn known_measure_names() -> HashSet<String> {
     let views = MEASURE_VIEWS.lock().unwrap();
     views
         .values()
-        .flat_map(|view| view.measures.iter().map(|m| normalize_identifier_name(&m.column_name)))
+        .flat_map(|view| view.measures.iter().map(|m| m.column_name.to_ascii_lowercase()))
         .collect()
 }
 
@@ -955,66 +915,146 @@ pub fn has_measure_at_refs(sql: &str) -> bool {
 }
 
 fn strip_measure_qualifier(measure: &str) -> String {
-    measure
-        .trim()
-        .split('.')
-        .next_back()
-        .unwrap_or(measure.trim())
-        .trim()
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_string()
+    extract_last_qualified_identifier(measure).unwrap_or_else(|| measure.trim().to_string())
 }
 
 /// Check if SQL contains curly brace measure syntax: `{column}`
 pub fn has_curly_brace_measure(sql: &str) -> bool {
-    let mut parser = delimited(
-        char::<_, nom::error::Error<&str>>('{'),
-        take_while1(|c: char| c.is_alphanumeric() || c == '_'),
-        char('}'),
-    );
-
-    let mut remaining = sql;
-    while !remaining.is_empty() {
-        if parser(remaining).is_ok() {
-            return true;
-        }
-        if remaining.len() > 1 {
-            remaining = &remaining[1..];
-        } else {
-            break;
-        }
-    }
-    false
+    !curly_brace_measure_spans(sql).is_empty()
 }
 
 /// Convert curly brace syntax `{column}` to `AGGREGATE(column)`
 pub fn expand_curly_braces(sql: &str) -> String {
-    let mut result = String::new();
-    let mut chars = sql.chars().peekable();
+    let mut result = String::with_capacity(sql.len());
+    let mut cursor = 0;
+    for (start, end) in curly_brace_measure_spans(sql) {
+        result.push_str(&sql[cursor..start]);
+        result.push_str("AGGREGATE(");
+        result.push_str(&sql[start + 1..end - 1]);
+        result.push(')');
+        cursor = end;
+    }
+    result.push_str(&sql[cursor..]);
+    result
+}
 
-    while let Some(c) = chars.next() {
-        if c == '{' {
-            let mut ident = String::new();
-            while let Some(&next) = chars.peek() {
-                if next == '}' {
-                    chars.next();
+// Both entry points must recognize exactly the same syntax. Only identifier
+// references are shorthand: DuckDB struct/map literals and incomplete input
+// retain their original bytes for the SQL parser to interpret.
+fn curly_brace_measure_spans(sql: &str) -> Vec<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        i = skip_ws_and_comments(sql, i);
+        if i == bytes.len() {
+            break;
+        }
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            i = skip_source_quote(sql, i);
+            continue;
+        }
+        if let Some(delimiter) = dollar_quote_delimiter_at(sql, i) {
+            let body_start = i + delimiter.len();
+            i = sql[body_start..]
+                .find(delimiter)
+                .map_or(bytes.len(), |end| body_start + end + delimiter.len());
+            continue;
+        }
+        if bytes[i] == b'{' {
+            if let Some(end) = curly_brace_reference_end(sql, i + 1) {
+                spans.push((i, end));
+                i = end;
+                continue;
+            }
+        }
+        // Byte scanning is safe here: only ASCII delimiters create slices.
+        i += 1;
+    }
+    spans
+}
+
+fn curly_brace_reference_end(sql: &str, mut i: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    loop {
+        i = skip_ws_and_comments(sql, i);
+        let first = sql.get(i..)?.chars().next()?;
+        if first == '"' {
+            let (end, _) = parse_identifier_token(sql, i)?;
+            i = end;
+        } else {
+            if first != '_' && !first.is_alphabetic() {
+                return None;
+            }
+            i += first.len_utf8();
+            while let Some(ch) = sql[i..].chars().next() {
+                if !ch.is_alphanumeric() && ch != '_' && ch != '$' {
                     break;
                 }
-                ident.push(chars.next().unwrap());
+                i += ch.len_utf8();
             }
-            if !ident.is_empty() {
-                result.push_str(&format!("AGGREGATE({ident})"));
-            } else {
-                result.push('{');
-            }
-        } else {
-            result.push(c);
+        }
+        i = skip_ws_and_comments(sql, i);
+        match bytes.get(i) {
+            Some(b'.') => i += 1,
+            Some(b'}') => return Some(i + 1),
+            _ => return None,
         }
     }
-    result
+}
+
+fn skip_ws_and_comments(sql: &str, mut i: usize) -> usize {
+    let bytes = sql.as_bytes();
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+        } else if bytes[i..].starts_with(b"--") {
+            i += 2;
+            while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
+                i += 1;
+            }
+        } else if bytes[i..].starts_with(b"/*") {
+            i += 2;
+            let mut depth = 1;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+fn skip_source_quote(sql: &str, mut i: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let quote = bytes[i];
+    if quote != b'\'' || !is_escape_string_quote_at(sql, i) {
+        return skip_quoted_sql(bytes, i, quote);
+    }
+    i += 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(bytes.len());
+        } else if bytes[i] == quote {
+            i += 1;
+            if i == bytes.len() || bytes[i] != quote {
+                break;
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    i
 }
 
 // =============================================================================
@@ -1452,6 +1492,13 @@ pub fn extract_aggregate_with_at(sql: &str) -> Vec<(String, ContextModifier, usi
 
 /// Extract all AGGREGATE() calls without AT
 pub fn extract_all_aggregate_calls(sql: &str) -> Vec<(String, usize, usize)> {
+    if let Ok((calls, true)) = parser_ffi::find_aggregates_with_source(sql) {
+        return calls
+            .into_iter()
+            .filter(|call| call.modifiers.is_empty() && parse_simple_measure_ref(&call.measure_name).is_some())
+            .map(|call| (call.measure_name, call.start_pos as usize, call.end_pos as usize))
+            .collect();
+    }
     let mut results = Vec::new();
 
     for start in aggregate_call_starts_outside_literals(sql) {
@@ -1618,36 +1665,42 @@ fn insert_primary_table_alias(sql: &str, alias: &str) -> Option<String> {
 
 /// Extract the SELECT/WITH query from a CREATE VIEW statement
 fn extract_view_query(sql: &str) -> Option<String> {
-    let trimmed = sql.trim();
-    let upper = trimmed.to_uppercase();
-    if upper.starts_with("SELECT ") || upper.starts_with("WITH ") {
-        return Some(trimmed.to_string());
+    let upper = sql.to_ascii_uppercase();
+    let mut position = skip_ws_and_comments(sql, 0);
+    if matches_keyword_at(&upper, position, "SELECT") || matches_keyword_at(&upper, position, "WITH") {
+        return Some(sql[position..].trim_end().to_string());
     }
-
-    let (rest, _) = create_view_header(trimmed).ok()?;
-    let rest_trimmed = rest.trim_start();
-    let rest_upper = rest_trimmed.to_uppercase();
-
-    if rest_upper.starts_with("AS ") {
-        return Some(rest_trimmed[2..].trim_start().to_string());
-    }
-
-    if rest_upper.starts_with("AS") && rest_trimmed.len() > 2 {
-        let after_as = &rest_trimmed[2..];
-        if after_as
-            .chars()
-            .next()
-            .map_or(false, |ch| ch.is_whitespace())
-        {
-            return Some(after_as.trim_start().to_string());
+    let consume = |position: &mut usize, keyword: &str| {
+        if !matches_keyword_at(&upper, *position, keyword) {
+            return false;
         }
+        *position = skip_ws_and_comments(sql, *position + keyword.len());
+        true
+    };
+    if !consume(&mut position, "CREATE") {
+        return None;
     }
-
-    if rest_upper.starts_with("SELECT") || rest_upper.starts_with("WITH") {
-        return Some(rest_trimmed.to_string());
+    if consume(&mut position, "OR") && !consume(&mut position, "REPLACE") {
+        return None;
     }
-
-    None
+    if !consume(&mut position, "TEMPORARY") {
+        consume(&mut position, "TEMP");
+    }
+    if !consume(&mut position, "VIEW") {
+        return None;
+    }
+    if consume(&mut position, "IF")
+        && (!consume(&mut position, "NOT") || !consume(&mut position, "EXISTS"))
+    {
+        return None;
+    }
+    position = parse_qualified_name_span(sql, position)?;
+    // AS in a quoted name, explicit column list, or view options is not the
+    // query delimiter. The native parser validates the header; retain the
+    // original query spelling for shared dimension and relation extraction.
+    let delimiter = find_top_level_keyword(sql, "AS", position)?;
+    let query_start = skip_ws_and_comments(sql, delimiter + "AS".len());
+    (query_start < sql.len()).then(|| sql[query_start..].trim_end().to_string())
 }
 
 fn is_boundary_char(ch: Option<char>) -> bool {
@@ -1664,92 +1717,27 @@ fn is_statement_tail(sql: &str, mut idx: usize) -> bool {
     idx == bytes.len()
 }
 
-fn skip_ws_and_comments(sql: &str, mut idx: usize) -> usize {
-    let bytes = sql.as_bytes();
-    while idx < bytes.len() {
-        if bytes[idx].is_ascii_whitespace() {
-            idx += 1;
-            continue;
+fn qualified_identifier_parts(input: &str) -> Option<Vec<&str>> {
+    let bytes = input.as_bytes();
+    let mut parts = Vec::new();
+    let mut i = skip_ws_and_comments(input, 0);
+    loop {
+        let (end, _) = parse_identifier_token(input, i)?;
+        parts.push(&input[i..end]);
+        i = skip_ws_and_comments(input, end);
+        if i == bytes.len() {
+            return Some(parts);
         }
-        if bytes[idx] == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
-            idx += 2;
-            while idx < bytes.len() {
-                let ch = bytes[idx];
-                idx += 1;
-                if ch == b'\n' || ch == b'\r' {
-                    break;
-                }
-            }
-            continue;
+        if bytes[i] != b'.' {
+            return None;
         }
-        if bytes[idx] == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
-            idx += 2;
-            while idx + 1 < bytes.len() {
-                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
-                    idx += 2;
-                    break;
-                }
-                idx += 1;
-            }
-            if idx + 1 >= bytes.len() {
-                idx = bytes.len();
-            }
-            continue;
-        }
-        break;
+        i = skip_ws_and_comments(input, i + 1);
     }
-    idx
-}
-
-fn is_ident_start_byte(b: u8) -> bool {
-    (b as char).is_ascii_alphabetic() || b == b'_'
-}
-
-fn is_ident_part_byte(b: u8) -> bool {
-    (b as char).is_ascii_alphanumeric() || b == b'_'
-}
-
-fn strip_identifier_quotes(input: &str) -> &str {
-    if input.len() >= 2 {
-        let bytes = input.as_bytes();
-        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
-        if (first == b'"' && last == b'"')
-            || (first == b'`' && last == b'`')
-            || (first == b'[' && last == b']')
-        {
-            return &input[1..input.len() - 1];
-        }
-    }
-    input
 }
 
 fn extract_last_qualified_identifier(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut i = skip_ws_and_comments(input, 0);
-    let (end, _) = parse_identifier_token(input, i)?;
-    let mut last_start = i;
-    let mut last_end = end;
-    i = end;
-
-    loop {
-        let mut j = skip_ws_and_comments(input, i);
-        if j >= bytes.len() || bytes[j] != b'.' {
-            break;
-        }
-        j += 1;
-        j = skip_ws_and_comments(input, j);
-        let (next_end, _) = parse_identifier_token(input, j)?;
-        last_start = j;
-        last_end = next_end;
-        i = next_end;
-    }
-
-    let tail = skip_ws_and_comments(input, i);
-    if tail < bytes.len() {
-        return None;
-    }
-
-    Some(strip_identifier_quotes(input[last_start..last_end].trim()).to_string())
+    let parts = qualified_identifier_parts(input)?;
+    parts.last().map(|name| decode_identifier_name(name))
 }
 
 fn parse_identifier_token(sql: &str, start: usize) -> Option<(usize, bool)> {
@@ -1767,7 +1755,7 @@ fn parse_identifier_token(sql: &str, start: usize) -> Option<(usize, bool)> {
         let mut i = start + 1;
         while i < bytes.len() {
             if bytes[i] == end_char {
-                if end_char == b'"' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == end_char {
                     i += 2;
                     continue;
                 }
@@ -1777,12 +1765,16 @@ fn parse_identifier_token(sql: &str, start: usize) -> Option<(usize, bool)> {
         }
         return None;
     }
-    if !is_ident_start_byte(first) {
+    let first_char = sql.get(start..)?.chars().next()?;
+    if !first_char.is_alphabetic() && first_char != '_' {
         return None;
     }
-    let mut i = start + 1;
-    while i < bytes.len() && is_ident_part_byte(bytes[i]) {
-        i += 1;
+    let mut i = start + first_char.len_utf8();
+    while let Some(ch) = sql[i..].chars().next() {
+        if !ch.is_alphanumeric() && ch != '_' && ch != '$' {
+            break;
+        }
+        i += ch.len_utf8();
     }
     Some((i, false))
 }
@@ -1856,7 +1848,7 @@ fn parse_alias_span(sql: &str, start: usize) -> Option<(usize, String)> {
 }
 
 fn find_top_level_keyword(sql: &str, keyword: &str, start: usize) -> Option<usize> {
-    let upper = sql.to_uppercase();
+    let upper = sql.to_ascii_uppercase();
     let upper_bytes = upper.as_bytes();
     let keyword_upper = keyword.to_uppercase();
     let keyword_parts: Vec<&str> = keyword_upper.split_whitespace().collect();
@@ -3872,20 +3864,40 @@ fn strip_at_where_qualifiers(condition: &str) -> String {
     result
 }
 
-fn rewrite_percentile_within_group(sql: &str) -> String {
-    let upper = sql.to_uppercase();
+pub(crate) fn rewrite_percentile_within_group(sql: &str) -> String {
+    let upper = sql.to_ascii_uppercase();
     let upper_bytes = upper.as_bytes();
     let bytes = sql.as_bytes();
     let mut out = String::new();
     let mut i = 0;
+    let mut copied_until = 0;
 
     while i < bytes.len() {
+        let after_trivia = skip_ws_and_comments(sql, i);
+        if after_trivia != i {
+            i = after_trivia;
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            i = skip_source_quote(sql, i);
+            continue;
+        }
+        if let Some(delimiter) = dollar_quote_delimiter_at(sql, i) {
+            let body_start = i + delimiter.len();
+            i = sql[body_start..]
+                .find(delimiter)
+                .map_or(bytes.len(), |end| body_start + end + delimiter.len());
+            continue;
+        }
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            i += 1;
+            continue;
+        }
         let (func_name, quantile_name) = if upper_bytes[i..].starts_with(b"PERCENTILE_CONT") {
             ("PERCENTILE_CONT", "QUANTILE_CONT")
         } else if upper_bytes[i..].starts_with(b"PERCENTILE_DISC") {
             ("PERCENTILE_DISC", "QUANTILE_DISC")
         } else {
-            out.push(bytes[i] as char);
             i += 1;
             continue;
         };
@@ -3896,7 +3908,6 @@ fn rewrite_percentile_within_group(sql: &str) -> String {
             j += 1;
         }
         if j >= bytes.len() || bytes[j] != b'(' {
-            out.push(bytes[i] as char);
             i += 1;
             continue;
         }
@@ -3905,7 +3916,6 @@ fn rewrite_percentile_within_group(sql: &str) -> String {
         let (after_args, args) = match balanced_parens(&sql[args_start..]) {
             Ok(res) => res,
             Err(_) => {
-                out.push(bytes[i] as char);
                 i += 1;
                 continue;
             }
@@ -3913,7 +3923,6 @@ fn rewrite_percentile_within_group(sql: &str) -> String {
         let args_len = args.len();
         let args_end = args_start + args_len;
         if args_end >= sql.len() || !after_args.starts_with(')') {
-            out.push(bytes[i] as char);
             i += 1;
             continue;
         }
@@ -3923,7 +3932,6 @@ fn rewrite_percentile_within_group(sql: &str) -> String {
             k += 1;
         }
         if k >= bytes.len() || !upper_bytes[k..].starts_with(b"WITHIN") {
-            out.push(bytes[i] as char);
             i += 1;
             continue;
         }
@@ -3932,7 +3940,6 @@ fn rewrite_percentile_within_group(sql: &str) -> String {
             k += 1;
         }
         if k >= bytes.len() || !upper_bytes[k..].starts_with(b"GROUP") {
-            out.push(bytes[i] as char);
             i += 1;
             continue;
         }
@@ -3941,7 +3948,6 @@ fn rewrite_percentile_within_group(sql: &str) -> String {
             k += 1;
         }
         if k >= bytes.len() || bytes[k] != b'(' {
-            out.push(bytes[i] as char);
             i += 1;
             continue;
         }
@@ -3950,7 +3956,6 @@ fn rewrite_percentile_within_group(sql: &str) -> String {
         let (after_inner, inner) = match balanced_parens(&sql[inner_start..]) {
             Ok(res) => res,
             Err(_) => {
-                out.push(bytes[i] as char);
                 i += 1;
                 continue;
             }
@@ -3958,7 +3963,6 @@ fn rewrite_percentile_within_group(sql: &str) -> String {
         let inner_len = inner.len();
         let inner_end = inner_start + inner_len;
         if inner_end >= sql.len() || !after_inner.starts_with(')') {
-            out.push(bytes[i] as char);
             i += 1;
             continue;
         }
@@ -3966,24 +3970,25 @@ fn rewrite_percentile_within_group(sql: &str) -> String {
         let inner_trim = inner.trim();
         let inner_upper = inner_trim.to_uppercase();
         if !inner_upper.starts_with("ORDER BY") {
-            out.push(bytes[i] as char);
             i += 1;
             continue;
         }
         let order_expr = inner_trim["ORDER BY".len()..].trim();
         if order_expr.is_empty() {
-            out.push(bytes[i] as char);
             i += 1;
             continue;
         }
 
+        out.push_str(&sql[copied_until..i]);
         out.push_str(&format!(
             "{quantile_name}({order_expr}, {})",
             args.trim()
         ));
         i = inner_end + 1;
+        copied_until = i;
     }
 
+    out.push_str(&sql[copied_until..]);
     out
 }
 
@@ -4408,7 +4413,22 @@ fn sanitize_non_ascii_in_sql_comments(sql: &str) -> String {
 
 /// Process CREATE VIEW statement, extracting AS MEASURE definitions
 pub fn process_create_view(sql: &str) -> CreateViewResult {
-    if !has_as_measure(sql) {
+    let native = parser_ffi::parse_create_view(sql)
+        .ok()
+        .filter(|info| info.native_parsed);
+    if let Some(error) = native.as_ref().and_then(|info| info.error.clone()) {
+        return CreateViewResult {
+            is_measure_view: false,
+            view_name: None,
+            clean_sql: sql.to_string(),
+            measures: vec![],
+            error: Some(error),
+        };
+    }
+    let has_measure = native
+        .as_ref()
+        .map_or_else(|| has_as_measure(sql), |info| info.is_measure_view);
+    if !has_measure {
         return CreateViewResult {
             is_measure_view: false,
             view_name: None,
@@ -4418,7 +4438,10 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
         };
     }
 
-    let result = extract_measures_from_sql(sql);
+    let result = match native {
+        Some(info) => extract_native_measures(sql, info),
+        None => extract_measures_from_sql(sql),
+    };
 
     match result {
         Ok((clean_sql, measures, view_name, base_table)) => {
@@ -4467,6 +4490,40 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
     }
 }
 
+struct MeasureDeclaration {
+    name: String,
+    alias_sql: String,
+    expression: String,
+    expr_start: usize,
+    name_end: usize,
+}
+
+fn extract_native_measures(
+    sql: &str,
+    info: parser_ffi::CreateViewInfo,
+) -> Result<(String, Vec<ViewMeasure>, Option<String>, Option<String>)> {
+    let mut declarations = Vec::with_capacity(info.measures.len());
+    let mut previous_end = 0;
+    for measure in info.measures {
+        let start = measure.expr_start as usize;
+        let end = measure.name_end as usize;
+        if start < previous_end || start >= end || sql.get(start..end).is_none() {
+            return Err(YardstickError::SqlParse(
+                "Invalid native measure declaration span".to_string(),
+            ));
+        }
+        previous_end = end;
+        declarations.push(MeasureDeclaration {
+            name: measure.column_name,
+            alias_sql: measure.alias_sql,
+            expression: measure.expression,
+            expr_start: start,
+            name_end: end,
+        });
+    }
+    lower_measure_declarations(sql, declarations, info.view_name)
+}
+
 /// Extract measures from SQL using nom-based parsing
 /// Returns (clean_sql, measures, view_name, base_table)
 fn extract_measures_from_sql(
@@ -4475,17 +4532,10 @@ fn extract_measures_from_sql(
     let sanitized_sql = sanitize_non_ascii_in_sql_comments(sql);
     let sql = sanitized_sql.as_str();
     let view_name = extract_view_name(sql);
-    let base_table = extract_table_name_from_sql(sql);
     let sql_upper = sql.to_ascii_uppercase();
 
     // First pass: collect all measures with positions
-    struct MeasureInfo {
-        name: String,
-        expression: String,
-        expr_start: usize,
-        name_end: usize,
-    }
-    let mut measure_infos: Vec<MeasureInfo> = Vec::new();
+    let mut measure_infos = Vec::new();
 
     let mut search_pos = 0;
     while let Some(offset) = sql_upper[search_pos..].find(" AS MEASURE ") {
@@ -4497,8 +4547,9 @@ fn extract_measures_from_sql(
             let expr_start = find_expression_start(sql, pattern_start);
             let expression = sql[expr_start..pattern_start].trim().to_string();
 
-            measure_infos.push(MeasureInfo {
+            measure_infos.push(MeasureDeclaration {
                 name: name.to_string(),
+                alias_sql: name.to_string(),
                 expression,
                 expr_start,
                 name_end,
@@ -4510,6 +4561,15 @@ fn extract_measures_from_sql(
         }
     }
 
+    lower_measure_declarations(sql, measure_infos, view_name)
+}
+
+fn lower_measure_declarations(
+    sql: &str,
+    measure_infos: Vec<MeasureDeclaration>,
+    view_name: Option<String>,
+) -> Result<(String, Vec<ViewMeasure>, Option<String>, Option<String>)> {
+    let base_table = extract_table_name_from_sql(sql);
     // Replace measured expressions:
     // - decomposable measures become NULL placeholders (virtual columns)
     // - non-decomposable measures keep their aggregate expression for direct querying
@@ -4527,9 +4587,9 @@ fn extract_measures_from_sql(
             info.expr_start,
             info.name_end,
             if is_non_decomp || is_window {
-                format!("{} AS {}", info.expression.trim(), info.name)
+                format!("{} AS {}", info.expression.trim(), info.alias_sql)
             } else {
-                format!("NULL AS {}", info.name)
+                format!("NULL AS {}", info.alias_sql)
             },
         ));
     }
@@ -4560,13 +4620,13 @@ fn extract_measures_from_sql(
 
     // Non-decomposable measures (e.g., COUNT DISTINCT, MEDIAN) kept as aggregates
     // require grouping to form a valid view if dimensions are projected.
-    if has_materialized_non_decomposable && !has_group_by_anywhere(&clean_sql) {
-        let upper = clean_sql.to_uppercase();
-        let insert_pos = ["ORDER BY", "LIMIT", "HAVING", ";"]
+    if has_materialized_non_decomposable && !has_top_level_group_by(&clean_sql) {
+        let statement_end = clean_sql.trim_end().strip_suffix(';').map_or(clean_sql.len(), str::len);
+        let insert_pos = ["ORDER BY", "LIMIT", "HAVING"]
             .iter()
-            .filter_map(|kw| upper.find(kw))
+            .filter_map(|kw| find_top_level_keyword(&clean_sql, kw, 0))
             .min()
-            .unwrap_or(clean_sql.len());
+            .unwrap_or(statement_end);
         clean_sql = format!(
             "{} GROUP BY ALL{}",
             clean_sql[..insert_pos].trim_end(),
@@ -5154,7 +5214,7 @@ fn correlation_exprs_for_dim(
             dim_trim.to_string()
         } else {
             outer_alias
-                .map(|alias| format!("{alias}.{dim_name}"))
+                .map(|alias| qualify_where_for_outer(dim_name, alias))
                 .unwrap_or_else(|| dim_name.to_string())
         };
         return (inner_expr, outer_expr);
@@ -5162,14 +5222,27 @@ fn correlation_exprs_for_dim(
 
     // Expression dimensions (function calls, operators, CASE): strip the source
     // table qualifier so inner/outer qualification works, then wrap the outer side
-    // in ANY_VALUE so DuckDB accepts it in grouped context. Only the known table
+    // in ANY_VALUE when it depends on outer rows so DuckDB accepts grouped
+    // context. Only the known table
     // name is stripped; schema qualifiers and struct field access are preserved.
     if is_expression_dim(dim_trim) {
         let table_to_strip = outer_alias.unwrap_or("");
         let unqualified = strip_table_qualifier(dim_trim, table_to_strip);
         let inner_expr = qualify_where_for_inner(&unqualified);
+        let is_scalar = parser_ffi::parse_expression(&unqualified)
+            .map(|info| info.is_scalar)
+            .unwrap_or(false);
         let outer_expr = outer_alias
-            .map(|alias| format!("ANY_VALUE({})", qualify_where_for_outer(&unqualified, alias)))
+            .map(|alias| {
+                let qualified = qualify_where_for_outer(&unqualified, alias);
+                if is_scalar {
+                    // No outer column needs aggregate binding. ANY_VALUE here
+                    // would instead become an aggregate in the inner WHERE.
+                    qualified
+                } else {
+                    format!("ANY_VALUE({qualified})")
+                }
+            })
             .unwrap_or_else(|| dim_trim.to_string());
         return (inner_expr, outer_expr);
     }
@@ -5179,7 +5252,7 @@ fn correlation_exprs_for_dim(
         dim_trim.to_string()
     } else {
         outer_alias
-            .map(|alias| format!("{alias}.{dim_name}"))
+            .map(|alias| qualify_where_for_outer(dim_name, alias))
             .unwrap_or_else(|| dim_name.to_string())
     };
     (inner_expr, outer_expr)
@@ -7516,7 +7589,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
             let _ = outer_ref_for_eval;
             let _ = outer_where_ref;
             let _ = eval_group_by_cols;
-            format!("{}({measure_lookup_name})", resolved.agg_fn)
+            format!("{}({measure_name})", resolved.agg_fn)
         } else if !expression_for_eval.is_empty() {
             let eval_sql = if use_default_context {
                 expand_non_decomposable_default_context(
@@ -7543,7 +7616,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
                 eval_sql
             }
         } else {
-            format!("{}({measure_lookup_name})", resolved.agg_fn)
+            format!("{}({measure_name})", resolved.agg_fn)
         };
         result_sql = format!(
             "{}{}{}",
@@ -9404,6 +9477,92 @@ FROM orders"#;
     }
 
     #[test]
+    fn test_measure_identifier_decoding() {
+        for (sql, qualifier, name) in [
+            ("Revenue", None, "revenue"),
+            (r#""Rev""Enue""#, None, "rev\"enue"),
+            (r#""net.revenue""#, None, "net.revenue"),
+            (r#""v.name"."Rev""Enue""#, Some("v.name"), "rev\"enue"),
+            (r#""""quoted""""#, None, "\"quoted\""),
+            ("売上", None, "売上"),
+            ("集計.売上", Some("集計"), "売上"),
+            ("v /* qualifier */ . Revenue", Some("v"), "revenue"),
+            ("[net.revenue]", None, "net.revenue"),
+            ("`net``revenue`", None, "net`revenue"),
+        ] {
+            assert_eq!(
+                parse_simple_measure_ref(sql),
+                Some((qualifier.map(str::to_string), name.to_string())),
+                "{sql}"
+            );
+            assert_eq!(strip_measure_qualifier(sql).to_ascii_lowercase(), name);
+        }
+        assert_eq!(normalize_identifier_name("rev\"enue"), "rev\"enue");
+        assert_eq!(
+            extract_last_qualified_identifier(r#"schema."view.with""quotes""#),
+            Some("view.with\"quotes".to_string())
+        );
+    }
+
+    #[test]
+    fn test_measure_identifier_rejects_expressions_and_incomplete_references() {
+        for sql in [
+            "", "123", "revenue + 1", "sum(revenue)", "a b", "a..b", "a.",
+            ".a", "a,b", "'revenue'", "\"unterminated", "a.\"unterminated",
+            "\"revenue\"suffix", "revenue::int",
+        ] {
+            assert_eq!(parse_simple_measure_ref(sql), None, "{sql}");
+            assert_eq!(extract_last_qualified_identifier(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_curly_braces_preserve_sql_literals_and_trivia() {
+        for sql in [
+            "SELECT '{revenue}', 'it''s {revenue}'",
+            r#"SELECT "{revenue}", "escaped""{revenue}""name""#,
+            r"SELECT E'escaped\' {revenue}', E'\\{revenue}'",
+            "SELECT $$ {revenue} $$, $tag$ {revenue} $tag$",
+            "SELECT 1 -- {revenue}\n/* {revenue} */",
+            "SELECT 1 /* outer /* nested */ {revenue} */",
+            "SELECT {'revenue': 1}, {revenue: 1}, MAP {'revenue': 1}",
+            "SELECT {}, {revenue, other}, {revenue + other}, {123}",
+            "SELECT {revenue", "SELECT {revenue /* unfinished",
+            "SELECT '{revenue}", "SELECT $$ {revenue}",
+            "SELECT '日本語', café FROM t",
+        ] {
+            assert!(!has_curly_brace_measure(sql), "{sql}");
+            assert_eq!(expand_curly_braces(sql), sql);
+        }
+    }
+
+    #[test]
+    fn test_curly_braces_recognize_qualified_quoted_and_unicode_references() {
+        for reference in [
+            "revenue", "v.revenue", "schema.v.revenue", "売上", "v.売上",
+            r#""net revenue""#, r#""view"."net""revenue""#,
+            " /* dimension */ v /* qualifier */ . revenue ",
+        ] {
+            let sql = format!("SELECT '日本語', {{{reference}}} AT (ALL) FROM t");
+            assert!(has_curly_brace_measure(&sql), "{sql}");
+            assert_eq!(
+                expand_curly_braces(&sql),
+                format!("SELECT '日本語', AGGREGATE({reference}) AT (ALL) FROM t")
+            );
+        }
+    }
+
+    #[test]
+    fn test_curly_braces_expand_only_measure_references_in_mixed_sql() {
+        let sql = "SELECT '{literal}', {revenue}, {'nested': {other}}, $$ {text} $$ /* {comment} */ FROM t";
+        assert!(has_curly_brace_measure(sql));
+        assert_eq!(
+            expand_curly_braces(sql),
+            "SELECT '{literal}', AGGREGATE(revenue), {'nested': AGGREGATE(other)}, $$ {text} $$ /* {comment} */ FROM t"
+        );
+    }
+
+    #[test]
     #[ignore = "requires C++ parser FFI"]
     #[serial]
     fn test_rewrite_measure_at_refs() {
@@ -9487,6 +9646,25 @@ FROM orders"#;
             sql_no_plain_measure,
             &known_measures
         ));
+    }
+
+    #[test]
+    fn test_extract_view_query_preserves_native_headers() {
+        for header in [
+            "CREATE/* header */VIEW v AS",
+            "CREATE OR/* replacement */REPLACE TEMP VIEW v AS",
+            "CREATE VIEW IF NOT EXISTS main.v AS",
+            r#"CREATE VIEW "main"."quoted""view" AS"#,
+            r#"CREATE VIEW main.v ("AS", other) AS"#,
+        ] {
+            let sql = format!("{header}/* query */SELECT year + 1 AS next_year FROM sales");
+            assert_eq!(
+                extract_view_query(&sql),
+                Some("SELECT year + 1 AS next_year FROM sales".to_string()),
+                "{sql}",
+            );
+        }
+        assert_eq!(extract_view_query("CREATE TABLE v AS SELECT 1"), None);
     }
 
     #[test]
@@ -10508,6 +10686,24 @@ GROUP BY s.year";
         let sql = "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY value) AS p50";
         let rewritten = rewrite_percentile_within_group(sql);
         assert!(rewritten.contains("QUANTILE_CONT(value, 0.5)"));
+    }
+
+    #[test]
+    fn test_rewrite_percentile_preserves_source_bytes() {
+        for sql in [
+            "SELECT '東京', 'ß', 売上 FROM t",
+            "SELECT 'PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY value)'",
+            "SELECT $$PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY value)$$",
+            "SELECT 1 /* PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY value) */",
+            r"SELECT E'escaped\' PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY value)'",
+        ] {
+            assert_eq!(rewrite_percentile_within_group(sql), sql);
+        }
+        let sql = "SELECT '東京', PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY 売上), 'ß'";
+        assert_eq!(
+            rewrite_percentile_within_group(sql),
+            "SELECT '東京', QUANTILE_CONT(売上, 0.5), 'ß'"
+        );
     }
 
     #[test]

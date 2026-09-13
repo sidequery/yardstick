@@ -1,0 +1,48 @@
+# name: test/sql/percentile.test
+# description: Shared percentile lowering preserves SQL literals and measure expressions.
+# group: [yardstick]
+
+require yardstick
+
+statement ok
+CREATE TABLE percentile_sales(region VARCHAR, label VARCHAR, amount DOUBLE);
+
+statement ok
+INSERT INTO percentile_sales VALUES
+    ('US', 'café percentile_cont(0.5) WITHIN GROUP (ORDER BY amount)', 10),
+    ('US', 'café percentile_cont(0.5) WITHIN GROUP (ORDER BY amount)', 30);
+
+# Real percentile calls are canonicalized before storage. Percentile-looking
+# text inside a measure's string literal must still match the original data.
+statement ok
+CREATE VIEW percentile_sales_v AS
+SELECT region,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS MEASURE continuous_median,
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY amount) AS MEASURE discrete_median,
+       SUM(CASE WHEN label = 'café percentile_cont(0.5) WITHIN GROUP (ORDER BY amount)'
+                THEN amount ELSE 0 END) AS MEASURE literal_total
+FROM percentile_sales;
+
+query RRR
+SELECT AGGREGATE(continuous_median), AGGREGATE(discrete_median), AGGREGATE(literal_total)
+FROM percentile_sales_v;
+----
+20.0	10.0	40.0
+
+# Direct reads use the returned clean SQL; measure reads use stored expressions.
+query RR
+SELECT continuous_median, discrete_median FROM percentile_sales_v;
+----
+20.0	10.0
+
+statement ok
+CREATE VIEW percentile_dollar_v AS
+SELECT region,
+       SUM(CASE WHEN label = $$café percentile_cont(0.5) WITHIN GROUP (ORDER BY amount)$$
+                THEN amount ELSE 0 END) AS MEASURE dollar_literal_total
+FROM percentile_sales;
+
+query R
+SELECT AGGREGATE(dollar_literal_total) FROM percentile_dollar_v;
+----
+40.0

@@ -1,0 +1,35 @@
+# name: test/sql/yardstick_column_names.test
+# description: yardstick table output deduplicates names using DuckDB's suffix policy.
+# group: [yardstick]
+
+require yardstick
+
+query II
+SELECT * FROM yardstick('SELECT 1 AS x, 2 AS x');
+----
+1	2
+
+# Both columns remain addressable with the same suffixes as a DuckDB subquery.
+query II
+SELECT x, x_1 FROM yardstick('SELECT 1 AS x, 2 AS x');
+----
+1	2
+
+query II
+SELECT x, x_1 FROM (SELECT 1 AS x, 2 AS x);
+----
+1	2
+
+# An existing suffixed name must not collide with a generated name.
+query IIII
+SELECT x, x_1, x_2, x_1_1
+FROM yardstick('SELECT 1 AS x, 2 AS x_1, 3 AS x, 4 AS x_1');
+----
+1	2	3	4
+
+# Quoted names retain embedded quotes and Unicode while receiving suffixes.
+query IIII
+SELECT "a""b", "a""b_1", "東京", "東京_1"
+FROM yardstick('SELECT 1 AS "a""b", 2 AS "a""b", 3 AS "東京", 4 AS "東京"');
+----
+1	2	3	4

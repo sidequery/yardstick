@@ -56,6 +56,7 @@ typedef struct {
     YardstickAggregateCall* calls;
     size_t count;
     const char* error;          /* NULL if success */
+    bool native_parsed;        /* Complete grammar-validated source spans */
 } YardstickAggregateCallList;
 
 /* =============================================================================
@@ -113,6 +114,7 @@ typedef struct {
     bool is_aggregate;
     bool is_identifier;         /* True if just a column reference */
     const char* error;          /* NULL if success */
+    bool is_scalar;             /* Parser reports no column/subquery dependency, not foldability */
 } YardstickExpressionInfo;
 
 /* =============================================================================
@@ -124,16 +126,20 @@ typedef struct {
     const char* expression;     /* Measure expression, e.g., "SUM(amount)" */
     const char* aggregate_func; /* Extracted agg function or NULL for derived */
     bool is_derived;            /* True if references other measures */
+    uint32_t expr_start;        /* Native source range starts at expression */
+    uint32_t name_end;          /* Exclusive native source range ends after alias */
+    const char* alias_sql;      /* Native alias source spelling for SQL emission */
 } YardstickMeasureDef;
 
 /* Result from parsing CREATE VIEW with AS MEASURE */
 typedef struct {
     bool is_measure_view;
     const char* view_name;
-    const char* clean_sql;      /* SQL with AS MEASURE removed */
+    const char* clean_sql;      /* Exact source when native_parsed, otherwise legacy SQL */
     YardstickMeasureDef* measures;
     size_t measure_count;
     const char* error;
+    bool native_parsed;        /* Native declaration list is authoritative, including empty */
 } YardstickCreateViewInfo;
 
 /* =============================================================================
