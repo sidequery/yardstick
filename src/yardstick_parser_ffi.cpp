@@ -1220,6 +1220,7 @@ extern "C" YardstickAggregateCallList* yardstick_find_aggregates(const char* sql
     }
 #endif
     auto* result = new YardstickAggregateCallList();
+    result->native_parsed = false;
     result->calls = nullptr;
     result->count = 0;
     result->error = nullptr;
@@ -1776,7 +1777,13 @@ extern "C" void yardstick_free_expression_info(YardstickExpressionInfo* info) {
 //=============================================================================
 
 extern "C" YardstickCreateViewInfo* yardstick_parse_create_view(const char* sql) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    if (auto *native = FindNativeYardstickMeasures(sql)) {
+        return native;
+    }
+#endif
     auto* result = new YardstickCreateViewInfo();
+    result->native_parsed = false;
     result->is_measure_view = false;
     result->view_name = nullptr;
     result->clean_sql = nullptr;
@@ -1836,6 +1843,7 @@ extern "C" void yardstick_free_create_view_info(YardstickCreateViewInfo* info) {
 
     for (size_t i = 0; i < info->measure_count; i++) {
         free(const_cast<char*>(info->measures[i].column_name));
+        free(const_cast<char*>(info->measures[i].alias_sql));
         free(const_cast<char*>(info->measures[i].expression));
         free(const_cast<char*>(info->measures[i].aggregate_func));
     }

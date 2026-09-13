@@ -24,6 +24,7 @@ public:
 
 private:
     friend YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql);
+    friend YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql);
     ParserOptions options;
     const NativeYardstickParseScope *previous;
     bool available;
@@ -34,6 +35,9 @@ const ParserOptions *CurrentNativeYardstickParserOptions();
 // Returns a complete native result, freed with yardstick_free_aggregate_list,
 // or nullptr when no native scope is available or the syntax is unsupported.
 YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql);
+
+// Source-preserving measure declarations. nullptr retains the legacy parser.
+YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql);
 
 // Recognize custom syntax with DuckDB's grammar, then adapt its source spans to
 // the existing semantic lowerer. False retains the legacy frontend.

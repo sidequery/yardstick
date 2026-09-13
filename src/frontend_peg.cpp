@@ -6,6 +6,9 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/grammar_extension.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
 
@@ -41,6 +44,15 @@ struct SyntaxCapture {
     bool has_measure = false;
     const string *source = nullptr;
     vector<NativeAtClause> clauses;
+    struct Measure {
+        string expression;
+        string name;
+        string alias;
+        idx_t start;
+        idx_t end;
+        const ParsedExpression *marker;
+    };
+    vector<Measure> measures;
 };
 
 // Grammar callbacks have no per-parse extension state. This scope captures only
@@ -186,6 +198,15 @@ unique_ptr<TransformResultValue> TransformMeasure(PEGTransformer &transformer, P
     CaptureSpan(list.GetChild(1), list.GetChild(3), true);
     if (active_capture) {
         active_capture->has_measure = true;
+        if (active_capture->source) {
+            auto &source_expression = list.GetChild(0);
+            auto &source_alias = list.GetChild(3);
+            active_capture->measures.push_back({DimensionSource(source_expression),
+                                               expression->GetAlias().GetIdentifierName(), DimensionSource(source_alias),
+                                               source_expression.offset.GetIndex(),
+                                               source_alias.offset.GetIndex() + source_alias.length.GetIndex(),
+                                               expression.get()});
+        }
     }
     return make_uniq<TypedTransformResult<unique_ptr<ParsedExpression>>>(std::move(expression));
 }
@@ -263,6 +284,85 @@ NativeYardstickParseScope::~NativeYardstickParseScope() {
 
 const ParserOptions *CurrentNativeYardstickParserOptions() {
     return active_parse_scope ? &active_parse_scope->ParserConfig() : nullptr;
+}
+
+YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql_p) {
+    if (!sql_p || !active_parse_scope || !active_parse_scope->available) {
+        return nullptr;
+    }
+    try {
+        string sql(sql_p);
+        if (sql.size() > std::numeric_limits<uint32_t>::max() || Parser::NormalizeSQLString(sql) != sql) {
+            return nullptr; // Byte offsets must refer to the exact input.
+        }
+        SyntaxCapture capture;
+        capture.source = &sql;
+        CaptureScope capture_scope(capture);
+        Parser parser(active_parse_scope->ParserConfig());
+        parser.ParseQuery(sql);
+        // The extension splits statements before semantic lowering. A direct
+        // multi-statement FFI call retains the legacy contract.
+        if (parser.statements.size() != 1) {
+            return nullptr;
+        }
+        auto &statement = *parser.statements[0];
+        if (statement.type != StatementType::CREATE_STATEMENT) {
+            return nullptr;
+        }
+        auto &create = statement.Cast<CreateStatement>();
+        if (!create.info || create.info->type != CatalogType::VIEW_ENTRY) {
+            return nullptr;
+        }
+        auto &view = create.info->Cast<CreateViewInfo>();
+        std::sort(capture.measures.begin(), capture.measures.end(), [](const SyntaxCapture::Measure &left,
+                                                                    const SyntaxCapture::Measure &right) {
+            return left.start < right.start;
+        });
+        auto duplicate = [](const string &value) {
+            auto *copy = static_cast<char *>(std::malloc(value.size() + 1));
+            if (!copy) {
+                throw std::bad_alloc();
+            }
+            std::memcpy(copy, value.c_str(), value.size() + 1);
+            return copy;
+        };
+        std::unique_ptr<YardstickCreateViewInfo, decltype(&yardstick_free_create_view_info)> result(
+            new YardstickCreateViewInfo {}, yardstick_free_create_view_info);
+        result->clean_sql = duplicate(sql);
+        // The shared catalog resolves the final unquoted identifier.
+        result->view_name = duplicate(view.GetViewName().GetIdentifierName());
+        result->native_parsed = true;
+        result->is_measure_view = !capture.measures.empty();
+        for (auto &measure : capture.measures) {
+            bool top_level = false;
+            if (view.query && view.query->node && view.query->node->type == QueryNodeType::SELECT_NODE) {
+                auto &select = view.query->node->Cast<SelectNode>();
+                for (auto &projection : select.select_list) {
+                    top_level |= projection.get() == measure.marker;
+                }
+            }
+            if (!top_level) {
+                result->error = duplicate("AS MEASURE declarations must be in the top-level CREATE VIEW projection");
+                return result.release();
+            }
+        }
+        if (!capture.measures.empty()) {
+            result->measures = new YardstickMeasureDef[capture.measures.size()] {};
+            result->measure_count = capture.measures.size();
+        }
+        for (idx_t i = 0; i < capture.measures.size(); i++) {
+            auto &source = capture.measures[i];
+            auto &measure = result->measures[i];
+            measure.column_name = duplicate(source.name);
+            measure.alias_sql = duplicate(source.alias);
+            measure.expression = duplicate(source.expression);
+            measure.expr_start = static_cast<uint32_t>(source.start);
+            measure.name_end = static_cast<uint32_t>(source.end);
+        }
+        return result.release();
+    } catch (const std::exception &) {
+        return nullptr;
+    }
 }
 
 YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
@@ -385,6 +485,7 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
         };
         std::unique_ptr<YardstickAggregateCallList, decltype(&yardstick_free_aggregate_list)> result(
             new YardstickAggregateCallList {}, yardstick_free_aggregate_list);
+        result->native_parsed = true;
         if (!aggregates.empty()) {
             result->calls = new YardstickAggregateCall[aggregates.size()] {};
             result->count = aggregates.size();

@@ -50,6 +50,7 @@ extern "C" {
 // Note: Struct types (YardstickCreateViewResult, YardstickAggregateResult, etc.)
 // are already defined in yardstick_ffi.h
 extern "C" {
+    char *yardstick_rewrite_percentile_within_group(const char *sql);
     bool yardstick_has_as_measure(const char *sql);
     bool yardstick_has_aggregate(const char *sql);
     bool yardstick_drop_measure_view_from_sql(const char *sql);
@@ -98,150 +99,15 @@ static ParserOptions YardstickParserOptions() {
 }
 
 static std::string RewritePercentileWithinGroup(const std::string &sql) {
-    std::string out;
-    out.reserve(sql.size());
-    const auto upper = StringUtil::Upper(sql);
-
-    size_t i = 0;
-    while (i < sql.size()) {
-        auto at = [&](const char *keyword) {
-            size_t len = strlen(keyword);
-            return i + len <= upper.size() && upper.compare(i, len, keyword) == 0;
-        };
-
-        const char *quantile_fn = nullptr;
-        size_t fn_len = 0;
-        if (at("PERCENTILE_CONT")) {
-            quantile_fn = "QUANTILE_CONT";
-            fn_len = strlen("PERCENTILE_CONT");
-        } else if (at("PERCENTILE_DISC")) {
-            quantile_fn = "QUANTILE_DISC";
-            fn_len = strlen("PERCENTILE_DISC");
-        } else {
-            out.push_back(sql[i]);
-            i++;
-            continue;
-        }
-
-        size_t j = i + fn_len;
-        while (j < sql.size() && std::isspace(static_cast<unsigned char>(sql[j]))) {
-            j++;
-        }
-        if (j >= sql.size() || sql[j] != '(') {
-            out.push_back(sql[i]);
-            i++;
-            continue;
-        }
-
-        size_t args_start = j + 1;
-        size_t depth = 0;
-        size_t k = args_start;
-        for (; k < sql.size(); k++) {
-            if (sql[k] == '(') {
-                depth++;
-            } else if (sql[k] == ')') {
-                if (depth == 0) {
-                    break;
-                }
-                depth--;
-            } else if (sql[k] == '\'' || sql[k] == '"') {
-                char quote = sql[k];
-                k++;
-                while (k < sql.size() && sql[k] != quote) {
-                    if (sql[k] == '\\' && k + 1 < sql.size()) {
-                        k++;
-                    }
-                    k++;
-                }
-            }
-        }
-        if (k >= sql.size() || sql[k] != ')') {
-            out.push_back(sql[i]);
-            i++;
-            continue;
-        }
-        auto args = sql.substr(args_start, k - args_start);
-        size_t after_args = k + 1;
-
-        size_t m = after_args;
-        while (m < sql.size() && std::isspace(static_cast<unsigned char>(sql[m]))) {
-            m++;
-        }
-        if (m >= sql.size() || upper.compare(m, 6, "WITHIN") != 0) {
-            out.push_back(sql[i]);
-            i++;
-            continue;
-        }
-        m += 6;
-        while (m < sql.size() && std::isspace(static_cast<unsigned char>(sql[m]))) {
-            m++;
-        }
-        if (m >= sql.size() || upper.compare(m, 5, "GROUP") != 0) {
-            out.push_back(sql[i]);
-            i++;
-            continue;
-        }
-        m += 5;
-        while (m < sql.size() && std::isspace(static_cast<unsigned char>(sql[m]))) {
-            m++;
-        }
-        if (m >= sql.size() || sql[m] != '(') {
-            out.push_back(sql[i]);
-            i++;
-            continue;
-        }
-
-        size_t inner_start = m + 1;
-        depth = 0;
-        size_t n = inner_start;
-        for (; n < sql.size(); n++) {
-            if (sql[n] == '(') {
-                depth++;
-            } else if (sql[n] == ')') {
-                if (depth == 0) {
-                    break;
-                }
-                depth--;
-            } else if (sql[n] == '\'' || sql[n] == '"') {
-                char quote = sql[n];
-                n++;
-                while (n < sql.size() && sql[n] != quote) {
-                    if (sql[n] == '\\' && n + 1 < sql.size()) {
-                        n++;
-                    }
-                    n++;
-                }
-            }
-        }
-        if (n >= sql.size() || sql[n] != ')') {
-            out.push_back(sql[i]);
-            i++;
-            continue;
-        }
-
-        auto inner = sql.substr(inner_start, n - inner_start);
-        StringUtil::Trim(inner);
-        auto inner_upper = StringUtil::Upper(inner);
-        if (!StringUtil::StartsWith(inner_upper, "ORDER BY")) {
-            out.push_back(sql[i]);
-            i++;
-            continue;
-        }
-        auto order_expr = inner.substr(strlen("ORDER BY"));
-        StringUtil::Trim(order_expr);
-        if (order_expr.empty()) {
-            out.push_back(sql[i]);
-            i++;
-            continue;
-        }
-
-        auto trimmed_args = args;
-        StringUtil::Trim(trimmed_args);
-        out += std::string(quantile_fn) + "(" + order_expr + ", " + trimmed_args + ")";
-        i = n + 1;
+    // Canonicalize before registration so stored expressions and executable SQL
+    // share the same percentile lowering on every supported DuckDB version.
+    char *rewritten = yardstick_rewrite_percentile_within_group(sql.c_str());
+    if (!rewritten) {
+        throw InvalidInputException("Failed to normalize percentile expressions");
     }
-
-    return out;
+    std::string result(rewritten);
+    yardstick_free(rewritten);
+    return result;
 }
 
 //=============================================================================
@@ -318,6 +184,9 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
 #endif
         names.push_back(query_result->ColumnName(i));
     }
+    // Table bindings require unique names even when the executed SELECT returns
+    // duplicate aliases. Use DuckDB's suffix policy without flattening Identifiers.
+    QueryResult::DeduplicateColumns(names);
 
     // Store the result for iteration
     data->result = std::move(query_result);
@@ -728,24 +597,16 @@ static void RestoreTemporaryMetadata(std::vector<MeasureViewSnapshot> &temporary
     }
 }
 
-static bool IsUnqualifiedOrTemporarySchemaReference(const std::string &qualified_name);
+static bool IsUnqualifiedOrTemporarySchemaReference(const std::vector<std::string> &qualified_name);
 
-static bool TableRefMatchesView(const std::string &table_name,
+static bool TableRefMatchesView(const std::vector<std::string> &table_name,
                                 const std::string &view_name,
                                 bool qualified_permanent) {
-    if (!qualified_permanent && EqualsCaseInsensitive(table_name, view_name)) {
-        return true;
+    if (table_name.empty() || !EqualsCaseInsensitive(table_name.back(), view_name)) {
+        return false;
     }
-    if (table_name.size() > view_name.size()) {
-        idx_t suffix_start = table_name.size() - view_name.size();
-        if (table_name[suffix_start - 1] != '.' ||
-            !EqualsCaseInsensitive(table_name.substr(suffix_start), view_name)) {
-            return false;
-        }
-        bool temporary_reference = IsUnqualifiedOrTemporarySchemaReference(table_name);
-        return qualified_permanent ? !temporary_reference : temporary_reference;
-    }
-    return false;
+    bool temporary_reference = IsUnqualifiedOrTemporarySchemaReference(table_name);
+    return qualified_permanent ? !temporary_reference : temporary_reference;
 }
 
 static std::string SelectPortionForTableAnalysis(const std::string &sql) {
@@ -854,25 +715,13 @@ static std::string SelectPortionForTableAnalysis(const std::string &sql) {
     return sql;
 }
 
-static std::string ReadQualifiedIdentifier(const std::string &sql, size_t &pos) {
-    std::string identifier;
-    bool expect_part = true;
-
+static std::vector<std::string> ReadQualifiedIdentifier(const std::string &sql, size_t &pos) {
+    std::vector<std::string> parts;
     while (pos < sql.size()) {
-        if (!expect_part && sql[pos] == '.') {
-            identifier += '.';
-            pos++;
-            expect_part = true;
-            continue;
-        }
-
-        if (!expect_part) {
-            break;
-        }
-
+        std::string part;
         if (sql[pos] == '"') {
             pos++;
-            std::string part;
+            bool closed = false;
             while (pos < sql.size()) {
                 if (sql[pos] == '"' && pos + 1 < sql.size() && sql[pos + 1] == '"') {
                     part += '"';
@@ -881,47 +730,40 @@ static std::string ReadQualifiedIdentifier(const std::string &sql, size_t &pos) 
                 }
                 if (sql[pos] == '"') {
                     pos++;
+                    closed = true;
                     break;
                 }
                 part += sql[pos++];
             }
-            if (part.empty()) {
-                break;
+            if (!closed || part.empty()) {
+                return {};
             }
-            identifier += part;
-            expect_part = false;
-            continue;
+        } else {
+            size_t start = pos;
+            while (pos < sql.size() && IsIdentifierChar(sql[pos])) {
+                pos++;
+            }
+            if (pos == start) {
+                return {};
+            }
+            part = sql.substr(start, pos - start);
         }
-
-        if (!IsIdentifierChar(sql[pos])) {
-            break;
+        parts.push_back(std::move(part));
+        pos = SkipWhitespaceAndComments(sql, pos);
+        if (pos == sql.size() || sql[pos] != '.') {
+            return parts;
         }
-
-        size_t start = pos;
-        while (pos < sql.size() && IsIdentifierChar(sql[pos])) {
-            pos++;
-        }
-        identifier += sql.substr(start, pos - start);
-        expect_part = false;
+        pos = SkipWhitespaceAndComments(sql, pos + 1);
     }
-
-    return identifier;
+    return {}; // A trailing dot does not form a qualified identifier.
 }
 
-static std::string LastQualifiedIdentifierPart(const std::string &qualified_name) {
-    size_t dot_pos = qualified_name.rfind('.');
-    return dot_pos == std::string::npos ? qualified_name : qualified_name.substr(dot_pos + 1);
-}
-
-static bool IsUnqualifiedOrTemporarySchemaReference(const std::string &qualified_name) {
-    size_t dot_pos = qualified_name.rfind('.');
-    if (dot_pos == std::string::npos) {
+static bool IsUnqualifiedOrTemporarySchemaReference(const std::vector<std::string> &qualified_name) {
+    if (qualified_name.size() < 2) {
         return true;
     }
 
-    std::string qualifier = qualified_name.substr(0, dot_pos);
-    size_t schema_dot = qualifier.rfind('.');
-    std::string schema = schema_dot == std::string::npos ? qualifier : qualifier.substr(schema_dot + 1);
+    auto &schema = qualified_name[qualified_name.size() - 2];
     return EqualsCaseInsensitive(schema, "temp") ||
            EqualsCaseInsensitive(schema, "temporary") ||
            EqualsCaseInsensitive(schema, "pg_temp");
@@ -1050,7 +892,7 @@ static bool StatementTextReadsFromView(const std::string &sql,
         }
 
         pos = SkipWhitespaceAndComments(sql, pos);
-        std::string table_name = ReadQualifiedIdentifier(sql, pos);
+        auto table_name = ReadQualifiedIdentifier(sql, pos);
         if (!table_name.empty() && TableRefMatchesView(table_name, view_name, qualified_permanent)) {
             return true;
         }
@@ -1078,8 +920,11 @@ static bool StatementReadsFromView(const std::string &sql,
             has_subquery = true;
             continue;
         }
-        if (info->tables[i].table_name &&
-            TableRefMatchesView(info->tables[i].table_name, view_name, qualified_permanent)) {
+        // Parser FFI exposes the decoded final name, without qualification.
+        // Preserve literal dots here; qualified permanent references are
+        // resolved by the source-aware fallback below.
+        if (!qualified_permanent && info->tables[i].table_name &&
+            EqualsCaseInsensitive(info->tables[i].table_name, view_name)) {
             found = true;
             break;
         }
@@ -1116,7 +961,7 @@ static bool ExtractDropViewInfoFromSql(const std::string &sql, DropViewInfo &dro
         pos = SkipWhitespaceAndComments(sql, pos);
     }
 
-    std::string qualified_name = ReadQualifiedIdentifier(sql, pos);
+    auto qualified_name = ReadQualifiedIdentifier(sql, pos);
     if (qualified_name.empty()) {
         return false;
     }
@@ -1134,7 +979,7 @@ static bool ExtractDropViewInfoFromSql(const std::string &sql, DropViewInfo &dro
     }
 
     drop_view.sql = sql;
-    drop_view.view_name = LastQualifiedIdentifierPart(qualified_name);
+    drop_view.view_name = qualified_name.back();
     drop_view.targets_temporary_view = IsUnqualifiedOrTemporarySchemaReference(qualified_name);
     return true;
 }
@@ -1609,8 +1454,25 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
             continue;
         }
 
-        if (yardstick_has_as_measure(statement_body.c_str()) &&
-            StartsWithCreateViewStatement(statement_body)) {
+        bool statement_has_measure = yardstick_has_as_measure(statement_body.c_str());
+        std::string native_view_name;
+#if YARDSTICK_GRAMMAR_EXTENSION
+        if (auto *native = FindNativeYardstickMeasures(statement_body.c_str())) {
+            statement_has_measure = native->is_measure_view;
+            if (native->view_name) {
+                native_view_name = native->view_name;
+            }
+            if (native->error) {
+                rewrite_result.error = native->error;
+            }
+            yardstick_free_create_view_info(native);
+            if (!rewrite_result.error.empty()) {
+                cleanup_temporary_measure_views();
+                return rewrite_result;
+            }
+        }
+#endif
+        if (statement_has_measure && StartsWithCreateViewStatement(statement_body)) {
             if (catalog_statement_seen && executable_since_catalog_mutation) {
                 rewrite_result.error = "AS MEASURE batches cannot apply catalog changes after executable statements";
                 cleanup_temporary_measure_views();
@@ -1620,11 +1482,13 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
 
             std::string rewritten_statement = RewritePercentileWithinGroup(statement_body);
             bool is_temporary_measure_view = IsTemporaryCreateViewStatement(statement_body);
-            std::string view_name;
-            char *extracted_view_name = yardstick_extract_view_name(rewritten_statement.c_str());
-            if (extracted_view_name) {
-                view_name = extracted_view_name;
-                yardstick_free(extracted_view_name);
+            std::string view_name = native_view_name;
+            if (view_name.empty()) {
+                char *extracted_view_name = yardstick_extract_view_name(rewritten_statement.c_str());
+                if (extracted_view_name) {
+                    view_name = extracted_view_name;
+                    yardstick_free(extracted_view_name);
+                }
             }
             MeasureViewSnapshot snapshot;
             bool has_snapshot = false;
@@ -1673,7 +1537,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
                     permanent_snapshots.push_back(snapshot);
                     has_snapshot = false;
                 }
-                rewritten_statements.push_back(RewritePercentileWithinGroup(result.clean_sql));
+                rewritten_statements.push_back(result.clean_sql);
             } else {
                 rewritten_statements.push_back(statement);
             }

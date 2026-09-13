@@ -44,6 +44,22 @@ pub struct YardstickAggregateResult {
     pub warnings: *mut c_char,
 }
 
+/// Normalize percentile expressions before registering a measure view.
+/// The caller frees the returned string with yardstick_free.
+#[no_mangle]
+pub extern "C" fn yardstick_rewrite_percentile_within_group(sql: *const c_char) -> *mut c_char {
+    if sql.is_null() {
+        return ptr::null_mut();
+    }
+    let sql_str = unsafe {
+        match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return ptr::null_mut(),
+        }
+    };
+    to_c_string(&crate::sql::measures::rewrite_percentile_within_group(sql_str))
+}
+
 /// Check if SQL contains "AS MEASURE" pattern
 #[no_mangle]
 pub extern "C" fn yardstick_has_as_measure(sql: *const c_char) -> bool {
