@@ -8,6 +8,7 @@
  */
 
 #include "yardstick_ffi.h"
+#include "yardstick_compat.hpp"
 
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node.hpp"
@@ -49,17 +50,11 @@ using namespace duckdb;
 // DuckDB main made the ParsedExpression subclass fields private (exposing
 // accessors instead) and introduced a dedicated Identifier type in place of
 // std::string for names. DuckDB 1.5 and earlier expose public fields and use
-// std::string. We detect the new API via the header it introduced and route
+// std::string. CMake probes the expression accessors directly and we route
 // field access through these helpers, so the extension builds against both the
 // stable line and main. Remove this shim once the minimum supported DuckDB has
 // the new API.
 //=============================================================================
-
-#if __has_include("duckdb/common/identifier.hpp")
-#define YARDSTICK_NEW_EXPR_API 1
-#else
-#define YARDSTICK_NEW_EXPR_API 0
-#endif
 
 namespace {
 
@@ -231,6 +226,13 @@ inline size_t YsColumnNameCount(const ColumnRefExpression &c) {
     return c.column_names.size();
 #endif
 }
+inline const std::string &YsTableQualifier(const ColumnRefExpression &c) {
+#if YARDSTICK_NEW_EXPR_API
+    return YsName(c.ColumnNames()[c.ColumnNames().size() - 2]);
+#else
+    return c.GetTableName();
+#endif
+}
 inline void YsPrependQualifier(ColumnRefExpression &c, const std::string &qualifier) {
 #if YARDSTICK_NEW_EXPR_API
     c.ColumnNamesMutable().insert(c.ColumnNamesMutable().begin(), Identifier(qualifier));
@@ -282,8 +284,8 @@ static bool IsPotentialOrderAliasRef(
         return true;
     }
     if (YsColumnNameCount(colref) == 2 &&
-        StringUtil::CIEquals(YsName(colref.GetTableName()), "alias")) {
-        if (from_qualifiers.find(NormalizeAliasName(YsName(colref.GetTableName()))) !=
+        StringUtil::CIEquals(YsTableQualifier(colref), "alias")) {
+        if (from_qualifiers.find(NormalizeAliasName(YsTableQualifier(colref))) !=
             from_qualifiers.end()) {
             return false;
         }
@@ -756,7 +758,7 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
                 }
 
                 // Get position from query_location
-                auto query_location = expr->GetQueryLocation();
+                optional_idx query_location = expr->GetQueryLocation();
                 if (query_location.IsValid()) {
                     info.start_pos = static_cast<uint32_t>(query_location.GetIndex());
                 } else {
@@ -1364,7 +1366,7 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
             item.expression_sql = safe_strdup(expr->ToString());
             item.alias = expr->HasAlias() ? safe_strdup(YsName(expr->GetAlias())) : nullptr;
 
-            auto query_location = expr->GetQueryLocation();
+            optional_idx query_location = expr->GetQueryLocation();
             if (query_location.IsValid()) {
                 item.start_pos = static_cast<uint32_t>(query_location.GetIndex());
             } else {

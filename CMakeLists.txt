@@ -12,7 +12,43 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 include_directories(include)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include)
+# Embedded builds must use the host DuckDB headers, not another checkout's
+# submodule headers (community builds can contain both versions).
+if(NOT COMMAND build_static_extension)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include)
+endif()
+
+# Probe the APIs independently: header presence does not establish an ABI.
+include(CheckCXXSourceCompiles)
+include(CMakePushCheckState)
+function(yardstick_detect_apis)
+    cmake_push_check_state(RESET)
+    get_directory_property(CMAKE_REQUIRED_INCLUDES INCLUDE_DIRECTORIES)
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+    # Recheck when the DuckDB checkout changes in an existing build directory.
+    unset(YARDSTICK_TOKEN_PARSE_FN CACHE)
+    unset(YARDSTICK_NEW_EXPR_API CACHE)
+    unset(YARDSTICK_RESULT_ACCESSORS CACHE)
+    check_cxx_source_compiles("
+        #include <duckdb/parser/parser_extension.hpp>
+        #include <type_traits>
+        using namespace duckdb;
+        using Callback = ParserExtensionParseResult (*)(ParserExtensionInfo *, const vector<SimpleToken> &);
+        static_assert(std::is_same<parse_function_t, Callback>::value, \"token callback\");
+    " YARDSTICK_TOKEN_PARSE_FN)
+    check_cxx_source_compiles("
+        #include <duckdb/parser/expression/function_expression.hpp>
+        void probe(duckdb::FunctionExpression &expr) { expr.GetArgumentsMutable(); }
+    " YARDSTICK_NEW_EXPR_API)
+    check_cxx_source_compiles("
+        #include <duckdb/main/query_result.hpp>
+        void probe(duckdb::QueryResult &result) { result.GetTypes(); }
+    " YARDSTICK_RESULT_ACCESSORS)
+    configure_file(src/include/yardstick_compat.hpp.in yardstick_compat.hpp)
+    cmake_pop_check_state()
+endfunction()
+yardstick_detect_apis()
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 # Detect Rust target based on platform
 execute_process(

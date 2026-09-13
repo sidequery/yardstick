@@ -3,10 +3,8 @@
 #   DuckDB is replacing its legacy PostgreSQL parser with a PEG parser (opt-in in
 #   1.5, the sole parser on main, default in 2.0). This file is parser-agnostic so
 #   it runs under whichever parser the build uses -- the legacy parser on the
-#   stable line today, and the PEG parser automatically once the suite runs
-#   against a PEG-default DuckDB (the duckdb-next-build job, once Yardstick
-#   compiles against current main again). It pins down the two behaviors most
-#   exposed to the swap:
+#   stable line today, and the PEG parser on the Cyanoptera release branch.
+#   It pins down the two behaviors most exposed to the swap:
 #     1. Yardstick's parser_override path still rewrites custom syntax correctly.
 #     2. When the override declines, the active parser still surfaces syntax errors
 #        (the "fallback" path). The assertion matches only "Parser Error", which
@@ -68,3 +66,19 @@ statement error
 SELECT * FROM;
 ----
 Parser Error
+
+# The table-function bridge preserves quoted result names and types across
+# DuckDB's string-to-Identifier and QueryResult accessor changes.
+query TIT
+SELECT "Mixed Name", "Count", typeof("Count")
+FROM yardstick('SELECT ''value'' AS "Mixed Name", 42::BIGINT AS "Count"');
+----
+value	42	BIGINT
+
+# Expression locations must remain byte offsets when DuckDB supplies spans.
+# Multiple calls and a multibyte literal before them catch shifted replacements.
+query TRR
+SELECT 'café', AGGREGATE(revenue), 2 * AGGREGATE(revenue) AT (ALL)
+FROM peg_sales_v;
+----
+café	375.0	750.0

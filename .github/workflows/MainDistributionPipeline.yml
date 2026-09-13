@@ -1,7 +1,7 @@
 #
 # Build and test the extension using the DuckDB reusable CI workflow.
-# Run both the latest stable branch and DuckDB main so API breaks for the next
-# release line are caught before release day.
+# Require the stable release and the upcoming release branch to build and test.
+# DuckDB main is checked separately by the scheduled canary workflow.
 #
 name: Main Extension Distribution Pipeline
 on:
@@ -17,20 +17,20 @@ concurrency:
 
 jobs:
   duckdb-stable-build:
-    name: Build stable extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    name: Build DuckDB v1.5.5 extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
     with:
-      duckdb_version: v1.5-variegata
-      ci_tools_version: v1.5-variegata
+      duckdb_version: v1.5.5
+      ci_tools_version: v1.5.5
       extension_name: yardstick
       extra_toolchains: rust
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;linux_amd64_gcc4;windows_amd64_rtools;windows_amd64_mingw"
 
   duckdb-next-build:
-    name: Build next extension binaries
+    name: Build DuckDB v2.0-cyanoptera release branch extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: main
+      duckdb_version: v2.0-cyanoptera
       ci_tools_version: main
       extension_name: yardstick
       extra_toolchains: rust

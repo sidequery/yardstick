@@ -1,0 +1,6 @@
+#pragma once
+
+// Detected against the DuckDB headers used by this build.
+#cmakedefine01 YARDSTICK_TOKEN_PARSE_FN
+#cmakedefine01 YARDSTICK_NEW_EXPR_API
+#cmakedefine01 YARDSTICK_RESULT_ACCESSORS
