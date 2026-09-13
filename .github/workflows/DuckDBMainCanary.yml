@@ -1,0 +1,22 @@
+# Advisory compatibility check. Kept separate from push/PR CI so changes on
+# DuckDB main do not block the supported release targets.
+name: DuckDB Main Canary
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 1-5"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  duckdb-main-build:
+    name: Build DuckDB main extension binaries (advisory)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: main
+      ci_tools_version: main
+      extension_name: yardstick
+      extra_toolchains: rust
+      exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;linux_amd64_gcc4;windows_amd64_rtools;windows_amd64_mingw"

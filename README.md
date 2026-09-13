@@ -154,15 +154,20 @@ On DuckDB 1.5+, queries containing `AGGREGATE()` are automatically intercepted b
 
 ## Building
 
+Supported build targets are DuckDB **v1.5.5** and the upcoming **v2.0-cyanoptera release branch**. The latter is a moving branch, not a released version. CI requires both targets to build and pass tests; DuckDB `main` runs separately as a scheduled, advisory canary.
+
 Prerequisites:
-- CMake 3.5+
+- CMake 3.12+
 - C++17 compiler
 - Cargo
 
 ```bash
-make        # builds Rust library and DuckDB extension
-make test   # runs tests
+git submodule update --init --recursive
+make release  # builds Rust library and DuckDB extension
+make test     # builds release and runs tests
 ```
+
+Use `make release` explicitly: plain `make` only builds the Rust library. To build another supported target, check out that ref in the `duckdb` submodule and use a fresh build directory.
 
 The extension will be at `build/release/extension/yardstick/yardstick.duckdb_extension`
 

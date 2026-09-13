@@ -6,6 +6,10 @@
 #include "duckdb/parser/statement/extension_statement.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/logging/logger.hpp"
+
+#include <type_traits>
+#include <utility>
 
 // Include FFI types header
 #include "yardstick_ffi.h"
@@ -231,6 +235,9 @@ static std::string RewritePercentileWithinGroup(const std::string &sql) {
 static std::string AggregateWarnings(YardstickAggregateResult &result);
 static void HandleAggregateWarnings(ClientContext &context, const string &warnings);
 
+// DuckDB 2.0 uses Identifier for result and table-function column names.
+using YardstickColumnName = std::decay<decltype(std::declval<QueryResult>().ColumnName(0))>::type;
+
 struct YardstickQueryData : public TableFunctionData {
     string original_sql;
     string rewritten_sql;
@@ -241,7 +248,7 @@ struct YardstickQueryData : public TableFunctionData {
 static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
                                                      TableFunctionBindInput &input,
                                                      vector<LogicalType> &return_types,
-                                                     vector<string> &names) {
+                                                     vector<YardstickColumnName> &names) {
     auto data = make_uniq<YardstickQueryData>();
     data->original_sql = input.inputs[0].GetValue<string>();
     if (input.inputs.size() > 1) {
@@ -277,8 +284,12 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
 
     // Extract return types and names from result
     for (idx_t i = 0; i < query_result->ColumnCount(); i++) {
+#if YARDSTICK_RESULT_ACCESSORS
+        return_types.push_back(query_result->GetTypes()[i]);
+#else
         return_types.push_back(query_result->types[i]);
-        names.push_back(query_result->names[i]);
+#endif
+        names.push_back(query_result->ColumnName(i));
     }
 
     // Store the result for iteration

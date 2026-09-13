@@ -2045,7 +2045,8 @@ fn has_top_level_group_by(sql: &str) -> bool {
 }
 
 fn has_group_by_anywhere(sql: &str) -> bool {
-    let upper = sql.to_uppercase();
+    // Keyword matching must preserve byte offsets into the original SQL.
+    let upper = sql.to_ascii_uppercase();
     let mut idx = 0;
     while idx < upper.len() {
         if matches_keyword_at(&upper, idx, "GROUP") {
@@ -2071,7 +2072,9 @@ fn matches_keyword_at(upper: &str, idx: usize, keyword: &str) -> bool {
     if idx + keyword.len() > upper.len() {
         return false;
     }
-    if &upper[idx..idx + keyword.len()] != keyword {
+    // Callers can scan byte-by-byte through UTF-8 text. Only a match at
+    // character boundaries permits the surrounding string slices below.
+    if upper.get(idx..idx + keyword.len()) != Some(keyword) {
         return false;
     }
 
@@ -7929,6 +7932,28 @@ fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn test_group_by_keyword_scan_preserves_utf8_offsets() {
+        assert!(!has_group_by_anywhere(
+            "SELECT 'café', AGGREGATE(revenue) FROM sales_v"
+        ));
+        assert!(has_group_by_anywhere(
+            "SELECT 'café', region FROM sales_v GROUP BY region"
+        ));
+        // Unicode uppercasing shortens the dotless i, shifting whitespace offsets.
+        assert!(has_group_by_anywhere(
+            "SELECT 'ı', region FROM sales_v group by region"
+        ));
+        assert!(!has_group_by_anywhere("SELECT éGROUP BY region"));
+        assert!(!has_group_by_anywhere("SELECT GROUP BYé"));
+
+        let sql = "SELECT 'café', region FROM sales_v GROUP BY region";
+        assert_eq!(
+            sql.find("GROUP BY"),
+            find_top_level_keyword(sql, "GROUP BY", 0)
+        );
+    }
 
     #[test]
     fn test_has_as_measure() {
