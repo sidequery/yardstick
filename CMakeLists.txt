@@ -192,6 +192,16 @@ endif()
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+option(YARDSTICK_BUILD_GRAMMAR_TEST_EXTENSION
+    "Build the grammar extension used by native_combined_grammar.test" OFF)
+if(YARDSTICK_BUILD_GRAMMAR_TEST_EXTENSION)
+    if(NOT YARDSTICK_GRAMMAR_EXTENSION)
+        message(FATAL_ERROR "The combined grammar test requires DuckDB's grammar extension API")
+    endif()
+    build_loadable_extension(yardstick_test_grammar " "
+        test/extension/yardstick_test_grammar.cpp)
+endif()
+
 # Link the Rust static library
 target_link_libraries(${EXTENSION_NAME} yardstick-static)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} yardstick)

@@ -1,0 +1,85 @@
+# name: test/sql/native_combined_grammar.test
+# description: Preserve a second grammar through native normalization and execution.
+# group: [yardstick]
+# Build with YARDSTICK_BUILD_GRAMMAR_TEST_EXTENSION=ON and set the environment
+# variable below to the absolute path of yardstick_test_grammar.duckdb_extension.
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require-env YARDSTICK_GRAMMAR_TEST_EXTENSION
+
+require yardstick
+
+require skip_reload
+
+statement ok
+LOAD '${YARDSTICK_GRAMMAR_TEST_EXTENSION}';
+
+statement ok
+CREATE TABLE combined_sales(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO combined_sales VALUES (2022, 100), (2023, 225);
+
+statement ok
+SET active_grammar_extensions=['yardstick', 'yardstick_test_grammar'];
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+query I
+SELECT yardstick_test_year!();
+----
+2023
+
+# The second grammar remains in the normalized CREATE VIEW body.
+statement ok
+CREATE OR REPLACE VIEW combined_sales_v AS
+SELECT year, SUM(amount + yardstick_test_year!() - 2023) AS/* native */MEASURE revenue
+FROM combined_sales;
+
+# AT's predicate retains the grammar-only expression through Rust lowering,
+# wrapper parsing, and the private execution connection used by yardstick().
+query IR
+SELECT yardstick_test_year!(), AGGREGATE(revenue) AT (WHERE year = yardstick_test_year!()) FROM combined_sales_v;
+----
+2023	225.0
+
+statement ok
+CREATE OR REPLACE TABLE combined_total AS
+SELECT AGGREGATE(revenue) AT (WHERE year = yardstick_test_year!()) AS revenue
+FROM combined_sales_v;
+
+query R
+SELECT revenue FROM combined_total;
+----
+225.0
+
+query R
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) AT (WHERE year = yardstick_test_year!()) FROM combined_sales_v');
+----
+225.0
+
+endloop
+
+# Grammar activation is connection-local, even after private connections parsed
+# the extension syntax. Registration alone must not make this expression bind.
+statement error isolated_connection
+SELECT yardstick_test_year!();
+----
+Parser Error
+
+query I
+SELECT yardstick_test_year!();
+----
+2023
+
+statement ok
+RESET active_grammar_extensions;
+
+statement error
+SELECT yardstick_test_year!();
+----
+Parser Error

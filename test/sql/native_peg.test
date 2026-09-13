@@ -1,5 +1,5 @@
 # name: test/sql/native_peg.test
-# description: Native grammar trivia normalization feeds shared measure semantics.
+# description: Native structured modifiers feed shared measure semantics.
 # group: [yardstick]
 
 require-env YARDSTICK_NATIVE_PEG 1
@@ -34,9 +34,25 @@ SELECT AGGREGATE(native_alias_revenue) FROM native_alias_v;
 ----
 375.0
 
+# A quoted function name is accepted by DuckDB, but the legacy AT scanner does
+# not recognize it. This query must consume native structured modifier output.
+query R
+SELECT "AGGREGATE"(native_revenue) AT (ALL) FROM native_sales_v;
+----
+375.0
+
+# Expanding the CTE changes offsets before the outer modifier is lowered.
+query R
+WITH totals AS (
+    SELECT "AGGREGATE"(native_revenue) AT (ALL) AS total FROM native_sales_v
+)
+SELECT "AGGREGATE"(native_revenue) AT (ALL) FROM native_sales_v;
+----
+375.0
+
 # The comment between the operand and AT belongs to the normalized suffix.
 query R
-SELECT AGGREGATE(native_revenue)/* operand trivia */AT(/* mode trivia */ALL)
+SELECT "AGGREGATE"(native_revenue)/* operand trivia */AT(/* mode trivia */ALL)
 FROM native_sales_v;
 ----
 375.0
@@ -47,20 +63,42 @@ SELECT v.native_revenue/* implicit measure */AT(ALL) FROM native_sales_v v;
 375.0
 
 query RR
-SELECT AGGREGATE(native_revenue) AT (ALL/* dimension trivia */year region) AS compound_total,
-       AGGREGATE(native_revenue) AT (ALL year)/* chain trivia */AT(ALL region) AS chained_total
+SELECT "AGGREGATE"(native_revenue) AT (ALL/* dimension trivia */year region) AS compound_total,
+       "AGGREGATE"(native_revenue) AT (ALL year)/* chain trivia */AT(ALL region) AS chained_total
 FROM native_sales_v;
 ----
 375.0	375.0
 
 query IR rowsort
-SELECT year, AGGREGATE(native_revenue) AT (SET/* assignment trivia */year = 2022)
+SELECT year, "AGGREGATE"(native_revenue) AT (SET/* assignment trivia */year = 2022)
 FROM native_sales_v;
 ----
 2022	150.0
 2023	150.0
 
-# CURRENT dimension still uses the shared legacy frontend during migration.
+query IR rowsort
+SELECT year, "AGGREGATE"(native_revenue) AT (ALL year) FROM native_sales_v;
+----
+2022	375.0
+2023	375.0
+
+# The complete nested RHS comes from DuckDB's expression parser.
+query IR rowsort
+SELECT year, "AGGREGATE"(native_revenue) AT (SET year = coalesce(NULL, 2022))
+FROM native_sales_v;
+----
+2022	150.0
+2023	150.0
+
+query IR rowsort
+SELECT year, "AGGREGATE"(native_revenue) AT (SET year = year - 1)
+FROM native_sales_v;
+----
+2022	NULL
+2023	150.0
+
+# CURRENT dimension retains the legacy path; a global CURRENT grammar rule
+# would also claim ordinary column/alias pairs such as SELECT current year.
 query IR rowsort
 SELECT year, AGGREGATE(native_revenue) AT (SET year = CURRENT year - 1)
 FROM native_sales_v;
@@ -69,46 +107,46 @@ FROM native_sales_v;
 2023	150.0
 
 query R
-SELECT AGGREGATE(native_revenue) AT (WHERE/* predicate trivia */year = 2023)
+SELECT "AGGREGATE"(native_revenue) AT (WHERE/* predicate trivia */year = 2023)
 FROM native_sales_v;
 ----
 225.0
 
 # A newline between adjacent string literals is significant to DuckDB.
 query R
-SELECT AGGREGATE(native_revenue) AT (WHERE region = 'U'
+SELECT "AGGREGATE"(native_revenue) AT (WHERE region = 'U'
 'S') FROM native_sales_v;
 ----
 250.0
 
 query R
-SELECT AGGREGATE(native_revenue) AT (/* visibility trivia */VISIBLE)
+SELECT "AGGREGATE"(native_revenue) AT (/* visibility trivia */VISIBLE)
 FROM native_sales_v WHERE year = 2022;
 ----
 150.0
 
 query IR rowsort
-SELECT year, AGGREGATE(native_revenue) AT (ALL/* compound trivia */region SET year = 2022)
+SELECT year, "AGGREGATE"(native_revenue) AT (ALL/* compound trivia */region SET year = 2022)
 FROM native_sales_v;
 ----
 2022	150.0
 2023	NULL
 
 query IR rowsort
-SELECT year, AGGREGATE(native_revenue) AT (ALL region/* compound trivia */WHERE year = 2023)
+SELECT year, "AGGREGATE"(native_revenue) AT (ALL region/* compound trivia */WHERE year = 2023)
 FROM native_sales_v;
 ----
 2022	NULL
 2023	225.0
 
 query R
-SELECT AGGREGATE(native_revenue) AT (ALL region/* compound trivia */VISIBLE)
+SELECT "AGGREGATE"(native_revenue) AT (ALL region/* compound trivia */VISIBLE)
 FROM native_sales_v WHERE year = 2022;
 ----
 150.0
 
 query TR
-SELECT 'café', AGGREGATE(native_revenue) AT (/* 東京 */ALL)
+SELECT 'café', "AGGREGATE"(native_revenue) AT (/* 東京 */ALL)
 FROM native_sales_v;
 ----
 café	375.0
@@ -124,7 +162,7 @@ endloop
 
 # A newly opened connection inherits the registered adapter without a SET.
 query R second_connection
-SELECT AGGREGATE(native_revenue) AT (/* second connection */ALL)
+SELECT "AGGREGATE"(native_revenue) AT (/* second connection */ALL)
 FROM native_sales_v;
 ----
 375.0
@@ -133,8 +171,19 @@ FROM native_sales_v;
 statement ok
 SET active_grammar_extensions=['yardstick'];
 
+# CURRENT remains an ordinary identifier outside AT expressions.
+query I
+SELECT current year FROM (SELECT 2023 AS current);
+----
+2023
+
+query RI
+SEMANTIC SELECT AGGREGATE(native_revenue), 1 AS measure FROM native_sales_v;
+----
+375.0	1
+
 query R
-SELECT AGGREGATE(native_revenue) AT (/* explicitly active */ALL)
+SELECT "AGGREGATE"(native_revenue) AT (/* explicitly active */ALL)
 FROM native_sales_v;
 ----
 375.0

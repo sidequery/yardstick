@@ -508,6 +508,9 @@ unsafe fn c_str_to_string(ptr: *const c_char) -> Option<String> {
 /// assert_eq!(calls[0].measure_name, "revenue");
 /// ```
 pub fn find_aggregates(sql: &str) -> Result<Vec<AggregateCall>, String> {
+    if FN_FIND_AGGREGATES.load(Ordering::SeqCst).is_null() {
+        return Err("Parser FFI not initialized".to_string());
+    }
     let c_sql = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
 
     unsafe {

@@ -9,6 +9,7 @@
 
 #include "yardstick_ffi.h"
 #include "yardstick_compat.hpp"
+#include "frontend_peg.hpp"
 
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node.hpp"
@@ -57,6 +58,17 @@ using namespace duckdb;
 //=============================================================================
 
 namespace {
+
+// Rewrites must preserve the caller's grammar while avoiding parser-override
+// recursion. Outside an override, legacy callers retain the default parser.
+static ParserOptions YardstickParserOptions() {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    if (auto *options = CurrentNativeYardstickParserOptions()) {
+        return *options;
+    }
+#endif
+    return ParserOptions();
+}
 
 // Identifier/string -> raw string (case preserved). The Identifier overload only
 // exists on the new API; the std::string overload covers the old API and any
@@ -1202,6 +1214,11 @@ static void QualifyColumnRefs(ParsedExpression* expr, const std::string& qualifi
 //=============================================================================
 
 extern "C" YardstickAggregateCallList* yardstick_find_aggregates(const char* sql) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    if (auto *native = FindNativeYardstickAggregates(sql)) {
+        return native;
+    }
+#endif
     auto* result = new YardstickAggregateCallList();
     result->calls = nullptr;
     result->count = 0;
@@ -1213,7 +1230,7 @@ extern "C" YardstickAggregateCallList* yardstick_find_aggregates(const char* sql
     }
 
     try {
-        Parser parser;
+        Parser parser(YardstickParserOptions());
         parser.ParseQuery(sql);
 
         if (parser.statements.empty()) {
@@ -1333,7 +1350,7 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
     }
 
     try {
-        Parser parser;
+        Parser parser(YardstickParserOptions());
         parser.ParseQuery(sql);
 
         if (parser.statements.empty()) {
@@ -1623,7 +1640,7 @@ extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
     }
 
     try {
-        Parser parser;
+        Parser parser(YardstickParserOptions());
         parser.ParseQuery(sql);
         if (parser.statements.empty()) {
             return nullptr;
@@ -1707,7 +1724,7 @@ extern "C" YardstickExpressionInfo* yardstick_parse_expression(const char* expr_
     }
 
     try {
-        auto expressions = Parser::ParseExpressionList(expr_str);
+        auto expressions = Parser::ParseExpressionList(expr_str, YardstickParserOptions());
 
         if (expressions.empty()) {
             result->error = safe_strdup("No expressions parsed");
@@ -1774,7 +1791,7 @@ extern "C" YardstickCreateViewInfo* yardstick_parse_create_view(const char* sql)
 
     try {
         // Parse the CREATE VIEW statement
-        Parser parser;
+        Parser parser(YardstickParserOptions());
         parser.ParseQuery(sql);
 
         if (parser.statements.empty()) {
@@ -1890,7 +1907,7 @@ extern "C" char* yardstick_qualify_expression(const char* expr_str, const char* 
     if (!expr_str || !qualifier) return nullptr;
 
     try {
-        auto expressions = Parser::ParseExpressionList(expr_str);
+        auto expressions = Parser::ParseExpressionList(expr_str, YardstickParserOptions());
         if (expressions.empty()) {
             return safe_strdup(expr_str);
         }

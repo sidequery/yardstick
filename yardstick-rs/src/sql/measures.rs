@@ -1380,6 +1380,52 @@ pub fn extract_aggregate_with_at_full(
     results
 }
 
+/// Consume the native frontend's structured calls after all source rewrites.
+/// Older DuckDB versions cannot parse AT syntax and retain the legacy parser.
+fn parse_aggregate_modifiers(sql: &str) -> Vec<(String, Vec<ContextModifier>, usize, usize)> {
+    let calls = match parser_ffi::find_aggregates(sql) {
+        Ok(calls) => calls,
+        Err(_) => return extract_aggregate_with_at_full(sql),
+    };
+    calls
+        .into_iter()
+        .filter_map(|call| {
+            let modifiers: Vec<_> = call
+                .modifiers
+                .into_iter()
+                .filter_map(|modifier| {
+                    use parser_ffi::AtType;
+                    match modifier.modifier_type {
+                        AtType::None => None,
+                        AtType::AllGlobal => Some(ContextModifier::AllGlobal),
+                        AtType::AllDim => {
+                            Some(ContextModifier::All(modifier.dimension.unwrap_or_default()))
+                        }
+                        AtType::Set => Some(ContextModifier::Set(
+                            modifier.dimension.unwrap_or_default(),
+                            modifier.value.unwrap_or_default(),
+                        )),
+                        AtType::Where => {
+                            Some(ContextModifier::Where(modifier.value.unwrap_or_default()))
+                        }
+                        AtType::Visible => Some(ContextModifier::Visible),
+                    }
+                })
+                .collect();
+            if modifiers.is_empty() {
+                None
+            } else {
+                Some((
+                    call.measure_name,
+                    modifiers,
+                    call.start_pos as usize,
+                    call.end_pos as usize,
+                ))
+            }
+        })
+        .collect()
+}
+
 /// Extract all AGGREGATE(...) [AT (...)] patterns from SQL (legacy - returns first modifier)
 pub fn extract_aggregate_with_at(sql: &str) -> Vec<(String, ContextModifier, usize, usize)> {
     extract_aggregate_with_at_full(sql)
@@ -3305,27 +3351,45 @@ pub fn qualify_outer_reference(expr: &str, table_name: &str, dim: &str) -> Strin
     // Parse expression into tokens and replace matching identifiers
     let mut result = String::new();
     let mut chars = expr.chars().peekable();
+    let dimension_key = normalize_dimension_key(dim).replace("\"\"", "\"");
+    let mut previous_was_dot = false;
+    let mut previous_was_as = false;
 
     while let Some(c) = chars.next() {
-        if c.is_alphabetic() || c == '_' {
-            // Collect identifier
-            let mut ident = String::from(c);
-            while let Some(&next) = chars.peek() {
-                if next.is_alphanumeric() || next == '_' {
-                    ident.push(chars.next().unwrap());
-                } else {
-                    break;
-                }
-            }
+        if c.is_alphabetic() || c == '_' || c == '"' {
+            let ident = consume_where_identifier(c, &mut chars);
+            let next = chars.clone().find(|ch| !ch.is_whitespace());
+            let already_qualified = previous_was_dot || next == Some('.');
+            let is_function = next == Some('(');
+            let is_type = previous_was_as || result.trim_end().ends_with("::");
+            let key = normalize_dimension_key(&ident).replace("\"\"", "\"");
 
             // Check if this identifier matches the dimension
-            if ident == dim {
+            if key == dimension_key && !already_qualified && !is_function && !is_type {
                 result.push_str(table_name);
                 result.push('.');
             }
             result.push_str(&ident);
+            previous_was_dot = false;
+            previous_was_as = c != '"' && ident.eq_ignore_ascii_case("AS");
+        } else if c == '\'' {
+            result.push(c);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            previous_was_dot = false;
         } else {
             result.push(c);
+            if !c.is_whitespace() {
+                previous_was_dot = c == '.';
+            }
         }
     }
 
@@ -3632,88 +3696,7 @@ fn qualify_where_for_inner(where_clause: &str) -> String {
 }
 
 fn qualify_where_for_inner_fallback(where_clause: &str) -> String {
-    let mut result = String::new();
-    let mut chars = where_clause.chars().peekable();
-    let mut previous_was_dot = false;
-    let mut previous_was_as = false;
-    // Track interval state: 0=normal, 1=saw INTERVAL keyword, 2=saw INTERVAL + string literal
-    let mut interval_state: u8 = 0;
-
-    while let Some(c) = chars.next() {
-        if c.is_alphabetic() || c == '_' {
-            // Collect identifier
-            let mut ident = String::from(c);
-            while let Some(&next) = chars.peek() {
-                if next.is_alphanumeric() || next == '_' {
-                    ident.push(chars.next().unwrap());
-                } else {
-                    break;
-                }
-            }
-
-            // Check if followed by a dot (already qualified) or paren (function call)
-            let already_qualified = previous_was_dot || chars.peek() == Some(&'.');
-            let is_function = chars.peek() == Some(&'(');
-
-            // SQL keywords that should not be prefixed
-            let keywords = [
-                "AND", "OR", "NOT", "IN", "IS", "AS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
-                "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
-            ];
-            let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
-            let is_type_context = previous_was_as;
-            let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
-            let is_date_part = interval_state == 2 && is_interval_date_part_keyword(&ident);
-
-            if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context && !is_date_part {
-                result.push_str("_inner.");
-            }
-            result.push_str(&ident);
-            previous_was_dot = false;
-            previous_was_as = ident.eq_ignore_ascii_case("AS");
-            // Update interval state
-            if ident.eq_ignore_ascii_case("INTERVAL") && is_typed_literal {
-                interval_state = 1;
-            } else {
-                interval_state = 0;
-            }
-        } else if c == '\'' {
-            // String literal - copy as-is until closing quote
-            result.push(c);
-            previous_was_dot = false;
-            while let Some(next) = chars.next() {
-                result.push(next);
-                if next == '\'' {
-                    // Check for escaped quote ''
-                    if chars.peek() == Some(&'\'') {
-                        result.push(chars.next().unwrap());
-                    } else {
-                        break;
-                    }
-                }
-            }
-            if interval_state == 1 {
-                interval_state = 2;
-            }
-        } else if c == '(' {
-            // Check if this opens a subquery; if so, emit it verbatim
-            if let Some(subquery) = try_consume_subquery_parens(&mut chars) {
-                result.push_str(&subquery);
-            } else {
-                result.push(c);
-            }
-            previous_was_dot = false;
-        } else {
-            result.push(c);
-            previous_was_dot = c == '.';
-            // Non-whitespace after interval string means no date part follows
-            if interval_state == 2 && !c.is_whitespace() {
-                interval_state = 0;
-            }
-        }
-    }
-
-    result
+    qualify_where_for_inner_with_dimensions(where_clause, &HashMap::new())
 }
 
 fn qualify_where_for_outer(where_clause: &str, outer_alias: &str) -> String {
@@ -3800,49 +3783,75 @@ fn qualify_where_for_outer_fallback(where_clause: &str, outer_alias: &str) -> St
     result
 }
 
-fn strip_at_where_qualifiers(condition: &str) -> String {
-    let mut result = String::new();
-    let mut chars = condition.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c.is_alphabetic() || c == '_' {
-            let mut ident = String::from(c);
-            while let Some(&next) = chars.peek() {
-                if next.is_alphanumeric() || next == '_' {
+// Consume identifiers as characters so quoted names retain UTF-8 and doubled
+// quotes. The caller has already consumed the opening character.
+fn consume_where_identifier(
+    first: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> String {
+    let mut ident = String::from(first);
+    if first == '"' {
+        while let Some(next) = chars.next() {
+            ident.push(next);
+            if next == '"' {
+                if chars.peek() == Some(&'"') {
                     ident.push(chars.next().unwrap());
                 } else {
                     break;
                 }
             }
+        }
+    } else {
+        while let Some(&next) = chars.peek() {
+            if next.is_alphanumeric() || next == '_' || next == '$' {
+                ident.push(chars.next().unwrap());
+            } else {
+                break;
+            }
+        }
+    }
+    ident
+}
 
-            let mut last_ident = ident;
-            while chars.peek() == Some(&'.') {
-                chars.next(); // consume '.'
-                if let Some(&next) = chars.peek() {
-                    if next.is_alphabetic() || next == '_' {
-                        let mut next_ident = String::new();
-                        while let Some(&next_ch) = chars.peek() {
-                            if next_ch.is_alphanumeric() || next_ch == '_' {
-                                next_ident.push(chars.next().unwrap());
-                            } else {
-                                break;
-                            }
-                        }
-                        last_ident = next_ident;
-                        continue;
-                    } else {
-                        result.push_str(&last_ident);
-                        result.push('.');
-                        break;
-                    }
-                } else {
-                    result.push_str(&last_ident);
-                    result.push('.');
+fn strip_at_where_qualifiers(condition: &str) -> String {
+    let mut result = String::new();
+    let mut chars = condition.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c.is_alphabetic() || c == '_' || c == '"' {
+            let mut last_ident = consume_where_identifier(c, &mut chars);
+            let mut qualified_ident = last_ident.clone();
+            loop {
+                let mut lookahead = chars.clone();
+                let mut separator = String::new();
+                while lookahead.peek().is_some_and(|ch| ch.is_whitespace()) {
+                    separator.push(lookahead.next().unwrap());
+                }
+                if lookahead.next() != Some('.') {
                     break;
                 }
+                separator.push('.');
+                while lookahead.peek().is_some_and(|ch| ch.is_whitespace()) {
+                    separator.push(lookahead.next().unwrap());
+                }
+                let Some(first) = lookahead.next() else { break };
+                if !first.is_alphabetic() && first != '_' && first != '"' {
+                    break;
+                }
+                last_ident = consume_where_identifier(first, &mut lookahead);
+                qualified_ident.push_str(&separator);
+                qualified_ident.push_str(&last_ident);
+                chars = lookahead;
             }
 
-            result.push_str(&last_ident);
+            // A qualified function name is not a column reference.
+            let mut lookahead = chars.clone();
+            let next = lookahead.find(|ch| !ch.is_whitespace());
+            if next == Some('(') || result.trim_end().ends_with("::") {
+                result.push_str(&qualified_ident);
+            } else {
+                result.push_str(&last_ident);
+            }
         } else if c == '\'' {
             result.push(c);
             while let Some(next) = chars.next() {
@@ -3989,30 +3998,25 @@ fn qualify_where_for_inner_with_dimensions(
     let mut interval_state: u8 = 0;
 
     while let Some(c) = chars.next() {
-        if c.is_alphabetic() || c == '_' {
-            let mut ident = String::from(c);
-            while let Some(&next) = chars.peek() {
-                if next.is_alphanumeric() || next == '_' {
-                    ident.push(chars.next().unwrap());
-                } else {
-                    break;
-                }
-            }
-
-            let already_qualified = previous_was_dot || chars.peek() == Some(&'.');
-            let is_function = chars.peek() == Some(&'(');
+        if c.is_alphabetic() || c == '_' || c == '"' {
+            let quoted = c == '"';
+            let ident = consume_where_identifier(c, &mut chars);
+            let next = chars.clone().find(|ch| !ch.is_whitespace());
+            let already_qualified = previous_was_dot || next == Some('.');
+            let is_function = next == Some('(');
 
             let keywords = [
                 "AND", "OR", "NOT", "IN", "IS", "AS", "NULL", "TRUE", "FALSE", "LIKE", "BETWEEN",
                 "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
             ];
-            let is_keyword = keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
-            let is_type_context = previous_was_as;
-            let is_typed_literal = is_typed_literal_keyword(&ident, &chars);
-            let is_date_part = interval_state == 2 && is_interval_date_part_keyword(&ident);
+            let is_keyword = !quoted && keywords.iter().any(|kw| kw.eq_ignore_ascii_case(&ident));
+            let is_type_context = previous_was_as || result.trim_end().ends_with("::");
+            let is_typed_literal = !quoted && is_typed_literal_keyword(&ident, &chars);
+            let is_date_part = !quoted && interval_state == 2 && is_interval_date_part_keyword(&ident);
 
             if !already_qualified && !is_keyword && !is_function && !is_typed_literal && !is_type_context && !is_date_part {
                 let key = normalize_dimension_key(&ident);
+                let key = if quoted { key.replace("\"\"", "\"") } else { key };
                 if let Some(expr) = dimension_exprs.get(&key) {
                     let inner_expr = qualify_where_for_inner(expr);
                     result.push('(');
@@ -4025,7 +4029,7 @@ fn qualify_where_for_inner_with_dimensions(
             }
             result.push_str(&ident);
             previous_was_dot = false;
-            previous_was_as = ident.eq_ignore_ascii_case("AS");
+            previous_was_as = !quoted && ident.eq_ignore_ascii_case("AS");
             if ident.eq_ignore_ascii_case("INTERVAL") && is_typed_literal {
                 interval_state = 1;
             } else {
@@ -4056,7 +4060,9 @@ fn qualify_where_for_inner_with_dimensions(
             previous_was_dot = false;
         } else {
             result.push(c);
-            previous_was_dot = c == '.';
+            if !c.is_whitespace() {
+                previous_was_dot = c == '.';
+            }
             if interval_state == 2 && !c.is_whitespace() {
                 interval_state = 0;
             }
@@ -7163,7 +7169,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     }
     had_aggregate = true;
 
-    let at_patterns = extract_aggregate_with_at_full(&sql);
+    let at_patterns = parse_aggregate_modifiers(&sql);
     // Keep full expansion path even without AT to handle non-decomposable measures safely
 
     // Prefer parser-FFI FROM extraction (supports JOIN aliases when SQL parses there),
@@ -8513,6 +8519,26 @@ FROM orders"#;
         assert_eq!(
             qualify_outer_reference("year + month", "t", "year"),
             "t.year + month"
+        );
+    }
+
+    #[test]
+    fn test_qualify_outer_reference_quoted_identifiers() {
+        assert_eq!(
+            qualify_outer_reference(r#"("year" - 1) + other.year + "other" . "year""#, "sales", "year"),
+            r#"(sales."year" - 1) + other.year + "other" . "year""#
+        );
+        assert_eq!(
+            qualify_outer_reference(r#""年" + '年' + "年額""#, "t", "年"),
+            r#"t."年" + '年' + "年額""#
+        );
+        assert_eq!(
+            qualify_outer_reference(r#""a""b" + 'a"b'"#, "t", r#""a""b""#),
+            r#"t."a""b" + 'a"b'"#
+        );
+        assert_eq!(
+            qualify_outer_reference("year (created_at) + year + CAST(x AS year) + x::year + 'year''s'", "t", "year"),
+            "year (created_at) + t.year + CAST(x AS year) + x::year + 'year''s'"
         );
     }
 
@@ -10230,6 +10256,54 @@ GROUP BY s.year";
         assert_eq!(
             result,
             ContextModifier::Set("EXTRACT(month FROM date)".to_string(), "6".to_string())
+        );
+    }
+
+    #[test]
+    fn test_at_where_quoted_identifier_qualification() {
+        let dimensions = HashMap::new();
+        assert_eq!(
+            qualify_where_for_inner_with_dimensions(r#"("year" = 2023) AND "年" = 1 AND "a""b" = 2"#, &dimensions),
+            r#"(_inner."year" = 2023) AND _inner."年" = 1 AND _inner."a""b" = 2"#
+        );
+        assert_eq!(
+            qualify_where_for_inner_with_dimensions(r#"t."year" = "t" . "年" AND "AND" = 'year''s 年'"#, &dimensions),
+            r#"t."year" = "t" . "年" AND _inner."AND" = 'year''s 年'"#
+        );
+        assert_eq!(
+            qualify_where_for_inner_with_dimensions(r#"CAST("year" AS INTEGER) = "year"::INTEGER AND YEAR (created_at) = 2023 AND created_at > DATE '2022-01-01' + INTERVAL '1' YEAR"#, &dimensions),
+            r#"CAST(_inner."year" AS INTEGER) = _inner."year"::INTEGER AND YEAR (_inner.created_at) = 2023 AND _inner.created_at > DATE '2022-01-01' + INTERVAL '1' YEAR"#
+        );
+    }
+
+    #[test]
+    fn test_at_where_quoted_dimension_substitution() {
+        let dimensions = HashMap::from([
+            ("year".to_string(), r#"YEAR("created_at")"#.to_string()),
+            ("a\"b".to_string(), "amount + 1".to_string()),
+            ("年".to_string(), "year".to_string()),
+        ]);
+        assert_eq!(
+            qualify_where_for_inner_with_dimensions(r#""Year" = 2023 AND "a""b" > 0 AND "年" = 1 AND label = 'Year'"#, &dimensions),
+            r#"(YEAR(_inner."created_at")) = 2023 AND (_inner.amount + 1) > 0 AND (_inner.year) = 1 AND _inner.label = 'Year'"#
+        );
+    }
+
+    #[test]
+    fn test_strip_at_where_quoted_qualifiers() {
+        let condition = r#"("sales" . "year" = 2023) AND db."sales"."年" = 'sales.年' AND t."a""b" > 0 AND "a.b" = 1"#;
+        let stripped = strip_at_where_qualifiers(condition);
+        assert_eq!(
+            stripped,
+            r#"("year" = 2023) AND "年" = 'sales.年' AND "a""b" > 0 AND "a.b" = 1"#
+        );
+        assert_eq!(
+            qualify_where_for_inner_with_dimensions(&stripped, &HashMap::new()),
+            r#"(_inner."year" = 2023) AND _inner."年" = 'sales.年' AND _inner."a""b" > 0 AND _inner."a.b" = 1"#
+        );
+        assert_eq!(
+            strip_at_where_qualifiers(r#"schema."function" (t."year") = 't.year''s' AND t."year"::schema.my_type = 1"#),
+            r#"schema."function" ("year") = 't.year''s' AND "year"::schema.my_type = 1"#
         );
     }
 
