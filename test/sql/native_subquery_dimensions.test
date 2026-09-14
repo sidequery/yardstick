@@ -1,0 +1,95 @@
+# name: test/sql/native_subquery_dimensions.test
+# description: Subquery projections group outer dependencies and preserve implicit measure output names.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE subquery_dimension_sales(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO subquery_dimension_sales VALUES (2023, 10), (2023, 20), (2024, 40);
+
+statement ok
+CREATE VIEW subquery_dimension_v AS
+SELECT year, SUM(amount) AS MEASURE revenue,
+       SUM(amount) AS MEASURE "Net ""revenue"
+FROM subquery_dimension_sales;
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+query IR rowsort
+SELECT (SELECT 1) + year AS x, revenue FROM subquery_dimension_v;
+----
+2024	30.0
+2025	40.0
+
+query IR rowsort
+SELECT (SELECT year) AS x, revenue FROM subquery_dimension_v;
+----
+2023	30.0
+2024	40.0
+
+# Independent subqueries do not turn the measure into one result per base row.
+query IR
+SELECT (SELECT 1) AS x, revenue FROM subquery_dimension_v;
+----
+1	70.0
+
+query IR
+SELECT (SELECT MAX(year) FROM subquery_dimension_sales) AS x, revenue
+FROM subquery_dimension_v;
+----
+2024	70.0
+
+# A qualified outer reference remains a dimension across an inner FROM scope.
+query IR rowsort
+SELECT (SELECT v.year FROM (VALUES (1)) local_row(i)) AS x, revenue
+FROM subquery_dimension_v v;
+----
+2023	30.0
+2024	40.0
+
+# Inner aliases shadow the outer qualifier; unqualified inner columns also
+# belong to the inner source, not the measure evaluation context.
+query IR
+SELECT (SELECT v.year FROM (VALUES (7)) v(year)) AS x, revenue
+FROM subquery_dimension_v v;
+----
+7	70.0
+
+query IR
+SELECT (SELECT year FROM (VALUES (7)) local_row(year)) AS x, revenue
+FROM subquery_dimension_v;
+----
+7	70.0
+
+query R
+WITH totals AS (SELECT revenue FROM subquery_dimension_v)
+SELECT revenue FROM totals;
+----
+70.0
+
+query R
+SELECT revenue FROM (SELECT v.revenue FROM subquery_dimension_v v) totals;
+----
+70.0
+
+query R
+WITH totals AS (SELECT revenue AS total FROM subquery_dimension_v)
+SELECT total FROM totals;
+----
+70.0
+
+query R
+WITH totals AS (SELECT "Net ""revenue" FROM subquery_dimension_v)
+SELECT "Net ""revenue" FROM totals;
+----
+70.0
+
+endloop

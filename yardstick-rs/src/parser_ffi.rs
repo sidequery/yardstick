@@ -14,6 +14,7 @@
 
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
+use std::cell::RefCell;
 
 // =============================================================================
 // C-compatible types matching yardstick_ffi.h
@@ -82,8 +83,11 @@ pub struct YardstickSelectItem {
     pub is_aggregate: bool,
     pub is_star: bool,
     pub is_measure_ref: bool,
+    pub contains_subquery: bool,
     pub reference_column: *const c_char,
     pub reference_qualifier: *const c_char,
+    pub subquery_dimensions: *const *const c_char,
+    pub subquery_dimension_count: usize,
 }
 
 /// Information about a table in FROM clause
@@ -93,6 +97,51 @@ pub struct YardstickTableRef {
     pub table_name: *const c_char,
     pub alias: *const c_char,
     pub is_subquery: bool,
+    pub schema_qualified: bool,
+}
+
+#[repr(C)]
+pub struct YardstickQueryScope {
+    pub start_pos: u32,
+    pub end_pos: u32,
+    pub visible_ctes: *const *const c_char,
+    pub visible_cte_count: usize,
+}
+
+#[repr(C)]
+pub struct YardstickQueryScopeList {
+    pub scopes: *const YardstickQueryScope,
+    pub count: usize,
+}
+
+pub struct QueryScope {
+    pub start: usize,
+    pub end: usize,
+    pub visible_ctes: Vec<String>,
+}
+
+thread_local! {
+    static QUERY_CTES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Carry enclosing CTE visibility when a native query body is lowered alone.
+/// Restoring on Drop also isolates recursive parser callbacks and unwinding.
+pub struct QueryScopeGuard(Vec<String>);
+
+impl QueryScopeGuard {
+    pub fn enter(ctes: &[String]) -> Self {
+        Self(QUERY_CTES.with(|current| {
+            let previous = current.borrow().clone();
+            current.borrow_mut().extend_from_slice(ctes);
+            previous
+        }))
+    }
+}
+
+impl Drop for QueryScopeGuard {
+    fn drop(&mut self) {
+        QUERY_CTES.with(|current| current.replace(std::mem::take(&mut self.0)));
+    }
 }
 
 /// Native shorthand operand and its exact source span.
@@ -181,6 +230,44 @@ pub struct YardstickReplacement {
 
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+type FnFindQueryScopes = unsafe extern "C" fn(*const c_char) -> *mut YardstickQueryScopeList;
+type FnFreeQueryScopes = unsafe extern "C" fn(*mut YardstickQueryScopeList);
+static FN_FIND_QUERY_SCOPES: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_FREE_QUERY_SCOPES: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+
+/// None preserves the compatibility frontend when the native grammar is unavailable.
+pub fn find_query_scopes(sql: &str) -> Option<Vec<QueryScope>> {
+    let find = FN_FIND_QUERY_SCOPES.load(Ordering::SeqCst);
+    let free = FN_FREE_QUERY_SCOPES.load(Ordering::SeqCst);
+    if find.is_null() || free.is_null() {
+        return None;
+    }
+    let sql = CString::new(sql).ok()?;
+    unsafe {
+        let find: FnFindQueryScopes = std::mem::transmute(find);
+        let free: FnFreeQueryScopes = std::mem::transmute(free);
+        let list = find(sql.as_ptr());
+        if list.is_null() {
+            return None;
+        }
+        let mut scopes = Vec::with_capacity((*list).count);
+        for index in 0..(*list).count {
+            let scope = &*(*list).scopes.add(index);
+            let mut visible_ctes = Vec::with_capacity(scope.visible_cte_count);
+            for cte in 0..scope.visible_cte_count {
+                visible_ctes.push(CStr::from_ptr(*scope.visible_ctes.add(cte)).to_string_lossy().into_owned());
+            }
+            scopes.push(QueryScope {
+                start: scope.start_pos as usize,
+                end: scope.end_pos as usize,
+                visible_ctes,
+            });
+        }
+        free(list);
+        Some(scopes)
+    }
+}
+
 #[repr(C)]
 pub struct YardstickCurrentReference {
     pub dimension: *const c_char,
@@ -203,6 +290,49 @@ type FnCurrentWhereIsSingleValued = unsafe extern "C" fn(*const c_char, *const c
 static FN_CURRENT_WHERE_IS_SINGLE_VALUED: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 type FnExpressionsEqual = unsafe extern "C" fn(*const c_char, *const c_char) -> i32;
 static FN_EXPRESSIONS_EQUAL: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+type FnRewriteVisibleFilter = unsafe extern "C" fn(
+    *const c_char, *const c_char, *const *const c_char, *const *const c_char, usize, *mut *mut c_char,
+) -> *mut c_char;
+static FN_REWRITE_VISIBLE_FILTER: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+
+/// Rebind the measure relation while retaining nested and ancestor references.
+/// None keeps the compatibility frontend when native parsing is unavailable.
+pub fn rewrite_visible_filter(
+    expression: &str,
+    local_alias: Option<&str>,
+    dimension_expressions: &std::collections::HashMap<String, String>,
+) -> Option<Result<String, String>> {
+    let function = FN_REWRITE_VISIBLE_FILTER.load(Ordering::SeqCst);
+    if function.is_null() || FN_FREE_STRING.load(Ordering::SeqCst).is_null() {
+        return None;
+    }
+    let expression = CString::new(expression).ok()?;
+    let local_alias = CString::new(local_alias.unwrap_or("")).ok()?;
+    let entries = dimension_expressions.iter()
+        .map(|(name, expression)| Some((CString::new(name.as_str()).ok()?, CString::new(expression.as_str()).ok()?)))
+        .collect::<Option<Vec<_>>>()?;
+    let names: Vec<_> = entries.iter().map(|(name, _)| name.as_ptr()).collect();
+    let expressions: Vec<_> = entries.iter().map(|(_, expression)| expression.as_ptr()).collect();
+    unsafe {
+        let function: FnRewriteVisibleFilter = std::mem::transmute(function);
+        let mut error = ptr::null_mut();
+        let result = function(expression.as_ptr(), local_alias.as_ptr(), names.as_ptr(), expressions.as_ptr(), names.len(), &mut error);
+        if !error.is_null() {
+            let text = CStr::from_ptr(error).to_string_lossy().into_owned();
+            yardstick_free_string(error);
+            if !result.is_null() {
+                yardstick_free_string(result);
+            }
+            return Some(Err(text));
+        }
+        if result.is_null() {
+            return None;
+        }
+        let text = CStr::from_ptr(result).to_string_lossy().into_owned();
+        yardstick_free_string(result);
+        Some(Ok(text))
+    }
+}
 
 pub fn expressions_equal(left: &str, right: &str) -> Option<bool> {
     let function = FN_EXPRESSIONS_EQUAL.load(Ordering::SeqCst);
@@ -333,6 +463,9 @@ pub extern "C" fn yardstick_init_parser_ffi(
     free_current_references: FnFreeCurrentReferences,
     current_where_is_single_valued: FnCurrentWhereIsSingleValued,
     expressions_equal: FnExpressionsEqual,
+    find_query_scopes: FnFindQueryScopes,
+    free_query_scopes: FnFreeQueryScopes,
+    rewrite_visible_filter: FnRewriteVisibleFilter,
 ) {
     FN_FIND_AGGREGATES.store(find_aggregates as *mut (), Ordering::SeqCst);
     FN_FREE_AGGREGATE_LIST.store(free_aggregate_list as *mut (), Ordering::SeqCst);
@@ -352,6 +485,9 @@ pub extern "C" fn yardstick_init_parser_ffi(
     FN_FREE_CURRENT_REFERENCES.store(free_current_references as *mut (), Ordering::SeqCst);
     FN_CURRENT_WHERE_IS_SINGLE_VALUED.store(current_where_is_single_valued as *mut (), Ordering::SeqCst);
     FN_EXPRESSIONS_EQUAL.store(expressions_equal as *mut (), Ordering::SeqCst);
+    FN_FIND_QUERY_SCOPES.store(find_query_scopes as *mut (), Ordering::SeqCst);
+    FN_FREE_QUERY_SCOPES.store(free_query_scopes as *mut (), Ordering::SeqCst);
+    FN_REWRITE_VISIBLE_FILTER.store(rewrite_visible_filter as *mut (), Ordering::SeqCst);
 }
 
 // Helper macros to call function pointers
@@ -545,8 +681,10 @@ pub struct SelectItem {
     pub is_aggregate: bool,
     pub is_star: bool,
     pub is_measure_ref: bool,
+    pub contains_subquery: bool,
     pub reference_column: Option<String>,
     pub reference_qualifier: Option<String>,
+    pub subquery_dimensions: Vec<String>,
 }
 
 /// Safe wrapper for table reference information
@@ -760,8 +898,12 @@ pub fn parse_select(sql: &str) -> Result<SelectInfo, String> {
                 is_aggregate: item.is_aggregate,
                 is_star: item.is_star,
                 is_measure_ref: item.is_measure_ref,
+                contains_subquery: item.contains_subquery,
                 reference_column: c_str_to_string(item.reference_column),
                 reference_qualifier: c_str_to_string(item.reference_qualifier),
+                subquery_dimensions: (0..item.subquery_dimension_count)
+                    .filter_map(|i| c_str_to_string(*item.subquery_dimensions.add(i)))
+                    .collect(),
             });
         }
 
@@ -769,10 +911,13 @@ pub fn parse_select(sql: &str) -> Result<SelectInfo, String> {
         let mut tables = Vec::with_capacity(info.table_count);
         for i in 0..info.table_count {
             let table = &*info.tables.add(i);
+            let table_name = c_str_to_string(table.table_name).unwrap_or_default();
+            let inherited_cte = info.native_parsed && !table.schema_qualified &&
+                QUERY_CTES.with(|ctes| ctes.borrow().iter().any(|cte| cte.eq_ignore_ascii_case(&table_name)));
             tables.push(TableRef {
-                table_name: c_str_to_string(table.table_name).unwrap_or_default(),
+                table_name,
                 alias: c_str_to_string(table.alias),
-                is_subquery: table.is_subquery,
+                is_subquery: table.is_subquery || inherited_cte,
             });
         }
 

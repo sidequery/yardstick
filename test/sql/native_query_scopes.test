@@ -1,0 +1,193 @@
+# name: test/sql/native_query_scopes.test
+# description: Native query boundaries isolate measure lookup and grouping.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE query_scope_sales(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO query_scope_sales VALUES (2023, 10), (2023, 20), (2024, 50);
+
+statement ok
+CREATE VIEW query_scope_v AS SELECT year, SUM(amount) AS MEASURE revenue FROM query_scope_sales;
+
+statement ok
+CREATE VIEW query_scope_ten AS SELECT year, SUM(amount * 10) AS MEASURE revenue FROM query_scope_sales;
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+# Visible filters rebind local columns but preserve enclosing correlations.
+query IR rowsort
+SELECT year, (SELECT AGGREGATE(revenue) FROM query_scope_v i WHERE i.year = o.year)
+FROM query_scope_v o;
+----
+2023	30.0
+2023	30.0
+2024	50.0
+
+query IR rowsort
+SELECT year, (SELECT revenue AT (VISIBLE) FROM query_scope_v i WHERE i.year = o.year)
+FROM query_scope_v o;
+----
+2023	30.0
+2023	30.0
+2024	50.0
+
+# Nested filter queries retain local aliases and correlations to the view.
+query R
+SELECT AGGREGATE(revenue) FROM query_scope_v o
+WHERE EXISTS (SELECT 1 FROM query_scope_sales s WHERE s.year = o.year AND s.amount = 50);
+----
+50.0
+
+query R
+SELECT AGGREGATE(revenue) FROM query_scope_v o
+WHERE year IN (SELECT year FROM query_scope_sales WHERE amount = 50);
+----
+50.0
+
+query R
+SELECT AGGREGATE(revenue) FROM query_scope_v o
+WHERE EXISTS (SELECT 1 FROM query_scope_sales o WHERE o.amount = 50);
+----
+80.0
+
+# A nested binding must not capture the generated recomputation qualifier.
+statement error
+SELECT AGGREGATE(revenue) FROM query_scope_v o
+WHERE EXISTS (SELECT 1 FROM query_scope_sales _inner WHERE _inner.year = o.year);
+----
+Conflicting recomputation alias
+
+# A failed rewrite cannot leak into the next statement on this connection.
+query R
+SELECT AGGREGATE(revenue) FROM query_scope_v WHERE year = 2023;
+----
+30.0
+
+query R
+SELECT AGGREGATE(revenue) FROM query_scope_v
+WHERE EXISTS (SELECT 1 AS year WHERE year = 1);
+----
+80.0
+
+# Identical measure names in inner and outer queries resolve independently.
+query RR
+SELECT AGGREGATE(revenue), (SELECT AGGREGATE(revenue) FROM query_scope_ten) FROM query_scope_v;
+----
+80.0	800.0
+
+query IR rowsort
+SELECT * FROM (SELECT year, revenue FROM query_scope_v) nested;
+----
+2023	30.0
+2024	50.0
+
+query IR rowsort
+WITH /* 東京 */ "year totals"(fiscal_year, total) AS MATERIALIZED (
+    SELECT year, revenue AT (VISIBLE) FROM query_scope_v
+)
+SELECT * FROM "year totals";
+----
+2023	30.0
+2024	50.0
+
+query IR rowsort
+WITH totals AS NOT MATERIALIZED (SELECT year, revenue FROM query_scope_v)
+SELECT * FROM totals;
+----
+2023	30.0
+2024	50.0
+
+# Each set operand gets its own relation and implicit grouping context.
+query IR rowsort
+SELECT year, revenue FROM query_scope_v
+UNION ALL
+SELECT year, revenue FROM query_scope_ten;
+----
+2023	30.0
+2023	300.0
+2024	50.0
+2024	500.0
+
+# An enclosing CTE stays visible inside extracted nested query bodies.
+query I
+WITH query_scope_v AS (SELECT 17 AS revenue)
+SELECT * FROM (SELECT revenue FROM query_scope_v) nested;
+----
+17
+
+query R
+WITH query_scope_v AS (SELECT 17 AS revenue)
+SELECT * FROM (SELECT revenue FROM main.query_scope_v) nested;
+----
+80.0
+
+# Non-recursive CTE bodies can read the same-named catalog view.
+query R
+WITH query_scope_v AS (SELECT revenue FROM query_scope_v)
+SELECT revenue FROM query_scope_v;
+----
+80.0
+
+# Recursive references are ordinary CTE columns, even when a catalog view has
+# the same name and measure column.
+query II rowsort
+WITH RECURSIVE query_scope_v(n, revenue) AS (
+    SELECT 1, 7
+    UNION ALL
+    SELECT n + 1, revenue FROM query_scope_v WHERE n < 2
+)
+SELECT * FROM query_scope_v;
+----
+1	7
+2	7
+
+statement ok
+CREATE OR REPLACE TABLE query_scope_output AS (
+    WITH totals AS MATERIALIZED (SELECT year, revenue FROM query_scope_v)
+    SELECT * FROM totals
+);
+
+query IR rowsort
+SELECT * FROM query_scope_output;
+----
+2023	30.0
+2024	50.0
+
+statement ok
+DELETE FROM query_scope_output;
+
+statement ok
+WITH totals AS MATERIALIZED (SELECT year, revenue FROM query_scope_ten)
+INSERT INTO query_scope_output SELECT * FROM totals;
+
+query IR rowsort
+SELECT * FROM query_scope_output;
+----
+2023	300.0
+2024	500.0
+
+# Lambda parameters shadow columns while captured relation references rebind.
+query R
+SELECT AGGREGATE(revenue) FROM query_scope_v v
+WHERE len(list_filter([2023], lambda year: year = v.year)) = 1;
+----
+30.0
+
+# An independent subquery can use the internal alias without capturing a
+# rewritten correlation reference.
+query R
+SELECT AGGREGATE(revenue) FROM query_scope_v v
+WHERE EXISTS (SELECT 1 FROM query_scope_sales _inner WHERE _inner.year = 2023);
+----
+80.0
+
+endloop

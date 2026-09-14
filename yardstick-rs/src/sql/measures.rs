@@ -558,6 +558,16 @@ fn native_item_is_implicit_measure_ref(
 }
 
 pub fn has_implicit_measure_refs(sql: &str) -> bool {
+    if let Some(scopes) = parser_ffi::find_query_scopes(sql) {
+        return scopes.iter().any(|scope| {
+            let _scope = parser_ffi::QueryScopeGuard::enter(&scope.visible_ctes);
+            sql.get(scope.start..scope.end).is_some_and(has_implicit_query_refs)
+        });
+    }
+    has_implicit_query_refs(sql)
+}
+
+fn has_implicit_query_refs(sql: &str) -> bool {
     let known_measures = known_measure_names();
     if known_measures.is_empty() {
         return false;
@@ -840,10 +850,17 @@ fn rewrite_implicit_measure_refs(sql: &str) -> String {
             let Some(expression) = sql.get(start..end).filter(|_| start < end) else {
                 continue;
             };
+            let output_alias = if item.alias.is_none() {
+                item.reference_column.as_ref()
+                    .map(|column| format!(" AS \"{}\"", column.replace('"', "\"\"")))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             replacements.push(parser_ffi::Replacement {
                 start_pos: item.start_pos,
                 end_pos: item.end_pos,
-                replacement: format!("AGGREGATE({expression}) {DEFAULT_CONTEXT_MARKER}"),
+                replacement: format!("AGGREGATE({expression}) {DEFAULT_CONTEXT_MARKER}{output_alias}"),
             });
             continue;
         }
@@ -1076,6 +1093,12 @@ fn rewrite_measure_at_refs(sql: &str) -> String {
 }
 
 pub fn has_measure_at_refs(sql: &str) -> bool {
+    if let Some(scopes) = parser_ffi::find_query_scopes(sql) {
+        return scopes.iter().any(|scope| {
+            let _scope = parser_ffi::QueryScopeGuard::enter(&scope.visible_ctes);
+            sql.get(scope.start..scope.end).is_some_and(|query| rewrite_measure_at_refs(query) != query)
+        });
+    }
     rewrite_measure_at_refs(sql) != sql
 }
 
@@ -3419,7 +3442,7 @@ pub fn is_count_distinct(expr: &str) -> bool {
 
 /// Expand derived measure expression by replacing measure references with their aggregations
 /// "revenue - cost" with measures [revenue=SUM(amount), cost=SUM(expense)]
-/// -> "SUM(revenue) - SUM(cost)"
+/// -> "(SUM(amount)) - (SUM(expense))"
 fn expand_derived_measure_expr(expr: &str, measure_view: &MeasureView) -> String {
     let mut result = String::new();
     let mut chars = expr.chars().peekable();
@@ -4055,6 +4078,57 @@ fn consume_where_identifier(
         }
     }
     ident
+}
+
+// Carry native rewrite failures through string-returning lowering helpers.
+thread_local! {
+    static FILTER_REWRITE_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+struct FilterRewriteGuard(Option<String>);
+
+impl FilterRewriteGuard {
+    fn enter() -> Self {
+        Self(FILTER_REWRITE_ERROR.with(|error| error.take()))
+    }
+}
+
+impl Drop for FilterRewriteGuard {
+    fn drop(&mut self) {
+        FILTER_REWRITE_ERROR.with(|error| error.replace(self.0.take()));
+    }
+}
+
+fn native_visible_filter(
+    condition: &str,
+    local_alias: Option<&str>,
+    dimension_exprs: &HashMap<String, String>,
+) -> Option<String> {
+    parser_ffi::rewrite_visible_filter(condition, local_alias, dimension_exprs).map(|result| {
+        result.unwrap_or_else(|error| {
+            // Lowering helpers return SQL strings. Carry native failures to the
+            // query boundary, which rejects the rewrite before SQL is executed.
+            FILTER_REWRITE_ERROR.with(|current| {
+                current.borrow_mut().get_or_insert(error);
+            });
+            condition.to_string()
+        })
+    })
+}
+
+/// Rebind visible filters while retaining ancestor correlations. AT WHERE has
+/// separate qualifier semantics and does not use this helper.
+fn qualify_visible_filter(
+    condition: &str,
+    local_alias: Option<&str>,
+    dimension_exprs: &HashMap<String, String>,
+) -> String {
+    native_visible_filter(condition, local_alias, dimension_exprs).unwrap_or_else(|| {
+        qualify_where_for_inner_with_dimensions(
+            &strip_at_where_qualifiers(condition),
+            dimension_exprs,
+        )
+    })
 }
 
 fn strip_at_where_qualifiers(condition: &str) -> String {
@@ -5617,7 +5691,8 @@ fn build_non_decomposable_join_plan(
 
     if modifiers.is_empty() {
         if let Some(w) = outer_where {
-            effective_where = Some(qualify_where_for_inner_with_dimensions(w, dimension_exprs));
+            effective_where = Some(native_visible_filter(w, outer_alias, dimension_exprs)
+                .unwrap_or_else(|| qualify_where_for_inner_with_dimensions(w, dimension_exprs)));
         }
     } else {
         let all_are_all = modifiers
@@ -5650,11 +5725,7 @@ fn build_non_decomposable_join_plan(
                     ContextModifier::Visible => {
                         if !has_set && !has_all_global {
                             if let Some(w) = outer_where {
-                                let stripped = strip_at_where_qualifiers(w);
-                                effective_where = Some(qualify_where_for_inner_with_dimensions(
-                                    &stripped,
-                                    dimension_exprs,
-                                ));
+                                effective_where = Some(qualify_visible_filter(w, outer_alias, dimension_exprs));
                             }
                         }
                     }
@@ -5884,11 +5955,7 @@ fn expand_non_decomposable_to_sql(
             ContextModifier::Visible => {
                 if !has_set && !has_all_global {
                     if let Some(w) = outer_where {
-                        let stripped = strip_at_where_qualifiers(w);
-                        effective_where = Some(qualify_where_for_inner_with_dimensions(
-                            &stripped,
-                            dimension_exprs,
-                        ));
+                        effective_where = Some(qualify_visible_filter(w, outer_alias, dimension_exprs));
                     }
                 }
             }
@@ -6056,9 +6123,7 @@ fn expand_non_decomposable_at_to_sql(
             if group_by_cols.is_empty() {
                 match outer_where {
                     Some(w) => {
-                        let stripped = strip_at_where_qualifiers(w);
-                        let qualified =
-                            qualify_where_for_inner_with_dimensions(&stripped, dimension_exprs);
+                        let qualified = qualify_visible_filter(w, outer_alias, dimension_exprs);
                         format!(
                             "(SELECT {expression} FROM {base_relation} _inner WHERE {qualified})"
                         )
@@ -6072,11 +6137,7 @@ fn expand_non_decomposable_at_to_sql(
                     .collect();
                 let full_where = match outer_where {
                     Some(w) => {
-                        let stripped = strip_at_where_qualifiers(w);
-                        let qualified = qualify_where_for_inner_with_dimensions(
-                            &stripped,
-                            dimension_exprs,
-                        );
+                        let qualified = qualify_visible_filter(w, outer_alias, dimension_exprs);
                         format!("{} AND {}", where_clauses.join(" AND "), qualified)
                     }
                     None => where_clauses.join(" AND "),
@@ -6383,8 +6444,7 @@ pub fn expand_modifiers_to_sql(
                 // Per paper: SET bypasses outer WHERE, so VISIBLE has no effect when SET is present
                 if !has_set && !has_all_global {
                     if let Some(w) = outer_where {
-                        let stripped = strip_at_where_qualifiers(w);
-                        effective_where = Some(qualify_where_for_inner(&stripped));
+                        effective_where = Some(qualify_visible_filter(w, outer_alias, &HashMap::new()));
                     }
                 }
             }
@@ -6577,8 +6637,7 @@ fn expand_modifiers_to_sql_derived(
                 // Per paper: SET bypasses outer WHERE, so VISIBLE has no effect when SET is present
                 if !has_set && !has_all_global {
                     if let Some(w) = outer_where {
-                        let stripped = strip_at_where_qualifiers(w);
-                        effective_where = Some(qualify_where_for_inner(&stripped));
+                        effective_where = Some(qualify_visible_filter(w, outer_alias, &HashMap::new()));
                     }
                 }
             }
@@ -7403,7 +7462,87 @@ fn warning_for_at_all_ungrouped_where_with_qualifiers(
 
 /// Expand AGGREGATE() with AT modifiers in SQL
 pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
-    let cte_expansion = if let Some((body_start, body_end)) =
+    if let Some(scopes) = parser_ffi::find_query_scopes(sql) {
+        return expand_native_query_scopes(sql, &scopes);
+    }
+    expand_aggregate_query(sql, false)
+}
+
+fn expand_native_query_scopes(sql: &str, scopes: &[parser_ffi::QueryScope]) -> AggregateExpandResult {
+    // Native scopes are ordered by source start, with enclosing ranges first.
+    // Establish containment once, then lower children before their parent. CTE
+    // bodies and set-operation operands are siblings, not one aggregate scope.
+    let mut children = vec![Vec::new(); scopes.len()];
+    let mut roots = Vec::new();
+    let mut ancestors: Vec<usize> = Vec::new();
+    for (index, scope) in scopes.iter().enumerate() {
+        if scope.start >= scope.end || sql.get(scope.start..scope.end).is_none() {
+            return AggregateExpandResult {
+                had_aggregate: true, expanded_sql: sql.to_string(),
+                error: Some("Invalid native query source range".to_string()), warnings: Vec::new(),
+            };
+        }
+        while ancestors.last().is_some_and(|parent| scopes[*parent].end <= scope.start) {
+            ancestors.pop();
+        }
+        if let Some(&parent) = ancestors.last() {
+            if scope.end > scopes[parent].end {
+                return AggregateExpandResult {
+                    had_aggregate: true, expanded_sql: sql.to_string(),
+                    error: Some("Overlapping native query scopes".to_string()), warnings: Vec::new(),
+                };
+            }
+            children[parent].push(index);
+        } else {
+            roots.push(index);
+        }
+        ancestors.push(index);
+    }
+    let mut lowered: Vec<String> = vec![String::new(); scopes.len()];
+    let mut had_aggregate = false;
+    let mut warnings = Vec::new();
+    for index in (0..scopes.len()).rev() {
+        let scope = &scopes[index];
+        let mut query = sql[scope.start..scope.end].to_string();
+        for &child in children[index].iter().rev() {
+            query.replace_range(scopes[child].start - scope.start..scopes[child].end - scope.start, &lowered[child]);
+        }
+        let _scope = parser_ffi::QueryScopeGuard::enter(&scope.visible_ctes);
+        let expanded = expand_aggregate_query(&query, true);
+        had_aggregate |= expanded.had_aggregate;
+        for warning in expanded.warnings {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+        if expanded.error.is_some() {
+            return AggregateExpandResult {
+                had_aggregate, expanded_sql: sql.to_string(), error: expanded.error, warnings,
+            };
+        }
+        lowered[index] = expanded.expanded_sql;
+    }
+    let mut expanded_sql = sql.to_string();
+    for &root in roots.iter().rev() {
+        expanded_sql.replace_range(scopes[root].start..scopes[root].end, &lowered[root]);
+    }
+    AggregateExpandResult { had_aggregate, expanded_sql, error: None, warnings }
+}
+
+fn expand_aggregate_query(sql: &str, native_scope: bool) -> AggregateExpandResult {
+    let _filter_scope = FilterRewriteGuard::enter();
+    let mut expanded = expand_aggregate_query_impl(sql, native_scope);
+    if let Some(error) = FILTER_REWRITE_ERROR.with(|error| error.take()) {
+        expanded.error = Some(error);
+        expanded.expanded_sql = sql.to_string();
+    }
+    expanded
+}
+
+fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpandResult {
+    let cte_expansion = if native_scope {
+        CteExpansion { sql: sql.to_string(), had_aggregate: false, warnings: Vec::new() }
+    } else if let Some((body_start, body_end)) =
         top_level_parenthesized_query_body_range(sql)
     {
         let body_sql = &sql[body_start..body_end];
@@ -7431,12 +7570,12 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
     let mut had_aggregate = cte_expansion.had_aggregate;
     let mut warnings = cte_expansion.warnings;
 
-    if has_measure_at_refs(&sql) {
+    if rewrite_measure_at_refs(&sql) != sql {
         sql = rewrite_measure_at_refs(&sql);
         had_aggregate = true;
     }
 
-    if has_implicit_measure_refs(&sql) {
+    if has_implicit_query_refs(&sql) {
         sql = rewrite_implicit_measure_refs(&sql);
         had_aggregate = true;
     }
@@ -7460,7 +7599,7 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     // Prefer parser-FFI FROM extraction (supports JOIN aliases when SQL parses there),
     // then fall back to string extraction for AGGREGATE/AT syntax that parser-FFI cannot parse.
-    let context_sql = aggregate_context_sql(&sql);
+    let context_sql = if native_scope { &sql } else { aggregate_context_sql(&sql) };
     let mut from_info = extract_from_clause_info(context_sql);
     let (primary_table_name, existing_alias) = if let Some(pt) = from_info.primary_table.clone() {
         let alias = if pt.has_alias {
@@ -7856,7 +7995,12 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
 
     // If no GROUP BY, add explicit GROUP BY with dimension columns from original SQL
     // (GROUP BY ALL doesn't work reliably with scalar subqueries mixed with aggregates)
-    if !has_group_by_anywhere(&result_sql) && !original_dim_cols.is_empty() {
+    let has_group_by = if native_scope {
+        parser_ffi::parse_select(&result_sql).map(|info| info.has_group_by).unwrap_or(false)
+    } else {
+        has_group_by_anywhere(&result_sql)
+    };
+    if !has_group_by && !original_dim_cols.is_empty() {
         // Find insertion point: before ORDER BY, LIMIT, HAVING, or at end
         let insert_pos = find_group_by_insert_pos(&result_sql);
 
@@ -8158,14 +8302,19 @@ fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
             return info.items.into_iter()
                 .filter(|item| !item.is_aggregate && !item.is_star && !item.is_measure_ref)
                 .filter(|item| !is_literal_constant(&item.expression_sql))
-                .map(|item| {
+                .flat_map(|item| {
+                    if item.contains_subquery {
+                        // DuckDB cannot GROUP BY a subquery expression. Group
+                        // its outer dependencies; independent subqueries add none.
+                        return item.subquery_dimensions;
+                    }
                     // Preserve the caller's expression spelling. DuckDB's
                     // rendering adds parentheses around binary operators,
                     // which must not change the lowerer's alias decisions.
-                    sql.get(item.start_pos as usize..item.end_pos as usize)
+                    vec![sql.get(item.start_pos as usize..item.end_pos as usize)
                         .filter(|expression| !expression.is_empty())
                         .unwrap_or(&item.expression_sql)
-                        .to_string()
+                        .to_string()]
                 })
                 .collect();
         }
@@ -8560,7 +8709,8 @@ FROM orders"#;
         assert_eq!(result.measures.len(), 1);
         assert_eq!(result.measures[0].column_name, "revenue");
         assert!(result.clean_sql.is_ascii());
-        assert!(result.clean_sql.contains("-- caf"));
+        // Lowering replaces the measured expression and its leading comment.
+        assert!(result.clean_sql.contains("NULL AS revenue"));
         assert!(result.clean_sql.contains("/*"));
         assert!(!result.clean_sql.contains("café"));
         assert!(!result.clean_sql.contains("東京"));
@@ -8709,10 +8859,11 @@ FROM orders"#;
         assert_eq!(result.measures[2].column_name, "profit");
         assert_eq!(result.measures[2].expression, "revenue - cost");
 
-        // Clean SQL should NOT contain the derived measure column
-        assert!(result.clean_sql.contains("AS revenue"));
-        assert!(result.clean_sql.contains("AS cost"));
-        assert!(!result.clean_sql.contains("AS profit"));
+        // Every virtual measure keeps a bindable column placeholder, including
+        // derived measures; their expressions are evaluated during expansion.
+        assert!(result.clean_sql.contains("NULL AS revenue"));
+        assert!(result.clean_sql.contains("NULL AS cost"));
+        assert!(result.clean_sql.contains("NULL AS profit"));
         assert!(!result.clean_sql.contains("revenue - cost"));
     }
 
@@ -10421,15 +10572,15 @@ FROM orders"#;
 
         // Simple subtraction
         let expanded = expand_derived_measure_expr("revenue - cost", &mv);
-        assert_eq!(expanded, "SUM(revenue) - SUM(cost)");
+        assert_eq!(expanded, "(SUM(amount)) - (SUM(expense))");
 
         // With parentheses
         let expanded2 = expand_derived_measure_expr("(revenue - cost) / revenue", &mv);
-        assert_eq!(expanded2, "(SUM(revenue) - SUM(cost)) / SUM(revenue)");
+        assert_eq!(expanded2, "((SUM(amount)) - (SUM(expense))) / (SUM(amount))");
 
         // Non-measure identifiers preserved
         let expanded3 = expand_derived_measure_expr("revenue * 100", &mv);
-        assert_eq!(expanded3, "SUM(revenue) * 100");
+        assert_eq!(expanded3, "(SUM(amount)) * 100");
     }
 
     #[test]
@@ -10452,7 +10603,7 @@ FROM orders"#;
             expand_derived_measure_expr("CASE WHEN status = 'revenue' THEN revenue ELSE 0 END", &mv);
         assert_eq!(
             expanded,
-            "CASE WHEN status = 'revenue' THEN SUM(revenue) ELSE 0 END"
+            "CASE WHEN status = 'revenue' THEN (SUM(amount)) ELSE 0 END"
         );
     }
 
@@ -10721,8 +10872,10 @@ GROUP BY s.year";
 
         eprintln!("Expanded SQL: {}", result.expanded_sql);
         assert!(result.had_aggregate);
-        // Should still use orders_v (the measure's source), not customers
-        assert!(result.expanded_sql.contains("FROM orders_v"));
+        // Recompute from the measure's base rows even when its view is second.
+        assert!(result.error.is_none());
+        assert!(result.expanded_sql.contains("(SELECT SUM(amount) FROM (SELECT * FROM orders))"));
+        assert!(result.expanded_sql.contains("FROM customers c JOIN orders_v o ON c.order_id = o.id"));
     }
 
     #[test]
@@ -11092,16 +11245,18 @@ GROUP BY s.year";
             Some("orders".to_string()),
         );
 
-        // Plain AGGREGATE should fast-path to the view's measure column
+        // DISTINCT cannot be re-aggregated from per-group counts. Recompute
+        // from base rows, correlated to every dimension in the query context.
         let sql = "SELECT year, region, AGGREGATE(unique_customers) FROM orders_v GROUP BY year, region";
         let result = expand_aggregate_with_at(sql);
 
         eprintln!("Expanded SQL: {}", result.expanded_sql);
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
-        assert!(result.expanded_sql.contains("MAX("));
-        assert!(result.expanded_sql.contains("unique_customers"));
-        assert!(!result.expanded_sql.contains("COUNT(DISTINCT"));
+        assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
+        assert!(result.expanded_sql.contains("FROM (SELECT * FROM orders) _inner"));
+        assert!(result.expanded_sql.contains("_inner.year IS NOT DISTINCT FROM orders_v.year"));
+        assert!(result.expanded_sql.contains("_inner.region IS NOT DISTINCT FROM orders_v.region"));
     }
 
     #[test]
@@ -11160,8 +11315,9 @@ GROUP BY s.year";
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
         assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
-        assert!(result.expanded_sql.contains("LEFT JOIN"));
-        assert!(result.expanded_sql.contains("IS NOT DISTINCT FROM _outer.year"));
+        assert!(result.expanded_sql.contains("FROM (SELECT * FROM orders) _inner"));
+        assert!(result.expanded_sql.contains("_inner.year IS NOT DISTINCT FROM _outer.year"));
+        assert!(!result.expanded_sql.contains("_inner.region"));
     }
 
     #[test]
@@ -11215,8 +11371,9 @@ GROUP BY s.year";
 
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
-        assert!(result.expanded_sql.contains("LEFT JOIN"));
-        assert!(result.expanded_sql.contains("year - 1"));
+        assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
+        assert!(result.expanded_sql.contains("FROM (SELECT * FROM orders) _inner"));
+        assert!(result.expanded_sql.contains("_inner.year IS NOT DISTINCT FROM _outer.year - 1"));
     }
 
     #[test]
@@ -11252,7 +11409,8 @@ GROUP BY s.year";
 
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
-        assert!(result.expanded_sql.contains("LEFT JOIN (SELECT"));
+        assert!(result.expanded_sql.contains("(SELECT COUNT(DISTINCT customer_id) FROM (SELECT * FROM orders o"));
+        assert!(result.expanded_sql.contains("_inner.year IS NOT DISTINCT FROM orders_v.year"));
         assert!(result.expanded_sql.contains("JOIN regions r ON o.region_id = r.id"));
         assert!(result.expanded_sql.contains("o.status = 'paid'"));
     }
@@ -11293,11 +11451,12 @@ GROUP BY s.year";
 
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
-        assert!(result.expanded_sql.contains("LEFT JOIN"));
-        assert!(result
-            .expanded_sql
-            .contains("date_trunc('year', _inner.order_date) AS dim_0"));
-        assert!(result.expanded_sql.contains("IS NOT DISTINCT FROM _outer.year"));
+        assert!(result.expanded_sql.contains("COUNT(DISTINCT customer_id)"));
+        assert!(result.expanded_sql.contains("FROM (SELECT * FROM orders) _inner"));
+        assert!(result.expanded_sql.contains(
+            "date_trunc('year', _inner.order_date) IS NOT DISTINCT FROM _outer.year"
+        ));
+        assert!(!result.expanded_sql.contains("_inner.region"));
     }
 
     #[test]
@@ -11312,7 +11471,7 @@ GROUP BY s.year";
                 expression: "COUNT(DISTINCT customer_id)".to_string(),
                 is_decomposable: false,
             }],
-            "SELECT year, region FROM a UNION ALL SELECT year, region FROM b",
+            "SELECT year, region, customer_id FROM a UNION ALL SELECT year, region, customer_id FROM b",
             None,
         );
 
@@ -11322,9 +11481,10 @@ GROUP BY s.year";
 
         assert!(result.had_aggregate);
         assert!(result.error.is_none());
-        assert!(result.expanded_sql.contains("LEFT JOIN"));
+        assert!(result.expanded_sql.contains("(SELECT COUNT(DISTINCT customer_id)"));
+        assert!(result.expanded_sql.contains("_inner.year IS NOT DISTINCT FROM orders_v.year"));
         assert!(result.expanded_sql.contains(
-            "FROM (SELECT * FROM (SELECT year, region FROM a UNION ALL SELECT year, region FROM b)) _inner"
+            "FROM (SELECT * FROM (SELECT year, region, customer_id FROM a UNION ALL SELECT year, region, customer_id FROM b)) _inner"
         ));
     }
 
@@ -11400,17 +11560,11 @@ GROUP BY s.year";
             "Expected ANY_VALUE wrapper for expression dimension, got: {}",
             result.expanded_sql
         );
-        // Should have _outer alias since expression dimension needs correlation
-        assert!(
-            result.expanded_sql.contains("_outer"),
-            "Expected _outer alias for expression dimension, got: {}",
-            result.expanded_sql
-        );
-        // Should NOT produce bare table.column references that fail GROUP BY
-        assert!(
-            !result.expanded_sql.contains("sales_v.region ||"),
-            "Should not have unqualified sales_v.region in expression, got: {}",
-            result.expanded_sql
-        );
+        // The source view itself can qualify the outer reference. Its entire
+        // expression must remain inside ANY_VALUE for grouped correlation.
+        assert!(result.expanded_sql.contains(
+            "_inner.region || 'foo' IS NOT DISTINCT FROM ANY_VALUE(sales_v.region || 'foo')"
+        ));
+        assert!(result.expanded_sql.contains("GROUP BY region || 'foo'"));
     }
 }

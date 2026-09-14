@@ -1,0 +1,76 @@
+# name: test/sql/native_aggregate_detection.test
+# description: Native aggregate discovery follows expression and query nodes.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE aggregate_detection_sales(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO aggregate_detection_sales VALUES (2023, 10), (2023, 20), (2024, 40);
+
+statement ok
+CREATE VIEW aggregate_detection_v AS
+SELECT year, SUM(amount) AS MEASURE revenue FROM aggregate_detection_sales;
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+# Quoted and qualified names own the full function span. Unicode before the
+# call must not shift byte offsets, and comments cannot manufacture calls.
+query TR
+SELECT '東京 AGGREGATE(fake)', main."AGGREGATE"/* name */(revenue)
+FROM aggregate_detection_v /* AGGREGATE(missing) */;
+----
+東京 AGGREGATE(fake)	70.0
+
+query T
+SELECT $$AGGREGATE(fake) AT (ALL)$$;
+----
+AGGREGATE(fake) AT (ALL)
+
+# Parent markers preserve the order of separate modifier suffixes.
+query R
+SELECT AGGREGATE(revenue) AT (WHERE year = 2023) /* between suffixes */ AT (WHERE year = 2024)
+FROM aggregate_detection_v;
+----
+30.0
+
+# CTEs, FROM subqueries and expression subqueries all contain query nodes.
+query R
+WITH totals AS (SELECT AGGREGATE(revenue) AS total FROM aggregate_detection_v)
+SELECT total FROM totals;
+----
+70.0
+
+query R
+SELECT total FROM (SELECT AGGREGATE(revenue) AS total FROM aggregate_detection_v) nested;
+----
+70.0
+
+query R
+SELECT (SELECT AGGREGATE(revenue) FROM aggregate_detection_v);
+----
+70.0
+
+query R rowsort
+SELECT AGGREGATE(revenue) FROM aggregate_detection_v WHERE year = 2023
+UNION ALL
+SELECT AGGREGATE(revenue) FROM aggregate_detection_v WHERE year = 2024;
+----
+30.0
+40.0
+
+# Multiargument list aggregation stays DuckDB syntax while its nested measure
+# argument participates in Yardstick expansion.
+query R
+SELECT aggregate([1, AGGREGATE(revenue) AT (ALL)], 'sum') FROM aggregate_detection_v;
+----
+71.0
+
+endloop

@@ -29,6 +29,7 @@ private:
     friend YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql);
     friend bool ParseNativeYardstickQuery(const string &sql, Parser &parser);
     friend YardstickCurrentReferenceList *FindNativeYardstickCurrentReferences(const char *expression);
+    friend YardstickQueryScopeList *FindNativeYardstickQueryScopes(const char *sql);
     ParserOptions options;
     const NativeYardstickParseScope *previous;
     bool available;
@@ -56,6 +57,7 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql);
 // Source-preserving measure declarations. nullptr retains the legacy parser.
 YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql);
 YardstickCurrentReferenceList *FindNativeYardstickCurrentReferences(const char *expression);
+YardstickQueryScopeList *FindNativeYardstickQueryScopes(const char *sql);
 
 // Recognize custom syntax with DuckDB's grammar, then adapt its source spans to
 // the existing semantic lowerer. False retains the legacy frontend.

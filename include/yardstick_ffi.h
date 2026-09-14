@@ -79,6 +79,28 @@ int32_t yardstick_current_where_is_single_valued(const char* predicate, const ch
                                                const char* qualifier);
 /* Structural expression equality, including identifier and literal semantics. */
 int32_t yardstick_expressions_equal(const char* left, const char* right);
+/* Rebind a visible filter to recomputation rows, preserving nested/outer scopes.
+ * NULL with no error means unavailable. Text and errors use yardstick_free_string. */
+char* yardstick_rewrite_visible_filter(const char* expression, const char* local_alias,
+                                     const char* const* dimension_names,
+                                     const char* const* dimension_expressions, size_t dimension_count,
+                                     char** error);
+
+/* Complete native SELECT scopes, including nested queries and set operands. */
+typedef struct {
+    uint32_t start_pos;
+    uint32_t end_pos;
+    const char** visible_ctes;
+    size_t visible_cte_count;
+} YardstickQueryScope;
+
+typedef struct {
+    YardstickQueryScope* scopes;
+    size_t count;
+} YardstickQueryScopeList;
+
+YardstickQueryScopeList* yardstick_find_query_scopes(const char* sql);
+void yardstick_free_query_scopes(YardstickQueryScopeList* scopes);
 
 /* =============================================================================
  * SELECT Clause Information
@@ -93,8 +115,11 @@ typedef struct {
     bool is_aggregate;          /* Contains SUM/COUNT/AVG/MIN/MAX */
     bool is_star;               /* True if SELECT * or table.* */
     bool is_measure_ref;        /* True if references AGGREGATE() */
+    bool contains_subquery;     /* Group outer dependencies instead of the subquery expression */
     const char* reference_column; /* Native direct column reference, decoded */
     const char* reference_qualifier; /* Native direct qualifier, decoded or NULL */
+    const char** subquery_dimensions; /* Outer column references required by this projection */
+    size_t subquery_dimension_count;
 } YardstickSelectItem;
 
 /* Information about FROM clause tables */
@@ -102,6 +127,7 @@ typedef struct {
     const char* table_name;     /* Original table name */
     const char* alias;          /* Alias if present (NULL = same as table_name) */
     bool is_subquery;           /* True if derived table */
+    bool schema_qualified;     /* A qualified catalog reference cannot resolve to a CTE */
 } YardstickTableRef;
 
 /* Native shorthand operand, excluding its AT suffix and SELECT alias. */
