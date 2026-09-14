@@ -142,11 +142,20 @@ pub struct YardstickTableRef {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct YardstickCteDefinition {
+    pub start_pos: u32,
+    pub end_pos: u32,
+    pub recursive: bool,
+}
+
+#[repr(C)]
 pub struct YardstickQueryScope {
     pub start_pos: u32,
     pub end_pos: u32,
     pub visible_ctes: *const *const c_char,
     pub visible_cte_count: usize,
+    pub cte_definitions: *const YardstickCteDefinition,
 }
 
 #[repr(C)]
@@ -159,10 +168,31 @@ pub struct QueryScope {
     pub start: usize,
     pub end: usize,
     pub visible_ctes: Vec<String>,
+    pub cte_definitions: Vec<YardstickCteDefinition>,
 }
 
 thread_local! {
     static QUERY_CTES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static QUERY_BINDING_CTES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Binding-only definitions retain their declaration order and lexical scope.
+pub struct BindingCteScopeGuard(Vec<String>);
+
+impl BindingCteScopeGuard {
+    pub fn enter(ctes: &[String]) -> Self {
+        Self(QUERY_BINDING_CTES.with(|current| {
+            let previous = current.borrow().clone();
+            current.borrow_mut().extend_from_slice(ctes);
+            previous
+        }))
+    }
+}
+
+impl Drop for BindingCteScopeGuard {
+    fn drop(&mut self) {
+        QUERY_BINDING_CTES.with(|current| current.replace(std::mem::take(&mut self.0)));
+    }
 }
 
 /// Carry enclosing CTE visibility when a native query body is lowered alone.
@@ -302,6 +332,9 @@ pub fn find_query_scopes(sql: &str) -> Option<Vec<QueryScope>> {
                 start: scope.start_pos as usize,
                 end: scope.end_pos as usize,
                 visible_ctes,
+                cte_definitions: (0..scope.visible_cte_count)
+                    .map(|cte| *scope.cte_definitions.add(cte))
+                    .collect(),
             });
         }
         free(list);
@@ -464,12 +497,12 @@ type FnInlineOrderBySubqueryAliases = unsafe extern "C" fn(*const c_char) -> *mu
 type FnFreeString = unsafe extern "C" fn(*mut c_char);
 type FnDecorateMeasure = unsafe extern "C" fn(
     *const c_char, *const c_char, *const *const c_char, *const *const c_char, usize,
-    *const *const c_char, usize, *mut *mut c_char,
+    *const *const c_char, usize, *const *const c_char, usize, *mut *mut c_char,
 ) -> *mut c_char;
 type FnWindowMarker = unsafe extern "C" fn(*const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
 type FnRewriteMeasureWindows = unsafe extern "C" fn(
     *const c_char, *const YardstickWindowSource, usize, *const YardstickWindowCall, usize,
-    *const *const c_char, usize, *mut *mut c_char,
+    *const *const c_char, usize, *const *const c_char, usize, *mut *mut c_char,
 ) -> *mut c_char;
 static FN_DECORATE_MEASURE: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_WINDOW_MARKER: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
@@ -595,6 +628,10 @@ pub fn decorate_measure(
     let names: Vec<_> = names.iter().map(|value| value.as_ptr()).collect();
     let values: Vec<_> = values.iter().map(|value| value.as_ptr()).collect();
     let qualifier_ptrs: Vec<_> = qualifiers.iter().map(|value| value.as_ptr()).collect();
+    let binding_strings = QUERY_BINDING_CTES.with(|ctes| {
+        ctes.borrow().iter().map(|query| string(query)).collect::<Result<Vec<_>, _>>()
+    })?;
+    let binding_queries: Vec<_> = binding_strings.iter().map(|query| query.as_ptr()).collect();
     unsafe {
         let function: FnDecorateMeasure = std::mem::transmute(function);
         let mut error = ptr::null_mut();
@@ -606,6 +643,8 @@ pub fn decorate_measure(
             names.len(),
             qualifier_ptrs.as_ptr(),
             qualifier_ptrs.len(),
+            binding_queries.as_ptr(),
+            binding_queries.len(),
             &mut error,
         );
         owned_rewrite_result(result, error)
@@ -650,6 +689,10 @@ pub fn rewrite_measure_windows(
         ctes.borrow().iter().map(|name| string(name)).collect::<Result<Vec<_>, _>>()
     })?;
     let cte_names: Vec<_> = cte_strings.iter().map(|name| name.as_ptr()).collect();
+    let binding_strings = QUERY_BINDING_CTES.with(|ctes| {
+        ctes.borrow().iter().map(|query| string(query)).collect::<Result<Vec<_>, _>>()
+    })?;
+    let binding_queries: Vec<_> = binding_strings.iter().map(|query| query.as_ptr()).collect();
     let mut source_strings = Vec::new();
     for source in sources {
         let entries: Vec<_> = source.dimensions.iter().collect();
@@ -758,6 +801,8 @@ pub fn rewrite_measure_windows(
             call_info.len(),
             cte_names.as_ptr(),
             cte_names.len(),
+            binding_queries.as_ptr(),
+            binding_queries.len(),
             &mut error,
         );
         owned_rewrite_result(result, error)

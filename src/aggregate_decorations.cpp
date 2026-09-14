@@ -250,15 +250,7 @@ private:
         auto probe = make_uniq<SelectNode>();
         probe->select_list.push_back(make_uniq<StarExpression>());
         probe->from_table = table.Copy();
-        for (auto it = scope.cte_scopes.rbegin(); it != scope.cte_scopes.rend(); ++it) {
-            for (auto &entry : (*it)->cte_map.map) {
-                if (probe->cte_map.map.find(entry.first) == probe->cte_map.map.end()) {
-                    probe->cte_map.map.insert(entry.first, entry.second->Copy());
-                }
-            }
-        }
-        auto binder = Binder::CreateBinder(*context);
-        auto bound = binder->Bind(*probe);
+        auto bound = BindNativeYardstickProbe(*probe, scope.cte_scopes);
         Names names;
         for (auto &name : bound.names) names.insert(StringUtil::Lower(name.GetIdentifierName()));
         return names;

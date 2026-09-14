@@ -47,6 +47,26 @@ private:
 };
 ClientContext *CurrentNativeYardstickClientContext();
 
+class QueryNode;
+struct BoundStatement;
+
+// CTE definitions are visible to schema probes only, never copied into the
+// emitted query. Nested scopes restore the caller's lexical binding context.
+class NativeYardstickCteBindScope {
+public:
+    explicit NativeYardstickCteBindScope(const vector<unique_ptr<QueryNode>> *context);
+    NativeYardstickCteBindScope(const vector<string> &queries, const ParserOptions &options);
+    ~NativeYardstickCteBindScope();
+    NativeYardstickCteBindScope(const NativeYardstickCteBindScope &) = delete;
+    NativeYardstickCteBindScope &operator=(const NativeYardstickCteBindScope &) = delete;
+private:
+    vector<unique_ptr<QueryNode>> definitions;
+    const vector<unique_ptr<QueryNode>> *previous;
+};
+
+const vector<unique_ptr<QueryNode>> *CurrentNativeYardstickCteBindings();
+BoundStatement BindNativeYardstickProbe(QueryNode &probe, const vector<QueryNode *> &local_scopes = {});
+
 // Parse through the active grammar while retaining Yardstick syntax capture.
 bool ParseNativeYardstickQuery(const string &sql, Parser &parser);
 

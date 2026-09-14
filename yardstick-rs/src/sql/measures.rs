@@ -7525,13 +7525,55 @@ fn expand_native_query_scopes(sql: &str, scopes: &[parser_ffi::QueryScope]) -> A
     let mut lowered: Vec<String> = vec![String::new(); scopes.len()];
     let mut had_aggregate = false;
     let mut warnings = Vec::new();
-    for index in (0..scopes.len()).rev() {
+    // Lower children before parents, but keep sibling declarations in source
+    // order: a consumer's binding probes need its earlier CTEs already lowered.
+    let mut pending: Vec<_> = roots.iter().rev().map(|&index| (index, false)).collect();
+    let mut order = Vec::with_capacity(scopes.len());
+    while let Some((index, visited)) = pending.pop() {
+        if visited {
+            order.push(index);
+        } else {
+            pending.push((index, true));
+            pending.extend(children[index].iter().rev().map(|&child| (child, false)));
+        }
+    }
+    for index in order {
         let scope = &scopes[index];
         let mut query = sql[scope.start..scope.end].to_string();
         for &child in children[index].iter().rev() {
             query.replace_range(scopes[child].start - scope.start..scopes[child].end - scope.start, &lowered[child]);
         }
         let _scope = parser_ffi::QueryScopeGuard::enter(&scope.visible_ctes);
+        let mut binding_ctes = Vec::new();
+        for definition in &scope.cte_definitions {
+            let start = definition.start_pos as usize;
+            let end = definition.end_pos as usize;
+            let Some(declaration) = sql.get(start..end) else {
+                return AggregateExpandResult {
+                    had_aggregate: true, expanded_sql: sql.to_string(),
+                    error: Some("Invalid native CTE source range".to_string()), warnings,
+                };
+            };
+            let mut declaration = declaration.to_string();
+            // Replace only the outermost completed scopes in this declaration;
+            // each replacement already contains its lowered descendants.
+            let mut replacements = Vec::new();
+            let mut previous_end = start;
+            for (cte_index, cte_scope) in scopes.iter().enumerate() {
+                if cte_scope.start >= previous_end && cte_scope.end <= end &&
+                    !lowered[cte_index].is_empty() {
+                    replacements.push(cte_index);
+                    previous_end = cte_scope.end;
+                }
+            }
+            for cte_index in replacements.into_iter().rev() {
+                declaration.replace_range(scopes[cte_index].start - start..scopes[cte_index].end - start,
+                                          &lowered[cte_index]);
+            }
+            let recursive = if definition.recursive { "RECURSIVE " } else { "" };
+            binding_ctes.push(format!("WITH {recursive}{declaration} SELECT 1"));
+        }
+        let _binding_scope = parser_ffi::BindingCteScopeGuard::enter(&binding_ctes);
         let expanded = expand_aggregate_query(&query, true);
         had_aggregate |= expanded.had_aggregate;
         for warning in expanded.warnings {

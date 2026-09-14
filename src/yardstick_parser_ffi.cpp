@@ -1337,6 +1337,7 @@ extern "C" void yardstick_free_query_scopes(YardstickQueryScopeList* list) {
             free(const_cast<char*>(list->scopes[i].visible_ctes[j]));
         }
         delete[] list->scopes[i].visible_ctes;
+        delete[] list->scopes[i].cte_definitions;
     }
     delete[] list->scopes;
     delete list;
@@ -1472,7 +1473,8 @@ extern "C" void yardstick_free_aggregate_list(YardstickAggregateCallList* list) 
 extern "C" char* yardstick_decorate_measure(
     const char* expression, const char* call_sql, const char* const* dimension_names,
     const char* const* dimension_expressions, size_t dimension_count,
-    const char* const* qualifiers, size_t qualifier_count, char** error) {
+    const char* const* qualifiers, size_t qualifier_count,
+    const char* const* binding_ctes, size_t binding_cte_count, char** error) {
     if (error) *error = nullptr;
 #if YARDSTICK_GRAMMAR_EXTENSION
     try {
@@ -1483,6 +1485,9 @@ extern "C" char* yardstick_decorate_measure(
         vector<string> local_qualifiers;
         for (size_t i = 0; i < qualifier_count; i++) local_qualifiers.emplace_back(qualifiers[i]);
         auto options = YardstickParserOptions();
+        vector<string> cte_queries;
+        for (size_t i = 0; i < binding_cte_count; i++) cte_queries.emplace_back(binding_ctes[i]);
+        NativeYardstickCteBindScope binding_scope(cte_queries, options);
         auto calls = Parser::ParseExpressionList(call_sql, options);
         if (calls.size() != 1) throw ParserException("Expected one AGGREGATE call");
         // Window FILTER selects input rows in the lineage stage. DISTINCT and
@@ -1532,7 +1537,8 @@ extern "C" char* yardstick_window_marker(const char* call_sql, const char* marke
 extern "C" char* yardstick_rewrite_measure_windows(
     const char* sql, const YardstickWindowSource* sources, size_t source_count,
     const YardstickWindowCall* calls, size_t call_count,
-    const char* const* visible_ctes, size_t visible_cte_count, char** error) {
+    const char* const* visible_ctes, size_t visible_cte_count,
+    const char* const* binding_ctes, size_t binding_cte_count, char** error) {
     if (error) *error = nullptr;
 #if YARDSTICK_GRAMMAR_EXTENSION
     try {
@@ -1570,7 +1576,12 @@ extern "C" char* yardstick_rewrite_measure_windows(
         for (size_t i = 0; i < visible_cte_count; i++) {
             cte_names.push_back(visible_ctes[i]);
         }
-        return safe_strdup(RewriteNativeMeasureWindows(sql, source_info, call_info, cte_names, YardstickParserOptions()));
+        vector<string> cte_queries;
+        for (size_t i = 0; i < binding_cte_count; i++) {
+            cte_queries.push_back(binding_ctes[i]);
+        }
+        return safe_strdup(RewriteNativeMeasureWindows(sql, source_info, call_info, cte_names,
+                                                      cte_queries, YardstickParserOptions()));
     } catch (const std::exception &exception) {
         if (error) *error = safe_strdup(exception.what());
     }

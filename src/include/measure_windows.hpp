@@ -38,7 +38,7 @@ struct MeasureWindowCall {
 // retain their independent identities.
 string RewriteNativeMeasureWindows(const string &scope_sql, const vector<MeasureWindowSource> &sources,
                                    const vector<MeasureWindowCall> &calls, const vector<string> &visible_ctes,
-                                   const ParserOptions &options);
+                                   const vector<string> &binding_ctes, const ParserOptions &options);
 
 } // namespace duckdb
 #endif

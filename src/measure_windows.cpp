@@ -230,8 +230,7 @@ Names InputColumns(SelectNode &select) {
     layout.where_clause.reset();
     layout.modifiers.clear();
     layout.aggregate_handling = AggregateHandling::STANDARD_HANDLING;
-    auto binder = Binder::CreateBinder(*context);
-    auto bound = binder->Bind(*probe);
+    auto bound = BindNativeYardstickProbe(*probe);
     for (auto &name : bound.names) {
         result.insert(Key(name.GetIdentifierName()));
     }
@@ -309,8 +308,7 @@ void ExpandStars(SelectNode &select) {
             placeholders.emplace(name, i);
         }
     }
-    auto binder = Binder::CreateBinder(*context);
-    auto bound = binder->Bind(*probe);
+    auto bound = BindNativeYardstickProbe(*probe);
     Names base_qualifiers;
     if (select.from_table) {
         BaseQualifiers(*select.from_table, base_qualifiers);
@@ -471,19 +469,11 @@ private:
             auto probe = make_uniq<SelectNode>();
             probe->select_list.push_back(make_uniq<StarExpression>());
             probe->from_table = table.Copy();
-            for (auto it = scope.cte_scopes.rbegin(); it != scope.cte_scopes.rend(); ++it) {
-                for (auto &entry : (*it)->cte_map.map) {
-                    if (probe->cte_map.map.find(entry.first) == probe->cte_map.map.end()) {
-                        probe->cte_map.map.insert(entry.first, entry.second->Copy());
-                    }
-                }
-            }
             auto context = CurrentNativeYardstickClientContext();
             if (!context) {
                 throw BinderException("Measure window correlation requires the originating bind context");
             }
-            auto binder = Binder::CreateBinder(*context);
-            auto bound = binder->Bind(*probe);
+            auto bound = BindNativeYardstickProbe(*probe, scope.cte_scopes);
             for (auto &name : bound.names) {
                 scope.local_columns.insert(Key(name.GetIdentifierName()));
             }
@@ -646,6 +636,9 @@ void RebindColumns(unique_ptr<ParsedExpression> &expression, const SourcePlan &p
 SourcePlan BuildSource(const MeasureWindowSource &source, const vector<MeasureWindowCall> &calls,
                        const std::unordered_map<string, idx_t> &caller_order_counts,
                        idx_t index, Names &cte_names, const ParserOptions &options) {
+    auto consumer_ctes = CurrentNativeYardstickCteBindings();
+    // A stored measure's defining query does not inherit consumer CTEs.
+    NativeYardstickCteBindScope defining_scope(nullptr);
     SourcePlan plan;
     plan.spec = &source;
     auto prefix = "__ys_window_source_" + std::to_string(index);
@@ -741,6 +734,7 @@ SourcePlan BuildSource(const MeasureWindowSource &source, const vector<MeasureWi
         CollectColumns(dimension.second, plan);
     }
     for (auto &call : calls) {
+        NativeYardstickCteBindScope consumer_scope(consumer_ctes);
         if (call.source_key != source.key) {
             continue;
         }
@@ -1310,10 +1304,11 @@ private:
 
 string RewriteNativeMeasureWindows(const string &scope_sql, const vector<MeasureWindowSource> &sources,
                                    const vector<MeasureWindowCall> &calls, const vector<string> &visible_ctes,
-                                   const ParserOptions &options) {
+                                   const vector<string> &binding_ctes, const ParserOptions &options) {
     if (calls.empty()) {
         return scope_sql;
     }
+    NativeYardstickCteBindScope binding_scope(binding_ctes, options);
     auto query = Query(scope_sql, options);
     auto &owner = query->Cast<SelectNode>();
     ExpandStars(owner);

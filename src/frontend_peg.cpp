@@ -18,6 +18,8 @@
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/table_binding.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -502,6 +504,71 @@ ClientContext *CurrentNativeYardstickClientContext() {
     return active_bind_context;
 }
 
+namespace {
+thread_local const vector<unique_ptr<QueryNode>> *active_binding_ctes = nullptr;
+}
+
+const vector<unique_ptr<QueryNode>> *CurrentNativeYardstickCteBindings() {
+    return active_binding_ctes;
+}
+
+NativeYardstickCteBindScope::NativeYardstickCteBindScope(const vector<unique_ptr<QueryNode>> *context)
+    : previous(active_binding_ctes) {
+    active_binding_ctes = context;
+}
+
+NativeYardstickCteBindScope::NativeYardstickCteBindScope(const vector<string> &queries,
+                                                     const ParserOptions &options)
+    : previous(active_binding_ctes) {
+    for (auto &sql : queries) {
+        Parser parser(options);
+        parser.ParseQuery(sql);
+        if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+            throw ParserException("Expected a SELECT carrying native CTE definitions");
+        }
+        definitions.push_back(parser.statements[0]->Cast<SelectStatement>().node->Copy());
+    }
+    active_binding_ctes = &definitions;
+}
+
+NativeYardstickCteBindScope::~NativeYardstickCteBindScope() {
+    active_binding_ctes = previous;
+}
+
+BoundStatement BindNativeYardstickProbe(QueryNode &probe, const vector<QueryNode *> &local_scopes) {
+    auto context = CurrentNativeYardstickClientContext();
+    if (!context) {
+        throw BinderException("Native query binding requires the originating bind context");
+    }
+    // Mirror DuckDB's lazy CTE binder chain. Each definition retains its own
+    // lexical parent, so an inner name cannot change an earlier CTE's meaning.
+    // These plans are used only for schema inspection and are never executed.
+    vector<unique_ptr<CommonTableExpressionInfo>> definitions;
+    vector<shared_ptr<Binder>> binders {Binder::CreateBinder(*context)};
+    auto add_scope = [&](QueryNode &scope) {
+        for (auto &entry : scope.cte_map.map) {
+            // Binding consumes parts of the AST; every probe needs its own copy.
+            definitions.push_back(entry.second->Copy());
+            auto &definition = *definitions.back();
+            auto &parent = *binders.back();
+            auto state = make_shared_ptr<CTEBindState>(parent, *definition.query_node, definition.aliases);
+            auto child = Binder::CreateBinder(*context, parent);
+            child->bind_context.AddCTEBinding(
+                make_uniq<CTEBinding>(BindingAlias(entry.first), state, parent.GenerateTableIndex()));
+            binders.push_back(std::move(child));
+        }
+    };
+    if (active_binding_ctes) {
+        for (auto &scope : *active_binding_ctes) {
+            add_scope(*scope);
+        }
+    }
+    for (auto *scope : local_scopes) {
+        add_scope(*scope);
+    }
+    return binders.back()->Bind(probe);
+}
+
 bool ParseNativeYardstickQuery(const string &sql, Parser &parser) {
     if (!active_parse_scope || !active_parse_scope->available || Parser::NormalizeSQLString(sql) != sql) {
         return false;
@@ -766,6 +833,7 @@ struct NativeQueryScope {
     idx_t start;
     idx_t end;
     vector<string> visible_ctes;
+    vector<YardstickCteDefinition> cte_definitions;
 };
 
 // QueryNode does not retain a complete source location. The native parse tree
@@ -776,10 +844,11 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
     struct Work {
         ParseResult *node;
         vector<string> visible_ctes;
+        vector<YardstickCteDefinition> cte_definitions;
         QueryLocation main_query;
         idx_t modifier_end = 0;
     };
-    vector<Work> pending {{&root, {}, {}, 0}};
+    vector<Work> pending {{&root, {}, {}, {}, 0}};
     while (!pending.empty()) {
         auto work = std::move(pending.back());
         pending.pop_back();
@@ -798,7 +867,7 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
                 end == work.main_query.End()) {
                 end = MaxValue(end, work.modifier_end);
             }
-            scopes.push_back({location.Start(), end, work.visible_ctes});
+            scopes.push_back({location.Start(), end, work.visible_ctes, work.cte_definitions});
         }
         // WITH is the first optional child of SELECT/INSERT/UPDATE/DELETE.
         // Handle its declarations in order: a non-recursive body sees earlier
@@ -828,13 +897,19 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
                     auto &list = declaration->Cast<ListParseResult>();
                     auto name = transformer.Transform<Identifier>(list.GetChild(0)).GetIdentifierName();
                     auto visible = work.visible_ctes;
+                    auto definitions = work.cte_definitions;
+                    auto location = declaration->GetLocation();
+                    YardstickCteDefinition definition {static_cast<uint32_t>(location.Start()),
+                                                      static_cast<uint32_t>(location.End()), recursive};
                     if (recursive) {
                         visible.push_back(name);
+                        definitions.push_back(definition);
                     }
                     // Visiting the declaration also finds CTE bodies nested in
                     // DML; it never infers a query from parentheses or text.
-                    pending.push_back({declaration, std::move(visible), {}, 0});
+                    pending.push_back({declaration, std::move(visible), std::move(definitions), {}, 0});
                     work.visible_ctes.push_back(std::move(name));
+                    work.cte_definitions.push_back(definition);
                 }
                 first_child = 1;
             }
@@ -844,7 +919,8 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
             work.modifier_end = node.GetLocation().End();
         }
         for (idx_t i = first_child; i < children.size(); i++) {
-            pending.push_back({&children[i].get(), work.visible_ctes, work.main_query, work.modifier_end});
+            pending.push_back({&children[i].get(), work.visible_ctes, work.cte_definitions,
+                               work.main_query, work.modifier_end});
         }
     }
     return true;
@@ -907,9 +983,11 @@ YardstickQueryScopeList *FindNativeYardstickQueryScopes(const char *sql_p) {
             scope.end_pos = static_cast<uint32_t>(source.end);
             if (!source.visible_ctes.empty()) {
                 scope.visible_ctes = new const char *[source.visible_ctes.size()] {};
+                scope.cte_definitions = new YardstickCteDefinition[source.cte_definitions.size()] {};
                 scope.visible_cte_count = source.visible_ctes.size();
                 for (idx_t j = 0; j < source.visible_ctes.size(); j++) {
                     scope.visible_ctes[j] = strdup(source.visible_ctes[j].c_str());
+                    scope.cte_definitions[j] = source.cte_definitions[j];
                     if (!scope.visible_ctes[j]) {
                         throw std::bad_alloc();
                     }

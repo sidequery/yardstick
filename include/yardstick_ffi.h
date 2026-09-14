@@ -85,12 +85,14 @@ typedef struct {
 char* yardstick_decorate_measure(
     const char* expression, const char* call_sql,
     const char* const* dimension_names, const char* const* dimension_expressions, size_t dimension_count,
-    const char* const* qualifiers, size_t qualifier_count, char** error);
+    const char* const* qualifiers, size_t qualifier_count,
+    const char* const* binding_ctes, size_t binding_cte_count, char** error);
 char* yardstick_window_marker(const char* call_sql, const char* marker_name, char** error);
 char* yardstick_rewrite_measure_windows(
     const char* sql, const YardstickWindowSource* sources, size_t source_count,
     const YardstickWindowCall* calls, size_t call_count,
-    const char* const* visible_ctes, size_t visible_cte_count, char** error);
+    const char* const* visible_ctes, size_t visible_cte_count,
+    const char* const* binding_ctes, size_t binding_cte_count, char** error);
 
 /* Grammar-owned CURRENT references, relative to the supplied expression. */
 typedef struct {
@@ -123,8 +125,15 @@ char* yardstick_rewrite_visible_filter(const char* expression, const char* local
 typedef struct {
     uint32_t start_pos;
     uint32_t end_pos;
+    bool recursive;
+} YardstickCteDefinition;
+
+typedef struct {
+    uint32_t start_pos;
+    uint32_t end_pos;
     const char** visible_ctes;
     size_t visible_cte_count;
+    YardstickCteDefinition* cte_definitions;
 } YardstickQueryScope;
 
 typedef struct {

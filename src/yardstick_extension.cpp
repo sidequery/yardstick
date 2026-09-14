@@ -102,10 +102,11 @@ extern "C" {
         void (*free_query_scopes)(YardstickQueryScopeList*),
         char* (*rewrite_visible_filter)(const char*, const char*, const char* const*, const char* const*, size_t, char**),
         char* (*decorate_measure)(const char*, const char*, const char* const*, const char* const*, size_t,
-                                  const char* const*, size_t, char**),
+                                  const char* const*, size_t, const char* const*, size_t, char**),
         char* (*window_marker)(const char*, const char*, char**),
         char* (*rewrite_measure_windows)(const char*, const YardstickWindowSource*, size_t,
-                                         const YardstickWindowCall*, size_t, const char* const*, size_t, char**)
+                                         const YardstickWindowCall*, size_t, const char* const*, size_t,
+                                         const char* const*, size_t, char**)
     );
 }
 
