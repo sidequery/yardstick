@@ -645,15 +645,22 @@ void RebindColumns(unique_ptr<ParsedExpression> &expression, const SourcePlan &p
 
 SourcePlan BuildSource(const MeasureWindowSource &source, const vector<MeasureWindowCall> &calls,
                        const std::unordered_map<string, idx_t> &caller_order_counts,
-                       idx_t index, const ParserOptions &options) {
+                       idx_t index, Names &cte_names, const ParserOptions &options) {
     SourcePlan plan;
     plan.spec = &source;
     auto prefix = "__ys_window_source_" + std::to_string(index);
-    plan.base_name = prefix + "_base";
     plan.lineage_name = prefix + "_lineage";
     plan.id_name = prefix + "_id";
     vector<Identifier> view_aliases;
     plan.view = Query(source.clean_select_sql, options, &view_aliases);
+    for (auto &entry : plan.view->cte_map.map) {
+        cte_names.insert(Key(entry.first.GetIdentifierName()));
+    }
+    plan.base_name = prefix + "_base";
+    idx_t suffix = 0;
+    while (!cte_names.insert(Key(plan.base_name)).second) {
+        plan.base_name = prefix + "_base_" + std::to_string(++suffix);
+    }
     auto &view = plan.view->Cast<SelectNode>();
     if (view.from_table) {
         RelationQualifiers(*view.from_table, plan.qualifiers);
@@ -992,7 +999,11 @@ private:
         auto frame_ids = payload_ids.empty() ? "SELECT unnest(flatten(" + Quote(frame) + "))" : payload_ids;
         auto membership = candidate + "." + Quote(source.id_name) + " IN (" + frame_ids + ")";
         std::unordered_set<string> removed;
-        std::unordered_map<string, string> sets;
+        struct SetOverride {
+            string dimension;
+            string value;
+        };
+        std::unordered_map<string, SetOverride> sets;
         string condition;
         bool global = false;
         bool expand = call.modifiers.size() > 1;
@@ -1050,7 +1061,7 @@ private:
                 break;
             case WindowContextType::SET:
                 if (!global && !removed.count(dimension_key(modifier.dimension))) {
-                    sets[modifier.dimension] = modifier.value;
+                    sets[dimension_key(modifier.dimension)] = {modifier.dimension, modifier.value};
                     expand = true;
                 }
                 break;
@@ -1086,8 +1097,8 @@ private:
             auto base_expression = dimension.second->ToString();
             bool replaced = false;
             for (auto &entry : sets) {
-                replaced |= dimension_key(entry.first) == dimension_key(dimension.first) ||
-                            dimension_key(entry.first) == dimension_key(base_expression);
+                replaced |= entry.first == dimension_key(dimension.first) ||
+                            entry.first == dimension_key(base_expression);
             }
             if (!removed.count(dimension_key(dimension.first)) &&
                 !removed.count(dimension_key(base_expression)) && !replaced) {
@@ -1097,11 +1108,11 @@ private:
         }
         bool needs_selected_row = !correlations.empty();
         for (auto &entry : sets) {
-            auto value = ModifierExpression(entry.second, options);
+            auto value = ModifierExpression(entry.second.value, options);
             // CURRENT values use the single value of the frame dimension. A
             // multi-valued or empty frame has NULL as its current value.
             resolve_current(value, true);
-            correlations.push_back(DimensionSQL(source, entry.first, candidate) + " IS NOT DISTINCT FROM " +
+            correlations.push_back(DimensionSQL(source, entry.second.dimension, candidate) + " IS NOT DISTINCT FROM " +
                                    value->ToString());
         }
         if (!condition.empty()) {
@@ -1298,7 +1309,8 @@ private:
 } // namespace
 
 string RewriteNativeMeasureWindows(const string &scope_sql, const vector<MeasureWindowSource> &sources,
-                                   const vector<MeasureWindowCall> &calls, const ParserOptions &options) {
+                                   const vector<MeasureWindowCall> &calls, const vector<string> &visible_ctes,
+                                   const ParserOptions &options) {
     if (calls.empty()) {
         return scope_sql;
     }
@@ -1323,8 +1335,15 @@ string RewriteNativeMeasureWindows(const string &scope_sql, const vector<Measure
         });
     });
     vector<SourcePlan> plans;
+    Names cte_names;
+    for (auto &name : visible_ctes) {
+        cte_names.insert(Key(name));
+    }
+    for (auto &entry : owner.cte_map.map) {
+        cte_names.insert(Key(entry.first.GetIdentifierName()));
+    }
     for (idx_t i = 0; i < sources.size(); i++) {
-        plans.push_back(BuildSource(sources[i], calls, caller_order_counts, i, options));
+        plans.push_back(BuildSource(sources[i], calls, caller_order_counts, i, cte_names, options));
     }
     for (auto &plan : plans) {
         if (!ReplaceSource(owner.from_table, plan)) {
@@ -1338,6 +1357,15 @@ string RewriteNativeMeasureWindows(const string &scope_sql, const vector<Measure
         cte->query_node = std::move(plan.base);
         cte->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
         output->cte_map.map.insert(Identifier(plan.base_name), std::move(cte));
+    }
+    if (!visible_ctes.empty()) {
+        // This SELECT is spliced into a statement with an enclosing WITH.
+        // Keep the generated WITH inside a subquery rather than emitting two
+        // adjacent WITH clauses at the same query level.
+        auto wrapper = make_uniq<SelectNode>();
+        wrapper->select_list.push_back(make_uniq<StarExpression>());
+        wrapper->from_table = Subquery(std::move(output), "__ys_window_result");
+        return wrapper->ToString();
     }
     return output->ToString();
 }

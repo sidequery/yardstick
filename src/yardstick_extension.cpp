@@ -105,7 +105,7 @@ extern "C" {
                                   const char* const*, size_t, char**),
         char* (*window_marker)(const char*, const char*, char**),
         char* (*rewrite_measure_windows)(const char*, const YardstickWindowSource*, size_t,
-                                         const YardstickWindowCall*, size_t, char**)
+                                         const YardstickWindowCall*, size_t, const char* const*, size_t, char**)
     );
 }
 

@@ -574,6 +574,47 @@ FROM measure_window_alias_order r CROSS JOIN (VALUES (5), (2)) t(id);
 ----
 [60, 200, 200, 100, 30, 10]
 
+# Generated lineage CTEs must not shadow user CTEs, including case-insensitive
+# collisions and names that already use the generated fallback suffix.
+query I
+WITH "__YS_WINDOW_SOURCE_0_BASE" AS (SELECT 7 AS n),
+     __ys_window_source_0_base_1 AS (SELECT 9 AS n)
+SELECT AGGREGATE(revenue) OVER ()
+FROM measure_window_raw LIMIT 1;
+----
+600
+
+# Enclosing CTEs remain available to consumers of the rewritten window query.
+query III
+WITH "__YS_WINDOW_SOURCE_0_BASE" AS (SELECT 7 AS n),
+     __ys_window_source_0_base_1 AS (SELECT 9 AS n),
+     totals AS (SELECT AGGREGATE(revenue) OVER () AS total FROM measure_window_raw LIMIT 1)
+SELECT total, a.n, b.n FROM totals
+CROSS JOIN "__YS_WINDOW_SOURCE_0_BASE" a
+CROSS JOIN __ys_window_source_0_base_1 b;
+----
+600	7	9
+
+# Equivalent SET spellings retain the same precedence as repeated identical
+# spellings. Keep the original dimension SQL for binding quoted identifiers.
+query III
+SELECT
+    AGGREGATE(revenue) OVER () AT (SET yr = 2022) AT (SET yr = 2023),
+    AGGREGATE(revenue) OVER () AT (SET yr = 2022) AT (SET v.yr = 2023),
+    AGGREGATE(revenue) OVER () AT (SET v."YR" = 2022) AT (SET yr = 2023)
+FROM measure_window_grouped v WHERE region = 'A' LIMIT 1;
+----
+40	40	40
+
+query III
+SELECT
+    AGGREGATE(revenue) OVER () AT (SET yr = 2023) AT (SET yr = 2022),
+    AGGREGATE(revenue) OVER () AT (SET v.yr = 2023) AT (SET yr = 2022),
+    AGGREGATE(revenue) OVER () AT (SET yr = 2023) AT (SET v."YR" = 2022)
+FROM measure_window_grouped v WHERE region = 'A' LIMIT 1;
+----
+100	100	100
+
 endloop
 
 statement ok

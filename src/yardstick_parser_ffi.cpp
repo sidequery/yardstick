@@ -1531,7 +1531,8 @@ extern "C" char* yardstick_window_marker(const char* call_sql, const char* marke
 
 extern "C" char* yardstick_rewrite_measure_windows(
     const char* sql, const YardstickWindowSource* sources, size_t source_count,
-    const YardstickWindowCall* calls, size_t call_count, char** error) {
+    const YardstickWindowCall* calls, size_t call_count,
+    const char* const* visible_ctes, size_t visible_cte_count, char** error) {
     if (error) *error = nullptr;
 #if YARDSTICK_GRAMMAR_EXTENSION
     try {
@@ -1565,7 +1566,11 @@ extern "C" char* yardstick_rewrite_measure_windows(
             }
             call_info.push_back(std::move(info));
         }
-        return safe_strdup(RewriteNativeMeasureWindows(sql, source_info, call_info, YardstickParserOptions()));
+        vector<string> cte_names;
+        for (size_t i = 0; i < visible_cte_count; i++) {
+            cte_names.push_back(visible_ctes[i]);
+        }
+        return safe_strdup(RewriteNativeMeasureWindows(sql, source_info, call_info, cte_names, YardstickParserOptions()));
     } catch (const std::exception &exception) {
         if (error) *error = safe_strdup(exception.what());
     }

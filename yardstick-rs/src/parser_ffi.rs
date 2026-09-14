@@ -468,7 +468,8 @@ type FnDecorateMeasure = unsafe extern "C" fn(
 ) -> *mut c_char;
 type FnWindowMarker = unsafe extern "C" fn(*const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
 type FnRewriteMeasureWindows = unsafe extern "C" fn(
-    *const c_char, *const YardstickWindowSource, usize, *const YardstickWindowCall, usize, *mut *mut c_char,
+    *const c_char, *const YardstickWindowSource, usize, *const YardstickWindowCall, usize,
+    *const *const c_char, usize, *mut *mut c_char,
 ) -> *mut c_char;
 static FN_DECORATE_MEASURE: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_WINDOW_MARKER: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
@@ -645,6 +646,10 @@ pub fn rewrite_measure_windows(
         names: Vec<CString>,
         expressions: Vec<CString>,
     }
+    let cte_strings = QUERY_CTES.with(|ctes| {
+        ctes.borrow().iter().map(|name| string(name)).collect::<Result<Vec<_>, _>>()
+    })?;
+    let cte_names: Vec<_> = cte_strings.iter().map(|name| name.as_ptr()).collect();
     let mut source_strings = Vec::new();
     for source in sources {
         let entries: Vec<_> = source.dimensions.iter().collect();
@@ -751,6 +756,8 @@ pub fn rewrite_measure_windows(
             source_info.len(),
             call_info.as_ptr(),
             call_info.len(),
+            cte_names.as_ptr(),
+            cte_names.len(),
             &mut error,
         );
         owned_rewrite_result(result, error)
