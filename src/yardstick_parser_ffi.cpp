@@ -1511,7 +1511,8 @@ static vector<string> NativeSubqueryDimensions(ParsedExpression &projection, Sel
             auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
             bool belongs_to_outer = scope.unqualified_outer && !scope.aliases.count(StringUtil::Lower(YsName(names.back())));
             if (names.size() > 1 && scope.nested) {
-                auto qualifier = StringUtil::Lower(YsName(names.front()));
+                // Catalog/schema prefixes precede the relation component.
+                auto qualifier = StringUtil::Lower(YsName(names[names.size() - 2]));
                 belongs_to_outer = outer_qualifiers.count(qualifier) && !scope.shadowed.count(qualifier);
             }
             if (belongs_to_outer) {
@@ -2224,8 +2225,8 @@ public:
             }
             bool local = names.size() == 1 ? scope.unqualified_is_local &&
                     !scope.aliases.count(StringUtil::Lower(names[0].GetIdentifierName()))
-                : names.size() == 2 && scope.alias_is_local && !local_alias.empty() &&
-                  names[0] == Identifier(local_alias);
+                : names.size() >= 2 && scope.alias_is_local && !local_alias.empty() &&
+                  names[names.size() - 2] == Identifier(local_alias);
             if (local) {
                 if (scope.inner_alias_shadowed) {
                     throw ParserException("Conflicting recomputation alias in visible filter");

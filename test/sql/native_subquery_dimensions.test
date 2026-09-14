@@ -23,6 +23,21 @@ foreach parser_mode true false
 statement ok
 SET heap_based_parser=${parser_mode};
 
+# Multipart outer references contribute grouping dependencies, including
+# references reached through a subquery with its own unrelated relation.
+query IR rowsort
+SELECT (SELECT main.subquery_dimension_v.year) AS x, revenue FROM main.subquery_dimension_v;
+----
+2023	30.0
+2024	40.0
+
+query IR rowsort
+SELECT (SELECT "main"."subquery_dimension_v"."year" FROM (VALUES (1)) local_row(i)) AS x, revenue
+FROM main.subquery_dimension_v;
+----
+2023	30.0
+2024	40.0
+
 query IR rowsort
 SELECT (SELECT 1) + year AS x, revenue FROM subquery_dimension_v;
 ----

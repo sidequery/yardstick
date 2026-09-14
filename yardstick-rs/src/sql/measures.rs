@@ -7678,7 +7678,9 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
     let mut insert_outer_alias = false;
     let primary_alias: Option<String> = if needs_outer_alias {
         if let Some(ref pt) = from_info.primary_table {
-            if pt.has_alias {
+            if pt.has_alias || native_scope {
+                // Native scope extraction retains the relation's usable name.
+                // Adding an alias would invalidate existing qualified filters.
                 Some(pt.effective_name.clone())
             } else if insert_primary_table_alias(&result_sql, "_outer").is_some() {
                 insert_outer_alias = true;
