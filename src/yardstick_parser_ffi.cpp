@@ -1292,7 +1292,7 @@ extern "C" int32_t yardstick_current_where_is_single_valued(const char* predicat
                                                             const char* qualifier) {
 #if YARDSTICK_GRAMMAR_EXTENSION
     auto *options = CurrentNativeYardstickParserOptions();
-    if (!options || !options->compiled_grammar || !options->compiled_grammar->HasGrammarChanges()) {
+    if (!options || !options->compiled_grammar || !options->compiled_grammar->GetRule("YardstickAtModifier")) {
         return -1;
     }
     try {

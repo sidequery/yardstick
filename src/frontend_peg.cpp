@@ -448,16 +448,23 @@ public:
 
 struct YardstickGrammarInfo final : ParserExtensionInfo {
     shared_ptr<CompiledGrammar> grammar;
+    shared_ptr<CompiledGrammar> base_grammar;
 };
 
 shared_ptr<CompiledGrammar> SelectGrammar(ParserExtensionInfo *info, const ParserOptions &options) {
-    if (options.compiled_grammar && options.compiled_grammar->HasGrammarChanges()) {
-        return options.compiled_grammar->GetRule("YardstickAtModifier") ? options.compiled_grammar : nullptr;
+    if (options.compiled_grammar && options.compiled_grammar->GetRule("YardstickAtModifier")) {
+        return options.compiled_grammar;
     }
     if (!info) {
         return nullptr;
     }
-    return info->Cast<YardstickGrammarInfo>().grammar;
+    auto &yardstick = info->Cast<YardstickGrammarInfo>();
+    // Only replace the database's default grammar. A different active grammar
+    // or dialect that lacks Yardstick rules must retain its own parser.
+    if (options.compiled_grammar && options.compiled_grammar != yardstick.base_grammar) {
+        return nullptr;
+    }
+    return yardstick.grammar;
 }
 
 } // namespace
@@ -465,6 +472,7 @@ shared_ptr<CompiledGrammar> SelectGrammar(ParserExtensionInfo *info, const Parse
 shared_ptr<ParserExtensionInfo> RegisterYardstickGrammar(DatabaseInstance &db) {
     GrammarExtension::Register(db, make_shared_ptr<YardstickGrammar>());
     auto info = make_shared_ptr<YardstickGrammarInfo>();
+    info->base_grammar = db.GetParserCache().GetMatcher();
     ClientContext context(db.shared_from_this());
     // Compile without changing any connection's active_grammar_extensions.
     info->grammar = CompiledGrammar::Create(context, {"yardstick"});
