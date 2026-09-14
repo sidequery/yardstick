@@ -82,6 +82,8 @@ pub struct YardstickSelectItem {
     pub is_aggregate: bool,
     pub is_star: bool,
     pub is_measure_ref: bool,
+    pub reference_column: *const c_char,
+    pub reference_qualifier: *const c_char,
 }
 
 /// Information about a table in FROM clause
@@ -91,6 +93,16 @@ pub struct YardstickTableRef {
     pub table_name: *const c_char,
     pub alias: *const c_char,
     pub is_subquery: bool,
+}
+
+/// Native shorthand operand and its exact source span.
+#[repr(C)]
+#[derive(Debug)]
+pub struct YardstickMeasureReference {
+    pub column: *const c_char,
+    pub qualifier: *const c_char,
+    pub start_pos: u32,
+    pub end_pos: u32,
 }
 
 /// Full SELECT clause information
@@ -108,6 +120,9 @@ pub struct YardstickSelectInfo {
     pub group_by_all: bool,
     pub where_clause: *const c_char,
     pub error: *const c_char,
+    pub native_parsed: bool,
+    pub at_references: *mut YardstickMeasureReference,
+    pub at_reference_count: usize,
 }
 
 /// Parsed expression information
@@ -147,6 +162,8 @@ pub struct YardstickCreateViewInfo {
     pub measure_count: usize,
     pub error: *const c_char,
     pub native_parsed: bool,
+    pub metadata_query_sql: *const c_char,
+    pub requires_binding: bool,
 }
 
 /// Single replacement in SQL text
@@ -163,6 +180,103 @@ pub struct YardstickReplacement {
 // =============================================================================
 
 use std::sync::atomic::{AtomicPtr, Ordering};
+
+#[repr(C)]
+pub struct YardstickCurrentReference {
+    pub dimension: *const c_char,
+    pub start_pos: u32,
+    pub end_pos: u32,
+}
+
+#[repr(C)]
+pub struct YardstickCurrentReferenceList {
+    pub references: *mut YardstickCurrentReference,
+    pub count: usize,
+    pub error: *const c_char,
+}
+
+type FnFindCurrentReferences = unsafe extern "C" fn(*const c_char) -> *mut YardstickCurrentReferenceList;
+type FnFreeCurrentReferences = unsafe extern "C" fn(*mut YardstickCurrentReferenceList);
+static FN_FIND_CURRENT_REFERENCES: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_FREE_CURRENT_REFERENCES: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+type FnCurrentWhereIsSingleValued = unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> i32;
+static FN_CURRENT_WHERE_IS_SINGLE_VALUED: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+type FnExpressionsEqual = unsafe extern "C" fn(*const c_char, *const c_char) -> i32;
+static FN_EXPRESSIONS_EQUAL: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+
+pub fn expressions_equal(left: &str, right: &str) -> Option<bool> {
+    let function = FN_EXPRESSIONS_EQUAL.load(Ordering::SeqCst);
+    if function.is_null() {
+        return None;
+    }
+    let (Ok(left), Ok(right)) = (CString::new(left), CString::new(right)) else {
+        return Some(false);
+    };
+    let result = unsafe {
+        let function: FnExpressionsEqual = std::mem::transmute(function);
+        function(left.as_ptr(), right.as_ptr())
+    };
+    (result >= 0).then_some(result == 1)
+}
+
+pub fn current_where_is_single_valued(predicate: &str, dimension: &str, qualifier: Option<&str>) -> Option<bool> {
+    let function = FN_CURRENT_WHERE_IS_SINGLE_VALUED.load(Ordering::SeqCst);
+    if function.is_null() {
+        return None;
+    }
+    let predicate = CString::new(predicate).ok()?;
+    let dimension = CString::new(dimension).ok()?;
+    let qualifier = CString::new(qualifier.unwrap_or("")).ok()?;
+    let result = unsafe {
+        let function: FnCurrentWhereIsSingleValued = std::mem::transmute(function);
+        function(predicate.as_ptr(), dimension.as_ptr(), qualifier.as_ptr())
+    };
+    (result >= 0).then_some(result == 1)
+}
+
+pub struct CurrentReference {
+    pub dimension: String,
+    pub start_pos: usize,
+    pub end_pos: usize,
+}
+
+/// None means the native grammar is unavailable. Native parse errors remain
+/// errors instead of being reinterpreted by the compatibility scanner.
+pub fn find_current_references(expression: &str) -> Option<Result<Vec<CurrentReference>, String>> {
+    let find = FN_FIND_CURRENT_REFERENCES.load(Ordering::SeqCst);
+    let free = FN_FREE_CURRENT_REFERENCES.load(Ordering::SeqCst);
+    if find.is_null() || free.is_null() {
+        return None;
+    }
+    let expression_c = match CString::new(expression) {
+        Ok(expression) => expression,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    unsafe {
+        let find: FnFindCurrentReferences = std::mem::transmute(find);
+        let free: FnFreeCurrentReferences = std::mem::transmute(free);
+        let list = find(expression_c.as_ptr());
+        if list.is_null() {
+            return None;
+        }
+        let result = if !(*list).error.is_null() {
+            Err(CStr::from_ptr((*list).error).to_string_lossy().into_owned())
+        } else {
+            let mut references = Vec::with_capacity((*list).count);
+            for index in 0..(*list).count {
+                let reference = &*(*list).references.add(index);
+                references.push(CurrentReference {
+                    dimension: CStr::from_ptr(reference.dimension).to_string_lossy().into_owned(),
+                    start_pos: reference.start_pos as usize,
+                    end_pos: reference.end_pos as usize,
+                });
+            }
+            Ok(references)
+        };
+        free(list);
+        Some(result)
+    }
+}
 
 type FnFindAggregates = unsafe extern "C" fn(*const c_char) -> *mut YardstickAggregateCallList;
 type FnFreeAggregateList = unsafe extern "C" fn(*mut YardstickAggregateCallList);
@@ -215,6 +329,10 @@ pub extern "C" fn yardstick_init_parser_ffi(
     inline_order_by_subquery_aliases: FnInlineOrderBySubqueryAliases,
     free_string: FnFreeString,
     expand_aggregate_call: FnExpandAggregateCall,
+    find_current_references: FnFindCurrentReferences,
+    free_current_references: FnFreeCurrentReferences,
+    current_where_is_single_valued: FnCurrentWhereIsSingleValued,
+    expressions_equal: FnExpressionsEqual,
 ) {
     FN_FIND_AGGREGATES.store(find_aggregates as *mut (), Ordering::SeqCst);
     FN_FREE_AGGREGATE_LIST.store(free_aggregate_list as *mut (), Ordering::SeqCst);
@@ -230,6 +348,10 @@ pub extern "C" fn yardstick_init_parser_ffi(
     FN_INLINE_ORDER_BY_SUBQUERY_ALIASES.store(inline_order_by_subquery_aliases as *mut (), Ordering::SeqCst);
     FN_FREE_STRING.store(free_string as *mut (), Ordering::SeqCst);
     FN_EXPAND_AGGREGATE_CALL.store(expand_aggregate_call as *mut (), Ordering::SeqCst);
+    FN_FIND_CURRENT_REFERENCES.store(find_current_references as *mut (), Ordering::SeqCst);
+    FN_FREE_CURRENT_REFERENCES.store(free_current_references as *mut (), Ordering::SeqCst);
+    FN_CURRENT_WHERE_IS_SINGLE_VALUED.store(current_where_is_single_valued as *mut (), Ordering::SeqCst);
+    FN_EXPRESSIONS_EQUAL.store(expressions_equal as *mut (), Ordering::SeqCst);
 }
 
 // Helper macros to call function pointers
@@ -423,6 +545,8 @@ pub struct SelectItem {
     pub is_aggregate: bool,
     pub is_star: bool,
     pub is_measure_ref: bool,
+    pub reference_column: Option<String>,
+    pub reference_qualifier: Option<String>,
 }
 
 /// Safe wrapper for table reference information
@@ -431,6 +555,15 @@ pub struct TableRef {
     pub table_name: String,
     pub alias: Option<String>,
     pub is_subquery: bool,
+}
+
+/// Safe wrapper for a native shorthand operand.
+#[derive(Debug, Clone)]
+pub struct MeasureReference {
+    pub column: String,
+    pub qualifier: Option<String>,
+    pub start_pos: u32,
+    pub end_pos: u32,
 }
 
 /// Safe wrapper for SELECT clause information
@@ -443,6 +576,8 @@ pub struct SelectInfo {
     pub has_group_by: bool,
     pub group_by_all: bool,
     pub where_clause: Option<String>,
+    pub native_parsed: bool,
+    pub at_references: Vec<MeasureReference>,
 }
 
 /// Safe wrapper for expression information
@@ -478,6 +613,7 @@ pub struct CreateViewInfo {
     pub measures: Vec<MeasureDef>,
     pub native_parsed: bool,
     pub error: Option<String>,
+    pub metadata_query_sql: Option<String>,
 }
 
 /// Replacement operation (safe Rust type)
@@ -592,6 +728,9 @@ pub(crate) fn find_aggregates_with_source(sql: &str) -> Result<(Vec<AggregateCal
 /// assert!(info.has_group_by);
 /// ```
 pub fn parse_select(sql: &str) -> Result<SelectInfo, String> {
+    if FN_PARSE_SELECT.load(Ordering::SeqCst).is_null() {
+        return Err("Parser FFI not initialized".to_string());
+    }
     let c_sql = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
 
     unsafe {
@@ -621,6 +760,8 @@ pub fn parse_select(sql: &str) -> Result<SelectInfo, String> {
                 is_aggregate: item.is_aggregate,
                 is_star: item.is_star,
                 is_measure_ref: item.is_measure_ref,
+                reference_column: c_str_to_string(item.reference_column),
+                reference_qualifier: c_str_to_string(item.reference_qualifier),
             });
         }
 
@@ -644,6 +785,17 @@ pub fn parse_select(sql: &str) -> Result<SelectInfo, String> {
             }
         }
 
+        let mut at_references = Vec::with_capacity(info.at_reference_count);
+        for i in 0..info.at_reference_count {
+            let reference = &*info.at_references.add(i);
+            at_references.push(MeasureReference {
+                column: c_str_to_string(reference.column).unwrap_or_default(),
+                qualifier: c_str_to_string(reference.qualifier),
+                start_pos: reference.start_pos,
+                end_pos: reference.end_pos,
+            });
+        }
+
         let result = SelectInfo {
             items,
             tables,
@@ -652,6 +804,8 @@ pub fn parse_select(sql: &str) -> Result<SelectInfo, String> {
             has_group_by: info.has_group_by,
             group_by_all: info.group_by_all,
             where_clause: c_str_to_string(info.where_clause),
+            native_parsed: info.native_parsed,
+            at_references,
         };
 
         yardstick_free_select_info(info_ptr);
@@ -751,6 +905,7 @@ pub fn parse_create_view(sql: &str) -> Result<CreateViewInfo, String> {
             measures,
             native_parsed: info.native_parsed,
             error: c_str_to_string(info.error),
+            metadata_query_sql: c_str_to_string(info.metadata_query_sql),
         };
 
         yardstick_free_create_view_info(info_ptr);

@@ -7,6 +7,7 @@
 //!
 //! Reference: https://arxiv.org/abs/2406.00251
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -55,6 +56,88 @@ pub struct MeasureView {
 /// Global storage for measure views (in-memory catalog)
 static MEASURE_VIEWS: Lazy<Mutex<HashMap<String, MeasureView>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone)]
+enum MeasureOverlayEntry {
+    Temporary(Option<MeasureView>),
+    Permanent,
+}
+
+thread_local! {
+    static MEASURE_VIEW_OVERLAYS: RefCell<Vec<HashMap<String, MeasureOverlayEntry>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+pub fn push_measure_view_overlay() {
+    MEASURE_VIEW_OVERLAYS.with(|overlays| overlays.borrow_mut().push(HashMap::new()));
+}
+
+pub fn pop_measure_view_overlay() {
+    MEASURE_VIEW_OVERLAYS.with(|overlays| { overlays.borrow_mut().pop(); });
+}
+
+pub fn set_measure_view_overlay(name: &str, view: Option<MeasureView>) {
+    MEASURE_VIEW_OVERLAYS.with(|overlays| {
+        if let Some(overlay) = overlays.borrow_mut().last_mut() {
+            overlay.insert(name.to_ascii_lowercase(), MeasureOverlayEntry::Temporary(view));
+        }
+    });
+}
+
+pub fn bypass_measure_view_overlay(name: &str) {
+    MEASURE_VIEW_OVERLAYS.with(|overlays| {
+        if let Some(overlay) = overlays.borrow_mut().last_mut() {
+            overlay.insert(name.to_ascii_lowercase(), MeasureOverlayEntry::Permanent);
+        }
+    });
+}
+
+// Return owned data: callers may invoke parser callbacks, including nested
+// lookups, without holding either the global mutex or a thread-local borrow.
+fn measure_views_snapshot() -> HashMap<String, MeasureView> {
+    let permanent = MEASURE_VIEWS.lock().unwrap().clone();
+    if MEASURE_VIEW_OVERLAYS.with(|overlays| overlays.borrow().iter().all(HashMap::is_empty)) {
+        return permanent;
+    }
+    let mut views = permanent.clone();
+    MEASURE_VIEW_OVERLAYS.with(|overlays| {
+        for overlay in overlays.borrow().iter() {
+            for (name, entry) in overlay {
+                remove_measure_view_case_insensitive(&mut views, name);
+                let view = match entry {
+                    MeasureOverlayEntry::Temporary(view) => view.as_ref(),
+                    MeasureOverlayEntry::Permanent => permanent.iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, view)| view),
+                };
+                if let Some(view) = view {
+                    views.insert(view.view_name.clone(), view.clone());
+                }
+            }
+        }
+    });
+    views
+}
+
+fn write_measure_view(name: &str, view: Option<MeasureView>) {
+    let scoped = MEASURE_VIEW_OVERLAYS.with(|overlays| {
+        for overlay in overlays.borrow_mut().iter_mut().rev() {
+            if let Some(entry) = overlay.get_mut(&name.to_ascii_lowercase()) {
+                return match entry {
+                    MeasureOverlayEntry::Temporary(current) => { *current = view.clone(); true }
+                    MeasureOverlayEntry::Permanent => false,
+                };
+            }
+        }
+        false
+    });
+    if !scoped {
+        let mut views = MEASURE_VIEWS.lock().unwrap();
+        remove_measure_view_case_insensitive(&mut views, name);
+        if let Some(view) = view {
+            views.insert(view.view_name.clone(), view);
+        }
+    }
+}
 
 const DEFAULT_CONTEXT_MARKER: &str = "/*YARDSTICK_DEFAULT*/";
 
@@ -396,11 +479,14 @@ fn measure_columns_for_query_tables(
     HashMap<String, HashSet<String>>,
     HashSet<String>,
 ) {
-    let views = MEASURE_VIEWS.lock().unwrap();
+    let views = measure_views_snapshot();
     let mut by_qualifier: HashMap<String, HashSet<String>> = HashMap::new();
     let mut any_measure: HashSet<String> = HashSet::new();
 
     for table in &info.tables {
+        if table.is_subquery {
+            continue;
+        }
         let maybe_view = views.iter().find(|(name, _)| name.eq_ignore_ascii_case(&table.table_name));
         let Some((_, view)) = maybe_view else {
             continue;
@@ -417,14 +503,16 @@ fn measure_columns_for_query_tables(
 
         any_measure.extend(measures.iter().cloned());
 
-        by_qualifier
-            .entry(normalize_identifier_name(&table.table_name))
-            .or_default()
-            .extend(measures.iter().cloned());
+        if !info.native_parsed || table.alias.is_none() {
+            by_qualifier
+                .entry(table.table_name.to_ascii_lowercase())
+                .or_default()
+                .extend(measures.iter().cloned());
+        }
 
         if let Some(alias) = &table.alias {
             by_qualifier
-                .entry(normalize_identifier_name(alias))
+                .entry(alias.to_ascii_lowercase())
                 .or_default()
                 .extend(measures.iter().cloned());
         }
@@ -452,6 +540,23 @@ fn select_item_is_implicit_measure_ref(
     any_measure.contains(&measure)
 }
 
+fn native_item_is_implicit_measure_ref(
+    item: &parser_ffi::SelectItem,
+    by_qualifier: &HashMap<String, HashSet<String>>,
+    any_measure: &HashSet<String>,
+) -> bool {
+    let Some(column) = &item.reference_column else {
+        return false;
+    };
+    let column = column.to_ascii_lowercase();
+    if let Some(qualifier) = &item.reference_qualifier {
+        return by_qualifier
+            .get(&qualifier.to_ascii_lowercase())
+            .is_some_and(|columns| columns.contains(&column));
+    }
+    any_measure.contains(&column)
+}
+
 pub fn has_implicit_measure_refs(sql: &str) -> bool {
     let known_measures = known_measure_names();
     if known_measures.is_empty() {
@@ -474,7 +579,11 @@ pub fn has_implicit_measure_refs(sql: &str) -> bool {
             !item.is_aggregate
                 && !item.is_star
                 && !item.is_measure_ref
-                && select_item_is_implicit_measure_ref(&item.expression_sql, &by_qualifier, &any_measure)
+                && if info.native_parsed {
+                    native_item_is_implicit_measure_ref(item, &by_qualifier, &any_measure)
+                } else {
+                    select_item_is_implicit_measure_ref(&item.expression_sql, &by_qualifier, &any_measure)
+                }
         })
 }
 
@@ -705,6 +814,9 @@ fn rewrite_implicit_measure_refs(sql: &str) -> String {
 
     let (by_qualifier, any_measure) = measure_columns_for_query_tables(&info);
     if any_measure.is_empty() {
+        if info.native_parsed {
+            return sql.to_string();
+        }
         return rewrite_implicit_measure_refs_fallback(sql, &known_measures);
     }
 
@@ -713,7 +825,26 @@ fn rewrite_implicit_measure_refs(sql: &str) -> String {
         if item.is_aggregate || item.is_star || item.is_measure_ref {
             continue;
         }
-        if !select_item_is_implicit_measure_ref(&item.expression_sql, &by_qualifier, &any_measure) {
+        let is_measure = if info.native_parsed {
+            native_item_is_implicit_measure_ref(item, &by_qualifier, &any_measure)
+        } else {
+            select_item_is_implicit_measure_ref(&item.expression_sql, &by_qualifier, &any_measure)
+        };
+        if !is_measure {
+            continue;
+        }
+
+        if info.native_parsed {
+            let start = item.start_pos as usize;
+            let end = item.end_pos as usize;
+            let Some(expression) = sql.get(start..end).filter(|_| start < end) else {
+                continue;
+            };
+            replacements.push(parser_ffi::Replacement {
+                start_pos: item.start_pos,
+                end_pos: item.end_pos,
+                replacement: format!("AGGREGATE({expression}) {DEFAULT_CONTEXT_MARKER}"),
+            });
             continue;
         }
 
@@ -746,7 +877,7 @@ fn rewrite_implicit_measure_refs(sql: &str) -> String {
 }
 
 fn known_measure_names() -> HashSet<String> {
-    let views = MEASURE_VIEWS.lock().unwrap();
+    let views = measure_views_snapshot();
     views
         .values()
         .flat_map(|view| view.measures.iter().map(|m| m.column_name.to_ascii_lowercase()))
@@ -792,6 +923,40 @@ fn find_previous_measure_ref_bounds(sql: &str, at_start: usize) -> Option<(usize
 }
 
 fn rewrite_measure_at_refs(sql: &str) -> String {
+    if let Ok(info) = parser_ffi::parse_select(sql) {
+        if info.native_parsed {
+            let (by_qualifier, any_measure) = measure_columns_for_query_tables(&info);
+            let mut replacements = Vec::new();
+            for reference in &info.at_references {
+                let column = reference.column.to_ascii_lowercase();
+                let is_measure = if let Some(qualifier) = &reference.qualifier {
+                    by_qualifier.get(&qualifier.to_ascii_lowercase())
+                        .is_some_and(|columns| columns.contains(&column))
+                } else {
+                    any_measure.contains(&column)
+                };
+                if !is_measure {
+                    continue;
+                }
+                let start = reference.start_pos as usize;
+                let end = reference.end_pos as usize;
+                let Some(operand) = sql.get(start..end).filter(|_| start < end) else {
+                    continue;
+                };
+                replacements.push(parser_ffi::Replacement {
+                    start_pos: reference.start_pos,
+                    end_pos: reference.end_pos,
+                    replacement: format!("AGGREGATE({operand})"),
+                });
+            }
+            // A chain has one column operand, and shared AST nodes may appear
+            // more than once. Apply each exact operand range only once.
+            replacements.sort_by_key(|replacement| (replacement.start_pos, replacement.end_pos));
+            replacements.dedup_by_key(|replacement| (replacement.start_pos, replacement.end_pos));
+            return parser_ffi::apply_replacements(sql, &replacements).unwrap_or_else(|_| sql.to_string());
+        }
+    }
+
     let known_measures = known_measure_names();
     if known_measures.is_empty() {
         return sql.to_string();
@@ -2756,6 +2921,9 @@ fn extract_base_relation_sql(view_query: &str) -> Option<String> {
 }
 
 fn normalize_group_by_col(col: &str) -> String {
+    if let Some((_, column)) = parse_simple_measure_ref(col) {
+        return column;
+    }
     let trimmed = col.trim();
     let unquoted = trimmed
         .strip_prefix('"')
@@ -2949,7 +3117,7 @@ fn filter_group_by_cols_for_measure(
 }
 
 fn source_dimension_names(source_view: &str) -> HashSet<String> {
-    let views = MEASURE_VIEWS.lock().unwrap();
+    let views = measure_views_snapshot();
     let Some((_, view)) = views
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(source_view))
@@ -3430,34 +3598,17 @@ fn dimension_in_group_by(
     group_by_cols: &[String],
     default_qualifier: Option<&str>,
 ) -> bool {
-    let dim_trim = dim.trim();
-    let dim_name = dim_trim.split('.').next_back().unwrap_or(dim_trim).trim();
-    let explicit_dim_qualifier = dim_trim
-        .rsplit_once('.')
-        .map(|(qualifier, _)| qualifier.trim());
-    let expected_qualifier = explicit_dim_qualifier.or(default_qualifier);
-    let dim_lower = dim_trim.to_lowercase();
-
-    if dim_trim.contains('(') {
-        return group_by_cols
-            .iter()
-            .any(|col| col.to_lowercase() == dim_lower);
-    }
-
+    let Some((explicit_qualifier, name)) = parse_simple_measure_ref(dim) else {
+        return group_by_cols.iter().any(|col| col.trim().eq_ignore_ascii_case(dim.trim()));
+    };
+    let expected_qualifier = explicit_qualifier
+        .or_else(|| default_qualifier.map(normalize_identifier_name));
     group_by_cols.iter().any(|col| {
-        let col_trim = col.trim();
-        let col_name = col_trim.split('.').next_back().unwrap_or(col_trim).trim();
-
-        if !col_name.eq_ignore_ascii_case(dim_name) {
+        let Some((qualifier, column)) = parse_simple_measure_ref(col) else {
             return false;
-        }
-
-        // When we know the expected outer qualifier, GROUP BY qualifiers must match it.
-        // Unqualified GROUP BY columns still count.
-        match (expected_qualifier, col_trim.rsplit_once('.')) {
-            (Some(expected), Some((col_qualifier, _))) => {
-                col_qualifier.trim().eq_ignore_ascii_case(expected)
-            }
+        };
+        column == name && match (&expected_qualifier, qualifier) {
+            (Some(expected), Some(found)) => *expected == found,
             _ => true,
         }
     })
@@ -3574,13 +3725,114 @@ fn current_dimension_is_single_valued(
         return true;
     }
 
-    let dim_name = dim.split('.').next_back().unwrap_or(dim).trim();
+    if let Some(predicate) = outer_where {
+        if let Some(proven) = parser_ffi::current_where_is_single_valued(predicate, dim, default_qualifier) {
+            return proven;
+        }
+    }
+
+    let dim_name = strip_measure_qualifier(dim);
     outer_where
-        .map(|w| where_has_simple_equality_constraint(w, dim_name, default_qualifier))
+        .map(|w| where_has_simple_equality_constraint(w, &dim_name, default_qualifier))
         .unwrap_or(false)
 }
 
 fn resolve_current_in_expr(
+    expr: &str,
+    group_by_cols: &[String],
+    outer_where: Option<&str>,
+    default_qualifier: Option<&str>,
+) -> String {
+    if let Some(parsed) = parser_ffi::find_current_references(expr) {
+        return match parsed {
+            Ok(references) => replace_current_references(expr, &references, |dim| {
+                if current_dimension_is_single_valued(dim, group_by_cols, outer_where, default_qualifier) {
+                    qualify_current_dimension(dim, default_qualifier)
+                } else {
+                    "NULL".to_string()
+                }
+            }),
+            // Keep malformed native input visible to the final SQL parser;
+            // never reinterpret it with the compatibility scanner.
+            Err(_) => expr.to_string(),
+        };
+    }
+    resolve_current_in_expr_fallback(expr, group_by_cols, outer_where, default_qualifier)
+}
+
+fn replace_current_references(
+    expr: &str,
+    references: &[parser_ffi::CurrentReference],
+    mut replacement: impl FnMut(&str) -> String,
+) -> String {
+    let mut result = String::with_capacity(expr.len());
+    let mut cursor = 0;
+    for reference in references {
+        if reference.start_pos < cursor || reference.end_pos > expr.len()
+            || !expr.is_char_boundary(reference.start_pos) || !expr.is_char_boundary(reference.end_pos)
+        {
+            return expr.to_string();
+        }
+        result.push_str(&expr[cursor..reference.start_pos]);
+        result.push_str(&replacement(&reference.dimension));
+        cursor = reference.end_pos;
+    }
+    result.push_str(&expr[cursor..]);
+    result
+}
+
+fn qualify_current_dimension(dimension: &str, qualifier: Option<&str>) -> String {
+    match (parse_simple_measure_ref(dimension), qualifier) {
+        (Some((None, _)), Some(qualifier)) => {
+            let qualifier_sql = match parse_identifier_token(qualifier, 0) {
+                Some((end, _)) if end == qualifier.len() => qualifier.to_string(),
+                _ => format!("\"{}\"", qualifier.replace('"', "\"\"")),
+            };
+            format!("{qualifier_sql}.{dimension}")
+        }
+        _ => dimension.to_string(),
+    }
+}
+
+fn resolve_current_in_at_where(
+    condition: &str,
+    group_by_cols: &[String],
+    outer_where: Option<&str>,
+    outer_alias: Option<&str>,
+    qualify: impl FnOnce(&str) -> String,
+) -> String {
+    let Some(Ok(references)) = parser_ffi::find_current_references(condition) else {
+        return qualify(condition);
+    };
+    if references.is_empty() {
+        return qualify(condition);
+    }
+    // Apply the ordinary inner-row qualification separately from CURRENT's
+    // outer-row references. Generated zero-argument functions survive the
+    // qualifier unchanged and cannot collide with caller-owned SQL.
+    let mut prefix = "__yardstick_current_reference_".to_string();
+    while condition.contains(&prefix) {
+        prefix.push('_');
+    }
+    let mut replacements = Vec::new();
+    let protected = replace_current_references(condition, &references, |dim| {
+        let marker = format!("{prefix}{}()", replacements.len());
+        let replacement = if current_dimension_is_single_valued(dim, group_by_cols, outer_where, outer_alias) {
+            qualify_current_dimension(dim, outer_alias)
+        } else {
+            "NULL".to_string()
+        };
+        replacements.push((marker.clone(), replacement));
+        marker
+    });
+    let mut result = qualify(&protected);
+    for (marker, replacement) in replacements {
+        result = result.replace(&marker, &replacement);
+    }
+    result
+}
+
+fn resolve_current_in_expr_fallback(
     expr: &str,
     group_by_cols: &[String],
     outer_where: Option<&str>,
@@ -4438,6 +4690,7 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
         };
     }
 
+    let metadata_query_sql = native.as_ref().and_then(|info| info.metadata_query_sql.clone());
     let result = match native {
         Some(info) => extract_native_measures(sql, info),
         None => extract_measures_from_sql(sql),
@@ -4447,8 +4700,8 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
         Ok((clean_sql, measures, view_name, base_table)) => {
             if !measures.is_empty() {
                 if let Some(ref vn) = view_name {
-                    let view_query =
-                        extract_view_query(&clean_sql).unwrap_or_else(|| clean_sql.clone());
+                    let view_query = metadata_query_sql.clone().unwrap_or_else(||
+                        extract_view_query(&clean_sql).unwrap_or_else(|| clean_sql.clone()));
                     let base_relation_sql = extract_base_relation_sql(&view_query);
                     let dimension_exprs = extract_dimension_exprs_from_query(&view_query);
                     let mut group_by_cols = extract_view_group_by_cols(&view_query);
@@ -4467,8 +4720,7 @@ pub fn process_create_view(sql: &str) -> CreateViewResult {
                         group_by_cols,
                     };
 
-                    let mut views = MEASURE_VIEWS.lock().unwrap();
-                    views.insert(vn.clone(), measure_view);
+                    restore_measure_view(measure_view);
                 }
             }
 
@@ -4734,7 +4986,7 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
     let table_name = select_info.primary_table.clone().unwrap_or_default();
 
     // Get measure view if this table has one
-    let views = MEASURE_VIEWS.lock().unwrap();
+    let views = measure_views_snapshot();
     let measure_view = views.get(&table_name);
 
     // Extract all AGGREGATE() calls (without AT modifiers)
@@ -4848,6 +5100,21 @@ fn extract_dimension_columns_from_select_info(info: &SelectInfo) -> Vec<String> 
 fn is_star_select_expression(expr: &str) -> bool {
     let trimmed = expr.trim();
     trimmed == "*" || trimmed.ends_with(".*") || trimmed.starts_with("* ")
+}
+
+// Native AST rendering may quote an identifier that its AT source leaves
+// unquoted. Compare decoded names when removing a dimension from correlation;
+// expression dimensions use DuckDB's AST equality, including case-insensitive
+// identifiers and case-sensitive string literals.
+fn same_dimension_reference(left: &str, right: &str) -> bool {
+    match (
+        extract_last_qualified_identifier(left),
+        extract_last_qualified_identifier(right),
+    ) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(&right),
+        _ => parser_ffi::expressions_equal(left, right)
+            .unwrap_or_else(|| left.trim().eq_ignore_ascii_case(right.trim())),
+    }
 }
 
 fn normalize_dimension_key(ident: &str) -> String {
@@ -4998,7 +5265,7 @@ pub struct ResolvedMeasure {
 /// Look up which view contains a measure and return resolved measure info
 /// Prioritizes default_table (the query's FROM table), then searches other views for JOINs
 fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMeasure {
-    let views = MEASURE_VIEWS.lock().unwrap();
+    let views = measure_views_snapshot();
 
     // Helper to build ResolvedMeasure from a found measure
     let build_resolved = |m: &ViewMeasure, v: &MeasureView, source_view: &str| -> ResolvedMeasure {
@@ -5365,7 +5632,7 @@ fn build_non_decomposable_join_plan(
             }
             for modifier in modifiers {
                 if let ContextModifier::All(dim) = modifier {
-                    removed_dims.push(dim.to_lowercase());
+                    removed_dims.push(dim.clone());
                 }
             }
         } else {
@@ -5378,7 +5645,7 @@ fn build_non_decomposable_join_plan(
                         removed_dims.clear();
                     }
                     ContextModifier::All(dim) => {
-                        removed_dims.push(dim.to_lowercase());
+                        removed_dims.push(dim.clone());
                     }
                     ContextModifier::Visible => {
                         if !has_set && !has_all_global {
@@ -5393,18 +5660,17 @@ fn build_non_decomposable_join_plan(
                     }
                     ContextModifier::Where(cond) => {
                         if !has_all_global {
-                            let stripped = strip_at_where_qualifiers(cond);
-                            effective_where =
-                                Some(qualify_where_for_inner_with_dimensions(
-                                    &stripped,
-                                    dimension_exprs,
-                                ));
+                            effective_where = Some(resolve_current_in_at_where(
+                                cond, group_by_cols, outer_where, outer_alias,
+                                |sql| qualify_where_for_inner_with_dimensions(
+                                    &strip_at_where_qualifiers(sql), dimension_exprs),
+                            ));
                         }
                     }
                     ContextModifier::Set(dim, expr) => {
                         let dim_name = dim.split('.').next_back().unwrap_or(dim).trim();
                         let dim_key = normalize_dimension_key(dim_name);
-                        if !has_all_global && !removed_dims.contains(&dim_key) {
+                        if !has_all_global && !removed_dims.iter().any(|removed| same_dimension_reference(dim, removed)) {
                             let resolved_expr =
                                 resolve_current_in_expr(expr, group_by_cols, outer_where, outer_alias);
                             let outer_expr = if let Some(alias) = outer_alias {
@@ -5431,11 +5697,7 @@ fn build_non_decomposable_join_plan(
     let remaining_cols: Vec<&String> = group_by_cols
         .iter()
         .filter(|col| {
-            let col_lower = col.to_lowercase();
-            let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
-            !removed_dims
-                .iter()
-                .any(|d| *d == col_lower || *d == col_name)
+            !removed_dims.iter().any(|dim| same_dimension_reference(col, dim))
         })
         .collect();
 
@@ -5562,11 +5824,7 @@ fn expand_non_decomposable_to_sql(
         let remaining_cols: Vec<&String> = group_by_cols
             .iter()
             .filter(|col| {
-                let col_lower = col.to_lowercase();
-                let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
-                !removed_dims
-                    .iter()
-                    .any(|d| d.to_lowercase() == col_lower || d.to_lowercase() == col_name)
+                !removed_dims.iter().any(|dim| same_dimension_reference(col, dim))
             })
             .collect();
 
@@ -5609,6 +5867,7 @@ fn expand_non_decomposable_to_sql(
     let mut effective_where: Option<String> = None;
     let mut has_all_global = false;
     let mut set_conditions: Vec<String> = Vec::new();
+    let mut set_dimensions: Vec<String> = Vec::new();
     let mut removed_dims: Vec<String> = Vec::new();
 
     for modifier in modifiers.iter().rev() {
@@ -5617,9 +5876,10 @@ fn expand_non_decomposable_to_sql(
                 has_all_global = true;
                 effective_where = None;
                 set_conditions.clear();
+                set_dimensions.clear();
             }
             ContextModifier::All(dim) => {
-                removed_dims.push(dim.to_lowercase());
+                removed_dims.push(dim.clone());
             }
             ContextModifier::Visible => {
                 if !has_set && !has_all_global {
@@ -5634,17 +5894,15 @@ fn expand_non_decomposable_to_sql(
             }
             ContextModifier::Where(cond) => {
                 if !has_all_global {
-                    let stripped = strip_at_where_qualifiers(cond);
-                    effective_where =
-                        Some(qualify_where_for_inner_with_dimensions(
-                            &stripped,
-                            dimension_exprs,
-                        ));
+                    effective_where = Some(resolve_current_in_at_where(
+                        cond, group_by_cols, outer_where, outer_alias,
+                        |sql| qualify_where_for_inner_with_dimensions(
+                            &strip_at_where_qualifiers(sql), dimension_exprs),
+                    ));
                 }
             }
             ContextModifier::Set(dim, expr) => {
-                let dim_lower = dim.to_lowercase();
-                if !has_all_global && !removed_dims.contains(&dim_lower) {
+                if !has_all_global && !removed_dims.iter().any(|removed| same_dimension_reference(dim, removed)) {
                     let outer_ref = outer_alias.unwrap_or("_outer");
                     let dim_name = dim.split('.').next_back().unwrap_or(dim).trim();
                     let dim_key = normalize_dimension_key(dim_name);
@@ -5667,6 +5925,7 @@ fn expand_non_decomposable_to_sql(
                         format!("_inner.{dim_name}")
                     };
                     set_conditions.push(format!("{inner_dim} IS NOT DISTINCT FROM {qualified_expr}"));
+                    set_dimensions.push(dim.clone());
                 }
             }
         }
@@ -5676,15 +5935,12 @@ fn expand_non_decomposable_to_sql(
         return format!("(SELECT {expression} FROM {base_relation})");
     }
 
-    // Filter group_by_cols to exclude removed dimensions
+    // SET replaces its dimension's original correlation, while ALL removes it.
     let remaining_cols: Vec<&String> = group_by_cols
         .iter()
         .filter(|col| {
-            let col_lower = col.to_lowercase();
-            let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
-            !removed_dims
-                .iter()
-                .any(|d| *d == col_lower || *d == col_name)
+            !removed_dims.iter().chain(&set_dimensions)
+                .any(|dim| same_dimension_reference(col, dim))
         })
         .collect();
 
@@ -5730,18 +5986,9 @@ fn expand_non_decomposable_at_to_sql(
             format!("(SELECT {expression} FROM {base_relation})")
         }
         ContextModifier::All(dim) => {
-            let dim_lower = dim.to_lowercase();
-            let is_expression = dim.contains('(');
             let correlating_dims: Vec<_> = group_by_cols
                 .iter()
-                .filter(|col| {
-                    if is_expression {
-                        col.to_lowercase() != dim_lower
-                    } else {
-                        let col_name = col.split('.').next_back().unwrap_or(col);
-                        col_name.to_lowercase() != dim_lower
-                    }
-                })
+                .filter(|col| !same_dimension_reference(col, dim))
                 .collect();
 
             if correlating_dims.is_empty() {
@@ -5779,18 +6026,9 @@ fn expand_non_decomposable_at_to_sql(
             };
             let set_condition = format!("{inner_dim} IS NOT DISTINCT FROM {qualified_expr}");
 
-            let dim_lower = dim.to_lowercase();
-            let is_expression = dim.contains('(');
             let correlation_conditions: Vec<String> = group_by_cols
                 .iter()
-                .filter(|col| {
-                    if is_expression {
-                        col.to_lowercase() != dim_lower
-                    } else {
-                        let col_name = col.split('.').next_back().unwrap_or(col);
-                        col_name.to_lowercase() != dim_lower
-                    }
-                })
+                .filter(|col| !same_dimension_reference(col, dim))
                 .map(|col| correlation_condition_for_dim(col, dimension_exprs, outer_alias))
                 .collect();
 
@@ -5805,9 +6043,11 @@ fn expand_non_decomposable_at_to_sql(
             )
         }
         ContextModifier::Where(condition) => {
-            let stripped = strip_at_where_qualifiers(condition);
-            let qualified =
-                qualify_where_for_inner_with_dimensions(&stripped, dimension_exprs);
+            let qualified = resolve_current_in_at_where(
+                condition, group_by_cols, outer_where, outer_alias,
+                |sql| qualify_where_for_inner_with_dimensions(
+                    &strip_at_where_qualifiers(sql), dimension_exprs),
+            );
             format!(
                 "(SELECT {expression} FROM {base_relation} _inner WHERE {qualified})"
             )
@@ -5878,20 +6118,9 @@ pub fn expand_at_to_sql(
             // Remove dimension from context - correlate on other GROUP BY dimensions
             let outer_ref = outer_alias.unwrap_or(table_name);
             // Filter group_by_cols to exclude the removed dimension (case-insensitive)
-            let dim_lower = dim.to_lowercase();
-            let is_expression = dim.contains('(');
             let correlating_dims: Vec<_> = group_by_cols
                 .iter()
-                .filter(|col| {
-                    if is_expression {
-                        // For expressions like MONTH(date), compare full expression
-                        col.to_lowercase() != dim_lower
-                    } else {
-                        // For simple columns, extract just the column name (handle qualified refs like "s.year")
-                        let col_name = col.split('.').next_back().unwrap_or(col);
-                        col_name.to_lowercase() != dim_lower
-                    }
-                })
+                .filter(|col| !same_dimension_reference(col, dim))
                 .collect();
 
             if correlating_dims.is_empty() {
@@ -5947,18 +6176,9 @@ pub fn expand_at_to_sql(
 
             // Build correlation conditions for OTHER GROUP BY columns (not the SET dim)
             // Per paper: SET only removes terms for the specified dimension, correlates on others
-            let dim_lower = dim.to_lowercase();
-            let is_expression = dim.contains('(');
             let correlation_conditions: Vec<String> = group_by_cols
                 .iter()
-                .filter(|col| {
-                    if is_expression {
-                        col.to_lowercase() != dim_lower
-                    } else {
-                        let col_name = col.split('.').next_back().unwrap_or(col);
-                        col_name.to_lowercase() != dim_lower
-                    }
-                })
+                .filter(|col| !same_dimension_reference(col, dim))
                 .map(|col| {
                     let col_is_expr = col.contains('(');
                     if col_is_expr {
@@ -5984,7 +6204,10 @@ pub fn expand_at_to_sql(
             )
         }
         ContextModifier::Where(condition) => {
-            let stripped = strip_at_where_qualifiers(condition);
+            let stripped = resolve_current_in_at_where(
+                condition, group_by_cols, outer_where, outer_alias,
+                strip_at_where_qualifiers,
+            );
             format!(
                 "(SELECT {measure_expr} FROM {table_name} WHERE {stripped})"
             )
@@ -6089,8 +6312,7 @@ pub fn expand_modifiers_to_sql(
         let remaining_cols: Vec<&String> = group_by_cols
             .iter()
             .filter(|col| {
-                let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
-                !removed_dims.iter().any(|d| d.to_lowercase() == col_name)
+                !removed_dims.iter().any(|dim| same_dimension_reference(col, dim))
             })
             .collect();
 
@@ -6140,6 +6362,7 @@ pub fn expand_modifiers_to_sql(
     let mut effective_where: Option<String> = None;
     let mut has_all_global = false;
     let mut set_conditions: Vec<String> = Vec::new();
+    let mut set_dimensions: Vec<String> = Vec::new();
     let mut removed_dims: Vec<String> = Vec::new();
 
     // Process modifiers (in order, which is right-to-left per paper)
@@ -6149,11 +6372,12 @@ pub fn expand_modifiers_to_sql(
                 has_all_global = true;
                 effective_where = None;
                 set_conditions.clear();
+                set_dimensions.clear();
             }
             ContextModifier::All(dim) => {
                 // ALL dim removes that dimension from context
                 // Track which dimensions are removed for later filtering
-                removed_dims.push(dim.to_lowercase());
+                removed_dims.push(dim.clone());
             }
             ContextModifier::Visible => {
                 // Per paper: SET bypasses outer WHERE, so VISIBLE has no effect when SET is present
@@ -6166,15 +6390,15 @@ pub fn expand_modifiers_to_sql(
             }
             ContextModifier::Where(cond) => {
                 if !has_all_global {
-                    let stripped = strip_at_where_qualifiers(cond);
-                    // Qualify column references with _inner
-                    effective_where = Some(qualify_where_for_inner(&stripped));
+                    effective_where = Some(resolve_current_in_at_where(
+                        cond, group_by_cols, outer_where, outer_alias,
+                        |sql| qualify_where_for_inner(&strip_at_where_qualifiers(sql)),
+                    ));
                 }
             }
             ContextModifier::Set(dim, expr) => {
                 // Skip SET if ALL(dim) was already processed (dimension removed from context)
-                let dim_lower = dim.to_lowercase();
-                if !has_all_global && !removed_dims.contains(&dim_lower) {
+                if !has_all_global && !removed_dims.iter().any(|removed| same_dimension_reference(dim, removed)) {
                     let outer_ref = outer_alias.unwrap_or(table_name);
                     let dim_name = dim.split('.').next_back().unwrap_or(dim).trim();
                     let resolved_expr = resolve_current_in_expr(
@@ -6195,6 +6419,7 @@ pub fn expand_modifiers_to_sql(
                         format!("_inner.{dim_name}")
                     };
                     set_conditions.push(format!("{inner_dim} IS NOT DISTINCT FROM {qualified_expr}"));
+                    set_dimensions.push(dim.clone());
                 }
             }
         }
@@ -6208,16 +6433,12 @@ pub fn expand_modifiers_to_sql(
         return format!("(SELECT {measure_expr} FROM {table_name})");
     }
 
-    // Filter group_by_cols to exclude removed dimensions
+    // SET replaces its dimension's original correlation, while ALL removes it.
     let remaining_cols: Vec<&String> = group_by_cols
         .iter()
         .filter(|col| {
-            let col_lower = col.to_lowercase();
-            let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
-            // Check both full expression match and simple column match
-            !removed_dims
-                .iter()
-                .any(|d| *d == col_lower || *d == col_name)
+            !removed_dims.iter().chain(&set_dimensions)
+                .any(|dim| same_dimension_reference(col, dim))
         })
         .collect();
 
@@ -6300,12 +6521,7 @@ fn expand_modifiers_to_sql_derived(
         let remaining_cols: Vec<&String> = group_by_cols
             .iter()
             .filter(|col| {
-                let col_lower = col.to_lowercase();
-                let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
-                // Check both full expression match and simple column match
-                !removed_dims
-                    .iter()
-                    .any(|d| d.to_lowercase() == col_lower || d.to_lowercase() == col_name)
+                !removed_dims.iter().any(|dim| same_dimension_reference(col, dim))
             })
             .collect();
 
@@ -6355,7 +6571,7 @@ fn expand_modifiers_to_sql_derived(
                 effective_where = None;
             }
             ContextModifier::All(dim) => {
-                removed_dims.push(dim.to_lowercase());
+                removed_dims.push(dim.clone());
             }
             ContextModifier::Visible => {
                 // Per paper: SET bypasses outer WHERE, so VISIBLE has no effect when SET is present
@@ -6368,8 +6584,10 @@ fn expand_modifiers_to_sql_derived(
             }
             ContextModifier::Where(cond) => {
                 if !has_all_global {
-                    let stripped = strip_at_where_qualifiers(cond);
-                    effective_where = Some(qualify_where_for_inner(&stripped));
+                    effective_where = Some(resolve_current_in_at_where(
+                        cond, group_by_cols, outer_where, outer_alias,
+                        |sql| qualify_where_for_inner(&strip_at_where_qualifiers(sql)),
+                    ));
                 }
             }
             ContextModifier::Set(_, _) => {
@@ -6387,12 +6605,7 @@ fn expand_modifiers_to_sql_derived(
     let remaining_cols: Vec<&String> = group_by_cols
         .iter()
         .filter(|col| {
-            let col_lower = col.to_lowercase();
-            let col_name = col.split('.').next_back().unwrap_or(col).to_lowercase();
-            // Check both full expression match and simple column match
-            !removed_dims
-                .iter()
-                .any(|d| *d == col_lower || *d == col_name)
+            !removed_dims.iter().any(|dim| same_dimension_reference(col, dim))
         })
         .collect();
 
@@ -7315,6 +7528,8 @@ pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
             matches!(m, ContextModifier::Set(_, _))
                 || matches!(m, ContextModifier::All(_))
                 || matches!(m, ContextModifier::Visible)
+                || matches!(m, ContextModifier::Where(condition)
+                    if matches!(parser_ffi::find_current_references(condition), Some(Ok(refs)) if !refs.is_empty()))
         })
     });
 
@@ -7697,13 +7912,11 @@ pub fn store_measure_view(
         group_by_cols,
     };
 
-    let mut views = MEASURE_VIEWS.lock().unwrap();
-    remove_measure_view_case_insensitive(&mut views, view_name);
-    views.insert(view_name.to_string(), measure_view);
+    restore_measure_view(measure_view);
 }
 
 pub fn get_measure_view(view_name: &str) -> Option<MeasureView> {
-    let views = MEASURE_VIEWS.lock().unwrap();
+    let views = measure_views_snapshot();
     views
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(view_name))
@@ -7711,9 +7924,7 @@ pub fn get_measure_view(view_name: &str) -> Option<MeasureView> {
 }
 
 pub fn restore_measure_view(view: MeasureView) {
-    let mut views = MEASURE_VIEWS.lock().unwrap();
-    remove_measure_view_case_insensitive(&mut views, &view.view_name);
-    views.insert(view.view_name.clone(), view);
+    write_measure_view(&view.view_name.clone(), Some(view));
 }
 
 pub fn clear_measure_views() {
@@ -7722,16 +7933,9 @@ pub fn clear_measure_views() {
 }
 
 pub fn drop_measure_view(view_name: &str) -> bool {
-    let mut views = MEASURE_VIEWS.lock().unwrap();
-    let key = views
-        .keys()
-        .find(|k| k.eq_ignore_ascii_case(view_name))
-        .cloned();
-    if let Some(k) = key {
-        views.remove(&k);
-        return true;
-    }
-    false
+    let existed = get_measure_view(view_name).is_some();
+    write_measure_view(view_name, None);
+    existed
 }
 
 pub fn drop_measure_view_from_sql(sql: &str) -> bool {
@@ -7743,7 +7947,7 @@ pub fn drop_measure_view_from_sql(sql: &str) -> bool {
 }
 
 pub fn get_measure_aggregation(column_name: &str) -> Option<(String, String)> {
-    let views = MEASURE_VIEWS.lock().unwrap();
+    let views = measure_views_snapshot();
 
     for (view_name, view) in views.iter() {
         for measure in &view.measures {
@@ -7792,6 +7996,23 @@ fn extract_group_by_columns(sql: &str) -> Vec<String> {
         .unwrap_or(query.len());
 
         let group_by_content = query[start..end].trim();
+
+        // The complete statement may contain legacy AT syntax that DuckDB
+        // cannot parse. Parse just this clause so comment trivia never becomes
+        // part of a dimension inserted into a generated correlation predicate.
+        let group_by_query = format!("SELECT 1 GROUP BY {group_by_content}\n");
+        if let Ok(info) = parser_ffi::parse_select(&group_by_query) {
+            if info.group_by_all {
+                return extract_dimension_columns_from_select(sql);
+            }
+            let parsed_columns: Vec<String> = info.group_by_cols.into_iter()
+                .map(|column| column.trim().to_string())
+                .filter(|column| !column.is_empty() && !column.chars().all(|ch| ch.is_ascii_digit()))
+                .collect();
+            if !parsed_columns.is_empty() {
+                return parsed_columns;
+            }
+        }
 
         for part in group_by_content.split(',') {
             let col = part.trim();
@@ -7932,6 +8153,23 @@ fn looks_like_sql_aggregate_expr(expr: &str) -> bool {
 }
 
 fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
+    if let Ok(info) = parser_ffi::parse_select(sql) {
+        if info.native_parsed {
+            return info.items.into_iter()
+                .filter(|item| !item.is_aggregate && !item.is_star && !item.is_measure_ref)
+                .filter(|item| !is_literal_constant(&item.expression_sql))
+                .map(|item| {
+                    // Preserve the caller's expression spelling. DuckDB's
+                    // rendering adds parentheses around binary operators,
+                    // which must not change the lowerer's alias decisions.
+                    sql.get(item.start_pos as usize..item.end_pos as usize)
+                        .filter(|expression| !expression.is_empty())
+                        .unwrap_or(&item.expression_sql)
+                        .to_string()
+                })
+                .collect();
+        }
+    }
     let mut columns = Vec::new();
 
     let query = sql.trim().trim_end_matches(';').trim();
@@ -8012,6 +8250,67 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    fn overlay_test_view(name: &str) -> MeasureView {
+        MeasureView {
+            view_name: name.to_string(),
+            measures: vec![ViewMeasure {
+                column_name: "total".to_string(),
+                expression: "SUM(amount)".to_string(),
+                is_decomposable: true,
+            }],
+            base_query: "SELECT SUM(amount) AS total FROM source".to_string(),
+            base_table: Some("source".to_string()),
+            base_relation_sql: Some("source".to_string()),
+            dimension_exprs: HashMap::new(),
+            group_by_cols: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_temporary_overlay_isolates_threads_and_preserves_permanent_updates() {
+        let name = "overlay_thread_view";
+        restore_measure_view(overlay_test_view(name));
+        let mut temporary = get_measure_view(name).unwrap();
+        temporary.measures[0].expression = "SUM(amount * 10)".to_string();
+        push_measure_view_overlay();
+        set_measure_view_overlay(name, Some(temporary));
+
+        // The worker runs while the temporary entry remains active here.
+        std::thread::spawn(move || {
+            let mut permanent = get_measure_view(name).unwrap();
+            assert_eq!(permanent.measures[0].expression, "SUM(amount)");
+            permanent.measures[0].expression = "SUM(amount * 2)".to_string();
+            restore_measure_view(permanent);
+        }).join().unwrap();
+        assert_eq!(get_measure_view(name).unwrap().measures[0].expression, "SUM(amount * 10)");
+        assert!(known_measure_names().contains("total"));
+        pop_measure_view_overlay();
+        assert_eq!(get_measure_view(name).unwrap().measures[0].expression, "SUM(amount * 2)");
+        drop_measure_view(name);
+    }
+
+    #[test]
+    #[serial]
+    fn test_temporary_overlay_nested_permanent_bypass_and_local_drop() {
+        let name = "overlay_nested_view";
+        restore_measure_view(overlay_test_view(name));
+        let mut temporary = get_measure_view(name).unwrap();
+        temporary.measures[0].expression = "SUM(amount * 10)".to_string();
+        push_measure_view_overlay();
+        set_measure_view_overlay(name, Some(temporary));
+        push_measure_view_overlay();
+        bypass_measure_view_overlay(name);
+        assert_eq!(get_measure_view(name).unwrap().measures[0].expression, "SUM(amount)");
+        pop_measure_view_overlay();
+        assert_eq!(get_measure_view(name).unwrap().measures[0].expression, "SUM(amount * 10)");
+        assert!(drop_measure_view(name));
+        assert!(get_measure_view(name).is_none());
+        pop_measure_view_overlay();
+        assert!(get_measure_view(name).is_some());
+        drop_measure_view(name);
+    }
+
     #[test]
     fn test_group_by_keyword_scan_preserves_utf8_offsets() {
         assert!(!has_group_by_anywhere(
@@ -8074,6 +8373,14 @@ mod tests {
         assert!(!is_window_expression("OVER(amount)"));
         assert!(!is_window_expression("cover(amount)"));
         assert!(!is_window_expression("'SUM(amount) OVER (ORDER BY year)'"));
+    }
+
+    #[test]
+    fn test_measure_grouping_matches_quoted_qualified_dimensions() {
+        let outer = vec!["o.\"year\"".to_string(), "o.region".to_string(),
+                         "o.\"Fiscal.year\"".to_string(), "o.unrelated".to_string()];
+        let view = vec!["year".to_string(), "region".to_string(), "\"Fiscal.year\"".to_string()];
+        assert_eq!(filter_group_by_cols_for_measure(&outer, &view, &HashMap::new()), outer[..3]);
     }
 
     #[test]
@@ -9505,6 +9812,35 @@ FROM orders"#;
     }
 
     #[test]
+    fn test_set_removes_canonical_quoted_dimension_correlation() {
+        let groups = vec!["\"year\"".to_string()];
+        let modifier = ContextModifier::Set("year".to_string(), "2022".to_string());
+        assert_eq!(
+            expand_at_to_sql("amount", "SUM", &modifier, "sales", Some("s"), None, &groups),
+            "(SELECT SUM(amount) FROM sales _inner WHERE _inner.year IS NOT DISTINCT FROM 2022)"
+        );
+        assert_eq!(
+            expand_at_to_sql("amount", "SUM", &ContextModifier::All("year".to_string()),
+                "sales", Some("s"), None, &groups),
+            "(SELECT SUM(amount) FROM sales)"
+        );
+        assert_eq!(
+            expand_modifiers_to_sql("amount", "SUM", &[ContextModifier::Visible, modifier],
+                "sales", Some("s"), None, &groups),
+            "(SELECT SUM(amount) FROM sales _inner WHERE _inner.year IS NOT DISTINCT FROM 2022)"
+        );
+    }
+
+    #[test]
+    fn test_current_qualifier_preserves_quoted_aliases() {
+        assert_eq!(qualify_current_dimension("\"year\"", Some("Outer alias")),
+            "\"Outer alias\".\"year\"");
+        assert_eq!(qualify_current_dimension("\"year\"", Some("\"Outer alias\"")),
+            "\"Outer alias\".\"year\"");
+        assert_eq!(qualify_current_dimension("v.\"year\"", Some("Outer alias")), "v.\"year\"");
+    }
+
+    #[test]
     fn test_measure_identifier_rejects_expressions_and_incomplete_references() {
         for sql in [
             "", "123", "revenue + 1", "sum(revenue)", "a b", "a..b", "a.",
@@ -9737,7 +10073,7 @@ FROM orders"#;
         let restored = get_measure_view("sales_v").unwrap();
         assert_eq!(restored.view_name, "Sales_V");
         assert_eq!(restored.measures[0].column_name, "revenue");
-        let views = MEASURE_VIEWS.lock().unwrap();
+        let views = measure_views_snapshot();
         assert!(views.contains_key("Sales_V"));
         assert!(!views.contains_key("sales_v"));
         drop(views);

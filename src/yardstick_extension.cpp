@@ -10,6 +10,13 @@
 #include "duckdb/main/connection.hpp"
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/planner/operator/logical_create.hpp"
+#include <atomic>
+#include <map>
 #endif
 #include "duckdb/logging/logger.hpp"
 
@@ -57,6 +64,10 @@ extern "C" {
     char *yardstick_extract_view_name(const char *sql);
     char *yardstick_extract_drop_view_name(const char *sql);
     void *yardstick_snapshot_measure_view(const char *view_name);
+    void yardstick_push_measure_view_overlay();
+    void yardstick_pop_measure_view_overlay();
+    void yardstick_set_measure_view_overlay(const char *name, const void *snapshot);
+    void yardstick_bypass_measure_view_overlay(const char *name);
     void *yardstick_empty_measure_view_snapshot();
     void yardstick_restore_measure_view_snapshot(const char *view_name, void *snapshot);
     void yardstick_free_measure_view_snapshot(void *snapshot);
@@ -81,7 +92,11 @@ extern "C" {
         char* (*qualify_expression)(const char*, const char*),
         char* (*inline_order_by_subquery_aliases)(const char*),
         void (*free_string)(char*),
-        char* (*expand_aggregate_call)(const char*, const char*, const YardstickAtModifier*, size_t, const char*, const char*, const char*, const char* const*, size_t)
+        char* (*expand_aggregate_call)(const char*, const char*, const YardstickAtModifier*, size_t, const char*, const char*, const char*, const char* const*, size_t),
+        YardstickCurrentReferenceList* (*find_current_references)(const char*),
+        void (*free_current_references)(YardstickCurrentReferenceList*),
+        int32_t (*current_where_is_single_valued)(const char*, const char*, const char*),
+        int32_t (*expressions_equal)(const char*, const char*)
     );
 }
 
@@ -1763,6 +1778,72 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
 // PARSER OVERRIDE: intercepts ALL queries before DuckDB's native parser
 //=============================================================================
 
+#if YARDSTICK_GRAMMAR_EXTENSION
+static std::atomic<size_t> deferred_temporary_contexts {0};
+
+static vector<unique_ptr<SQLStatement>> DeferMeasureColumnListBatch(const string &query) {
+    if (CurrentNativeYardstickClientContext()) {
+        return {};
+    }
+    bool requires_binding = deferred_temporary_contexts.load() != 0;
+    auto statements = SplitSqlStatements(query);
+    for (auto &sql : statements) {
+        string semantic_stripped;
+        if (StartsWithSemantic(sql, semantic_stripped)) {
+            sql = std::move(semantic_stripped);
+        }
+        if (!StartsWithCreateViewStatement(sql)) {
+            continue;
+        }
+        if (auto *native = FindNativeYardstickMeasures(sql.c_str())) {
+            requires_binding |= native->requires_binding;
+            yardstick_free_create_view_info(native);
+        }
+    }
+    if (!requires_binding) {
+        return {};
+    }
+    vector<unique_ptr<SQLStatement>> deferred;
+    auto options = *CurrentNativeYardstickParserOptions();
+    for (auto &sql : statements) {
+        StringUtil::Trim(sql);
+        if (sql.empty()) {
+            continue;
+        }
+        // Transaction and setting statements must retain their engine-visible
+        // types so statement preprocessing preserves session semantics.
+        Parser parser(options);
+        if (!ParseNativeYardstickQuery(sql, parser)) {
+            return {};
+        }
+        if (parser.statements.size() == 1 &&
+            (parser.statements[0]->type == StatementType::TRANSACTION_STATEMENT ||
+             parser.statements[0]->type == StatementType::SET_STATEMENT ||
+             parser.statements[0]->type == StatementType::PRAGMA_STATEMENT ||
+             parser.statements[0]->type == StatementType::EXECUTE_STATEMENT)) {
+            deferred.push_back(std::move(parser.statements[0]));
+        } else if (parser.statements.size() == 1 &&
+                   parser.statements[0]->type == StatementType::SELECT_STATEMENT) {
+            Parser wrapper_parser(options);
+            wrapper_parser.ParseQuery("SELECT * FROM yardstick_scoped('" + EscapeSqlStringLiteral(sql) + "')");
+            auto statement = std::move(wrapper_parser.statements[0]);
+            statement->named_param_map = parser.statements[0]->named_param_map;
+            statement->has_anonymous_parameters = parser.statements[0]->has_anonymous_parameters;
+            deferred.push_back(std::move(statement));
+        } else {
+            auto statement = make_uniq<ExtensionStatement>(YardstickParserExtension(),
+                make_uniq_base<ParserExtensionParseData, YardstickDeferredParseData>(sql, options));
+            if (parser.statements.size() == 1) {
+                statement->named_param_map = parser.statements[0]->named_param_map;
+                statement->has_anonymous_parameters = parser.statements[0]->has_anonymous_parameters;
+            }
+            deferred.push_back(std::move(statement));
+        }
+    }
+    return deferred;
+}
+#endif
+
 ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
                                                 const std::string &query,
                                                 ParserOptions &options) {
@@ -1776,6 +1857,17 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
     if (had_semantic_prefix) {
         sql_to_check = semantic_stripped;
     }
+
+#if YARDSTICK_GRAMMAR_EXTENSION
+    try {
+        auto deferred = DeferMeasureColumnListBatch(sql_to_check);
+        if (!deferred.empty()) {
+            return ParserOverrideResult(std::move(deferred));
+        }
+    } catch (std::exception &error) {
+        return ParserOverrideResult(error);
+    }
+#endif
 
     bool native_has_measure = false;
     bool native_parsed = false;
@@ -1890,6 +1982,284 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
     return ParserOverrideResult();
 }
 
+#if YARDSTICK_GRAMMAR_EXTENSION
+class DeferredMeasureCatalogState : public ClientContextState {
+public:
+    using TemporaryViews = std::map<string, std::shared_ptr<void>>;
+    TemporaryViews temporary_views;
+    std::unique_ptr<TemporaryViews> pending_temporary;
+    std::unique_ptr<TemporaryViews> transaction_temporary;
+    bool counted = false;
+    std::vector<MeasureViewSnapshot> pending;
+    std::vector<MeasureViewSnapshot> transaction_snapshots;
+
+    ~DeferredMeasureCatalogState() override {
+        if (counted) {
+            deferred_temporary_contexts.fetch_sub(1);
+        }
+        FreeMeasureViewSnapshots(pending);
+        FreeMeasureViewSnapshots(transaction_snapshots);
+    }
+    void BeginTemporaryChange() {
+        if (!pending_temporary) {
+            pending_temporary = std::make_unique<TemporaryViews>(temporary_views);
+        }
+        if (!transaction_temporary) {
+            transaction_temporary = std::make_unique<TemporaryViews>(temporary_views);
+        }
+        if (!counted) {
+            counted = true;
+            deferred_temporary_contexts.fetch_add(1);
+        }
+    }
+    void RefreshTemporaryRouting() {
+        bool needed = !temporary_views.empty();
+        if (needed != counted) {
+            if (needed) {
+                deferred_temporary_contexts.fetch_add(1);
+            } else {
+                deferred_temporary_contexts.fetch_sub(1);
+            }
+            counted = needed;
+        }
+    }
+    void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
+        if (error && error->HasError()) {
+            RestoreMeasureViewSnapshots(pending);
+            if (pending_temporary) {
+                temporary_views = *pending_temporary;
+            }
+        } else if (context.transaction.HasActiveTransaction()) {
+            for (auto &snapshot : pending) {
+                transaction_snapshots.push_back(std::move(snapshot));
+            }
+            pending.clear();
+        } else {
+            FreeMeasureViewSnapshots(pending);
+        }
+        pending_temporary.reset();
+        RefreshTemporaryRouting();
+    }
+    void TransactionCommit(MetaTransaction &, ClientContext &) override {
+        FreeMeasureViewSnapshots(pending);
+        FreeMeasureViewSnapshots(transaction_snapshots);
+        pending_temporary.reset();
+        transaction_temporary.reset();
+        RefreshTemporaryRouting();
+    }
+    void TransactionRollback(MetaTransaction &, ClientContext &) override {
+        RestoreMeasureViewSnapshots(pending);
+        RestoreMeasureViewSnapshots(transaction_snapshots);
+        if (transaction_temporary) {
+            temporary_views = *transaction_temporary;
+        }
+        pending_temporary.reset();
+        transaction_temporary.reset();
+        RefreshTemporaryRouting();
+    }
+};
+
+// Temporary entries belong to the originating session. A thread-local overlay
+// exposes them to the lowerer without modifying another binder's catalog.
+class DeferredTemporaryMeasureScope {
+public:
+    explicit DeferredTemporaryMeasureScope(DeferredMeasureCatalogState &state) {
+        yardstick_push_measure_view_overlay();
+        for (auto &entry : state.temporary_views) {
+            yardstick_set_measure_view_overlay(entry.first.c_str(), entry.second.get());
+        }
+    }
+    ~DeferredTemporaryMeasureScope() {
+        yardstick_pop_measure_view_overlay();
+    }
+    void Save(const string &name) {
+        yardstick_set_measure_view_overlay(name.c_str(), nullptr);
+    }
+    void Restore(const string &name) {
+        yardstick_bypass_measure_view_overlay(name.c_str());
+    }
+};
+
+static void SelectDeferredMeasureNamespace(const string &sql, DeferredMeasureCatalogState &state,
+                                          DeferredTemporaryMeasureScope &scope) {
+    for (auto &entry : state.temporary_views) {
+        if (StatementReadsFromView(sql, entry.first, true)) {
+            if (StatementTextReadsFromView(sql, entry.first, false)) {
+                throw BinderException("A statement cannot combine temporary and permanent measure views named %s", entry.first);
+            }
+            scope.Restore(entry.first);
+        }
+    }
+}
+
+static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binder &parent,
+                                                    const YardstickDeferredParseData &data) {
+    NativeYardstickBindScope bind_scope(context);
+    NativeYardstickParseScope parse_scope(nullptr, data.options);
+    auto state = context.registered_state->GetOrCreate<DeferredMeasureCatalogState>("yardstick_deferred_catalog");
+    DeferredTemporaryMeasureScope temporary_scope(*state);
+    string sql = data.sql;
+    string semantic_stripped;
+    if (StartsWithSemantic(sql, semantic_stripped)) {
+        sql = std::move(semantic_stripped);
+    }
+    try {
+        SelectDeferredMeasureNamespace(sql, *state, temporary_scope);
+        Parser original_parser(*CurrentNativeYardstickParserOptions());
+        ParseNativeYardstickQuery(sql, original_parser);
+        bool temporary_create = false;
+        if (original_parser.statements.size() == 1 &&
+            original_parser.statements[0]->type == StatementType::CREATE_STATEMENT) {
+            auto &create = original_parser.statements[0]->Cast<CreateStatement>();
+            if (create.info && create.info->type == CatalogType::VIEW_ENTRY) {
+                auto &view = create.info->Cast<CreateViewInfo>();
+                temporary_create = view.temporary;
+                if (view.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+                    // Let DuckDB resolve the exact target and skip an ignored
+                    // body before Yardstick probes stars or changes metadata.
+                    // Use the public binder API, including on Windows.
+                    auto probe = original_parser.statements[0]->Copy();
+                    auto binder = Binder::CreateBinder(context, &parent);
+                    try {
+                        auto bound = binder->Bind(*probe);
+                        if (bound.plan->type == LogicalOperatorType::LOGICAL_CREATE_VIEW &&
+                            bound.plan->Cast<LogicalCreate>().info->Cast<CreateViewInfo>().binding_mode ==
+                                CreateViewBindingMode::SKIP_BINDING) {
+                            return bound;
+                        }
+                    } catch (const Exception &) {
+                        // An unignored body still contains measure markers.
+                        // Its authoritative binding follows semantic lowering.
+                    }
+                }
+            }
+        }
+        std::unique_ptr<YardstickCreateViewInfo, decltype(&yardstick_free_create_view_info)> native(
+            FindNativeYardstickMeasures(sql.c_str()), yardstick_free_create_view_info);
+        if (native && native->error) {
+            throw BinderException(native->error);
+        }
+        if (native && native->is_measure_view) {
+            if (temporary_create) {
+                state->BeginTemporaryChange();
+                temporary_scope.Save(native->view_name);
+            } else {
+                temporary_scope.Restore(native->view_name);
+                state->pending.push_back(SnapshotMeasureView(native->view_name));
+            }
+            auto lowered = yardstick_process_create_view(sql.c_str());
+            string error = lowered.error ? lowered.error : "";
+            if (lowered.clean_sql) {
+                sql = lowered.clean_sql;
+            }
+            yardstick_free_create_view_result(lowered);
+            if (!error.empty()) {
+                throw BinderException(error);
+            }
+            if (temporary_create) {
+                state->temporary_views[StringUtil::Lower(native->view_name)] = std::shared_ptr<void>(
+                    yardstick_snapshot_measure_view(native->view_name), yardstick_free_measure_view_snapshot);
+            }
+        } else {
+            if (native) {
+                // A plain replacement removes the old measure definition. A
+                // temporary plain view also masks same-name permanent metadata.
+                if (temporary_create) {
+                    state->BeginTemporaryChange();
+                    temporary_scope.Save(native->view_name);
+                    state->temporary_views[StringUtil::Lower(native->view_name)] = std::shared_ptr<void>(
+                        yardstick_snapshot_measure_view(native->view_name), yardstick_free_measure_view_snapshot);
+                } else {
+                    temporary_scope.Restore(native->view_name);
+                    state->pending.push_back(SnapshotMeasureView(native->view_name));
+                    yardstick_restore_measure_view_snapshot(native->view_name, yardstick_empty_measure_view_snapshot());
+                }
+            }
+            DropViewInfo drop;
+            if (ExtractDropViewInfoFromSql(sql, drop)) {
+                auto temporary = state->temporary_views.find(StringUtil::Lower(drop.view_name));
+                if (temporary != state->temporary_views.end() && drop.targets_temporary_view) {
+                    state->BeginTemporaryChange();
+                    state->temporary_views.erase(temporary);
+                    temporary_scope.Restore(drop.view_name);
+                } else {
+                    temporary_scope.Restore(drop.view_name);
+                    state->pending.push_back(SnapshotMeasureView(drop.view_name));
+                    yardstick_drop_measure_view_from_sql(sql.c_str());
+                }
+            }
+            if (yardstick_has_aggregate(sql.c_str())) {
+                auto expanded = yardstick_expand_aggregate(sql.c_str());
+                string error = expanded.error ? expanded.error : "";
+                string warnings = AggregateWarnings(expanded);
+                if (expanded.had_aggregate && expanded.expanded_sql) {
+                    sql = expanded.expanded_sql;
+                }
+                yardstick_free_aggregate_result(expanded);
+                if (!error.empty()) {
+                    throw BinderException(error);
+                }
+                HandleAggregateWarnings(context, warnings);
+            }
+        }
+        Parser parser(*CurrentNativeYardstickParserOptions());
+        if (!ParseNativeYardstickQuery(sql, parser)) {
+            parser.ParseQuery(sql);
+        }
+        if (parser.statements.size() != 1) {
+            throw BinderException("Deferred Yardstick binding requires one statement");
+        }
+        auto binder = Binder::CreateBinder(context, &parent);
+        return binder->Bind(*parser.statements[0]);
+    } catch (...) {
+        RestoreMeasureViewSnapshots(state->pending);
+        if (state->pending_temporary) {
+            state->temporary_views = *state->pending_temporary;
+            state->pending_temporary.reset();
+        }
+        throw;
+    }
+}
+
+struct DeferredMeasureFunctionInfo : public TableFunctionInfo {
+    explicit DeferredMeasureFunctionInfo(shared_ptr<ParserExtensionInfo> parser_info_p)
+        : parser_info(std::move(parser_info_p)) {
+    }
+    shared_ptr<ParserExtensionInfo> parser_info;
+};
+
+static unique_ptr<TableRef> DeferredMeasureSelectBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+    auto &info = input.info->Cast<DeferredMeasureFunctionInfo>();
+    NativeYardstickBindScope bind_scope(context);
+    NativeYardstickParseScope parse_scope(info.parser_info.get(), context.GetParserOptions());
+    auto state = context.registered_state->GetOrCreate<DeferredMeasureCatalogState>("yardstick_deferred_catalog");
+    DeferredTemporaryMeasureScope temporary_scope(*state);
+    string sql = input.inputs[0].GetValue<string>();
+    SelectDeferredMeasureNamespace(sql, *state, temporary_scope);
+    if (yardstick_has_aggregate(sql.c_str())) {
+        auto expanded = yardstick_expand_aggregate(sql.c_str());
+        string error = expanded.error ? expanded.error : "";
+        string warnings = AggregateWarnings(expanded);
+        if (expanded.had_aggregate && expanded.expanded_sql) {
+            sql = expanded.expanded_sql;
+        }
+        yardstick_free_aggregate_result(expanded);
+        if (!error.empty()) {
+            throw BinderException(error);
+        }
+        HandleAggregateWarnings(context, warnings);
+    }
+    Parser parser(*CurrentNativeYardstickParserOptions());
+    if (!ParseNativeYardstickQuery(sql, parser)) {
+        parser.ParseQuery(sql);
+    }
+    if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+        throw BinderException("Deferred Yardstick query requires one SELECT statement");
+    }
+    return make_uniq<SubqueryRef>(unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0])));
+}
+#endif
+
 ParserExtensionPlanResult yardstick_plan(ParserExtensionInfo *,
                                           ClientContext &context,
                                           unique_ptr<ParserExtensionParseData> parse_data) {
@@ -1909,6 +2279,11 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
             auto lookup = context.registered_state->Get<YardstickState>("yardstick");
             if (lookup) {
                 auto state = (YardstickState *)lookup.get();
+#if YARDSTICK_GRAMMAR_EXTENSION
+                if (auto *deferred = dynamic_cast<YardstickDeferredParseData *>(state->parse_data.get())) {
+                    return BindDeferredMeasureStatement(context, binder, *deferred);
+                }
+#endif
                 auto parse_data = dynamic_cast<YardstickParseData *>(state->parse_data.get());
 
                 shared_ptr<Binder> yardstick_binder;
@@ -1985,7 +2360,11 @@ static void LoadInternal(ExtensionLoader &loader) {
         yardstick_qualify_expression,
         yardstick_inline_order_by_subquery_aliases,
         yardstick_free_string,
-        yardstick_expand_aggregate_call
+        yardstick_expand_aggregate_call,
+        yardstick_find_current_references,
+        yardstick_free_current_reference_list,
+        yardstick_current_where_is_single_valued,
+        yardstick_expressions_equal
     );
 
     auto &db = loader.GetDatabaseInstance();
@@ -2020,6 +2399,13 @@ static void LoadInternal(ExtensionLoader &loader) {
     TableFunction query_func_with_warnings("yardstick", {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                            YardstickQueryFunction, YardstickQueryBind);
     loader.RegisterFunction(query_func_with_warnings);
+
+#if YARDSTICK_GRAMMAR_EXTENSION
+    TableFunction scoped_query("yardstick_scoped", {LogicalType::VARCHAR}, nullptr, nullptr);
+    scoped_query.bind_replace = DeferredMeasureSelectBindReplace;
+    scoped_query.function_info = make_shared_ptr<DeferredMeasureFunctionInfo>(parser.parser_info);
+    loader.RegisterFunction(scoped_query);
+#endif
 
     ScalarFunction warning_func("yardstick_warning", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
                                 YardstickWarningFunction);

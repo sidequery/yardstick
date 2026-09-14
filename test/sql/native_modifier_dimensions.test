@@ -1,0 +1,78 @@
+# name: test/sql/native_modifier_dimensions.test
+# description: Native modifier dimensions match canonical expression rendering.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE modifier_dates (day DATE, label VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO modifier_dates VALUES ('2023-01-01', 'US', 10), ('2023-02-01', 'us', 20);
+
+statement ok
+CREATE VIEW modifier_dates_v AS SELECT day, label, SUM(amount) AS MEASURE modifier_revenue FROM modifier_dates;
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+query IR rowsort
+SELECT MONTH(DAY), "AGGREGATE"(modifier_revenue) AT (SET month(day) = 2) FROM modifier_dates_v;
+----
+1	20.0
+2	20.0
+
+query IR rowsort
+SELECT CASE WHEN label = 'US' THEN 1 ELSE 2 END, "AGGREGATE"(modifier_revenue) AT (ALL CASE WHEN LABEL = 'US' THEN 1 ELSE 2 END) FROM modifier_dates_v;
+----
+1	30.0
+2	30.0
+
+# String literals remain case-sensitive when deciding which dimension ALL removes.
+query IR rowsort
+SELECT CASE WHEN label = 'US' THEN 1 ELSE 2 END, "AGGREGATE"(modifier_revenue) AT (ALL CASE WHEN label = 'us' THEN 1 ELSE 2 END) FROM modifier_dates_v;
+----
+1	10.0
+2	20.0
+
+query IR rowsort
+SELECT MONTH(day), "AGGREGATE"(modifier_revenue) AT (SET MONTH(day) = 2) FROM modifier_dates_v;
+----
+1	20.0
+2	20.0
+
+query IR rowsort
+SELECT MONTH(day), "AGGREGATE"(modifier_revenue) AT (ALL MONTH(day)) FROM modifier_dates_v;
+----
+1	30.0
+2	30.0
+
+query IR rowsort
+SELECT MONTH(day), "AGGREGATE"(modifier_revenue) AT (VISIBLE SET MONTH(day) = 2) FROM modifier_dates_v;
+----
+1	20.0
+2	20.0
+
+query IR rowsort
+SELECT MONTH(day), "AGGREGATE"(modifier_revenue) AT (ALL "month"(day) SET MONTH(day) = 2) FROM modifier_dates_v;
+----
+1	20.0
+2	20.0
+
+query IR rowsort
+SELECT MONTH(day), "AGGREGATE"(modifier_revenue) AT (SET MONTH(day) = 2 ALL "month"(day)) FROM modifier_dates_v;
+----
+1	30.0
+2	30.0
+
+endloop
+
+statement ok
+DROP VIEW modifier_dates_v;
+
+statement ok
+DROP TABLE modifier_dates;

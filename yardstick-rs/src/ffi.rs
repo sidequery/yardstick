@@ -17,6 +17,10 @@ use crate::sql::{
     has_implicit_measure_refs, has_measure_at_refs, process_create_view, restore_measure_view,
     MeasureView,
 };
+use crate::sql::measures::{
+    bypass_measure_view_overlay, pop_measure_view_overlay, push_measure_view_overlay,
+    set_measure_view_overlay,
+};
 
 /// Result from processing CREATE VIEW with AS MEASURE
 #[repr(C)]
@@ -167,6 +171,40 @@ pub extern "C" fn yardstick_snapshot_measure_view(view_name: *const c_char) -> *
 
     let snapshot: Option<MeasureView> = get_measure_view(view_name_str);
     Box::into_raw(Box::new(snapshot)) as *mut c_void
+}
+
+#[no_mangle]
+pub extern "C" fn yardstick_push_measure_view_overlay() {
+    push_measure_view_overlay();
+}
+
+#[no_mangle]
+pub extern "C" fn yardstick_pop_measure_view_overlay() {
+    pop_measure_view_overlay();
+}
+
+#[no_mangle]
+pub extern "C" fn yardstick_set_measure_view_overlay(name: *const c_char, snapshot: *const c_void) {
+    if name.is_null() {
+        return;
+    }
+    let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else { return; };
+    let view = if snapshot.is_null() {
+        None
+    } else {
+        unsafe { &*(snapshot as *const Option<MeasureView>) }.clone()
+    };
+    set_measure_view_overlay(name, view);
+}
+
+#[no_mangle]
+pub extern "C" fn yardstick_bypass_measure_view_overlay(name: *const c_char) {
+    if name.is_null() {
+        return;
+    }
+    if let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() {
+        bypass_measure_view_overlay(name);
+    }
 }
 
 /// Create a snapshot representing an absent catalog entry.

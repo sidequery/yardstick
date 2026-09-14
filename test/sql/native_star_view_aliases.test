@@ -1,0 +1,210 @@
+# name: test/sql/native_star_view_aliases.test
+# description: Star view column aliases bind against the originating session.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE native_star_data(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO native_star_data VALUES (2022, 100), (2022, 50), (2023, 225);
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+statement ok
+CREATE OR REPLACE VIEW native_star_view(fiscal_year, value, total) AS
+SELECT *, SUM(amount) AS MEASURE revenue FROM native_star_data;
+
+query R
+SELECT AGGREGATE(total) FROM native_star_view;
+----
+375.0
+
+statement ok
+CREATE TEMP TABLE native_star_session(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO native_star_session VALUES (2025, 9);
+
+statement ok
+CREATE TEMP VIEW native_star_session_view(fiscal_year, value, session_total) AS
+SELECT *, SUM(amount) AS MEASURE revenue FROM native_star_session;
+
+query II
+SELECT fiscal_year, value FROM native_star_session_view;
+----
+2025	9
+
+query R
+SELECT AGGREGATE(session_total) FROM native_star_session_view;
+----
+9.0
+
+statement ok
+PREPARE native_star_parameter AS SELECT $1::INTEGER AS value;
+
+query I
+EXECUTE native_star_parameter(42);
+----
+42
+
+statement ok
+DEALLOCATE native_star_parameter;
+
+statement ok
+DROP VIEW native_star_session_view;
+
+statement ok
+DROP TABLE native_star_session;
+
+query R
+CREATE OR REPLACE VIEW native_star_batch(fiscal_year, value, batch_total) AS
+SELECT *, SUM(amount) AS MEASURE revenue FROM native_star_data;
+SELECT AGGREGATE(batch_total) FROM native_star_batch;
+----
+375.0
+
+query R
+CREATE OR REPLACE VIEW native_star_batch(fiscal_year, value, batch_total) AS
+SELECT *, SUM(amount) AS MEASURE revenue FROM native_star_data;
+SEMANTIC SELECT AGGREGATE(batch_total) FROM native_star_batch;
+----
+375.0
+
+statement ok
+SET allow_parser_override_extension='strict';
+
+statement error
+CREATE OR REPLACE VIEW native_star_view(fiscal_year, value, total) AS
+SELECT *, SUM(amount * 10) AS MEASURE revenue FROM native_star_data
+WHERE missing_column = 1;
+----
+missing_column
+
+query R
+SELECT AGGREGATE(total) FROM native_star_view;
+----
+375.0
+
+# Ignored declarations do not probe their body or alter measure metadata.
+statement ok
+CREATE VIEW IF NOT EXISTS native_star_view(fiscal_year, value, total) AS
+SELECT *, SUM(amount * 10) AS MEASURE revenue FROM native_star_data;
+
+statement ok
+CREATE VIEW IF NOT EXISTS native_star_view(fiscal_year, value, total) AS
+SELECT *, SUM(amount) AS MEASURE revenue FROM native_star_missing_table;
+
+query R
+SELECT AGGREGATE(total) FROM native_star_view;
+----
+375.0
+
+# A session-local measure view can shadow and reveal permanent metadata.
+statement ok
+CREATE TEMP VIEW native_star_view(fiscal_year, value, total) AS
+SELECT *, SUM(amount * 10) AS MEASURE revenue FROM native_star_data;
+
+query R
+SELECT AGGREGATE(total) FROM native_star_view;
+----
+3750.0
+
+query R
+SELECT AGGREGATE(total) FROM main.native_star_view;
+----
+375.0
+
+query R independent_session
+SELECT AGGREGATE(total) FROM native_star_view;
+----
+375.0
+
+statement error
+CREATE OR REPLACE TEMP VIEW native_star_view AS SELECT missing_plain_column AS total;
+----
+missing_plain_column
+
+query R
+SELECT AGGREGATE(total) FROM native_star_view;
+----
+3750.0
+
+statement ok
+CREATE OR REPLACE TEMP VIEW native_star_view AS SELECT 17 AS total;
+
+query I
+SELECT total FROM native_star_view;
+----
+17
+
+statement ok
+DROP VIEW native_star_view;
+
+query R
+SELECT AGGREGATE(total) FROM native_star_view;
+----
+375.0
+
+statement ok
+CREATE OR REPLACE VIEW native_star_plain(total) AS SELECT SUM(amount) AS MEASURE revenue FROM native_star_data;
+
+# Keep a temporary entry active while replacing permanent measure metadata.
+statement ok
+CREATE TEMP VIEW native_star_plain_guard(year, value, total) AS SELECT *, SUM(amount) AS MEASURE revenue FROM native_star_data;
+
+statement ok
+CREATE OR REPLACE VIEW native_star_plain AS SELECT 42 AS total;
+
+query I
+SELECT total FROM native_star_plain;
+----
+42
+
+statement ok
+DROP VIEW native_star_plain_guard;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TEMP VIEW native_star_view(fiscal_year, value, total) AS
+SELECT *, SUM(amount * 2) AS MEASURE revenue FROM native_star_data;
+
+query R
+SELECT AGGREGATE(total) FROM native_star_view;
+----
+750.0
+
+statement ok
+ROLLBACK;
+
+query R
+SELECT AGGREGATE(total) FROM native_star_view;
+----
+375.0
+
+# The schema probe and consumer must see this session's uncommitted temp table.
+query R
+BEGIN;
+CREATE TEMP TABLE native_star_local(year INTEGER, amount INTEGER);
+INSERT INTO native_star_local VALUES (2024, 7), (2024, 8);
+CREATE TEMP VIEW native_star_local_view(fiscal_year, value, local_total) AS
+SELECT *, SUM(amount) AS MEASURE revenue FROM native_star_local;
+SELECT AGGREGATE(local_total) FROM native_star_local_view;
+----
+15.0
+
+statement ok
+ROLLBACK;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+endloop

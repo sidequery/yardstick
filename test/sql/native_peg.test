@@ -97,8 +97,8 @@ FROM native_sales_v;
 2022	NULL
 2023	150.0
 
-# CURRENT dimension retains the legacy path; a global CURRENT grammar rule
-# would also claim ordinary column/alias pairs such as SELECT current year.
+# CURRENT is recognized inside AT expressions without claiming ordinary
+# column/alias pairs such as SELECT current year.
 query IR rowsort
 SELECT year, AGGREGATE(native_revenue) AT (SET year = CURRENT year - 1)
 FROM native_sales_v;
@@ -130,7 +130,7 @@ SELECT year, "AGGREGATE"(native_revenue) AT (ALL/* compound trivia */region SET 
 FROM native_sales_v;
 ----
 2022	150.0
-2023	NULL
+2023	150.0
 
 query IR rowsort
 SELECT year, "AGGREGATE"(native_revenue) AT (ALL region/* compound trivia */WHERE year = 2023)

@@ -4,6 +4,9 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/grammar_extension.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
@@ -11,6 +14,7 @@
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
+#include "duckdb/planner/binder.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -40,6 +44,12 @@ struct NativeAtClause {
 };
 
 struct SyntaxCapture {
+    struct CurrentReference {
+        string dimension;
+        idx_t start;
+        idx_t end;
+    };
+    vector<CurrentReference> current_references;
     vector<SyntaxSpan> spans;
     bool has_measure = false;
     const string *source = nullptr;
@@ -59,6 +69,108 @@ struct SyntaxCapture {
 // source syntax, never catalog state, and restores nested parses on exit.
 thread_local SyntaxCapture *active_capture = nullptr;
 thread_local const NativeYardstickParseScope *active_parse_scope = nullptr;
+thread_local ClientContext *active_bind_context = nullptr;
+
+// CURRENT is an expression only inside an AT SET value or WHERE predicate.
+// Work from native tokens so literals, quoted names and comments cannot open
+// a scope, and a nested SELECT starts a separate SQL expression namespace.
+class CurrentKeywordMatcher final : public AtomicMatcher {
+public:
+    CurrentKeywordMatcher() : AtomicMatcher(MatcherType::CUSTOM) {}
+
+    MatcherResult MatchAtomic(MatchState &state) const override {
+        auto token = state.token_iterator.Current();
+        if (!token) {
+            return MatcherResult::Failure();
+        }
+        bool keyword = StringUtil::CIEquals(token->text, "CURRENT");
+        if (!keyword && StringUtil::CIEquals(token->text, "\"CURRENT\"")) {
+            auto next = state.token_iterator.Position() + 1;
+            while (next < state.token_iterator.Size() &&
+                   state.token_iterator.GetToken(next).type == TokenType::COMMENT) {
+                next++;
+            }
+            // DuckDB quotes the canonical function name when rendering it.
+            // A quoted column named current must still retain alias syntax.
+            keyword = next < state.token_iterator.Size() && state.token_iterator.GetToken(next).text == "(";
+        }
+        if (!keyword) {
+            return MatcherResult::Failure();
+        }
+        struct Frame {
+            bool at = false;
+            bool value = false;
+            bool set = false;
+            bool query = false;
+            bool started = false;
+        };
+        vector<Frame> frames(1);
+        const MatcherToken *previous = nullptr;
+        for (idx_t i = 0; i < state.token_iterator.Position(); i++) {
+            auto &item = state.token_iterator.GetToken(i);
+            if (item.type == TokenType::COMMENT) {
+                continue;
+            }
+            if (item.text == "(") {
+                Frame frame;
+                frame.at = previous && StringUtil::CIEquals(previous->text, "AT");
+                frames.back().started = true;
+                frames.push_back(frame);
+            } else if (item.text == ")") {
+                if (frames.size() > 1) {
+                    frames.pop_back();
+                }
+            } else if (StringUtil::CIEquals(item.text, "SELECT") ||
+                       (!frames.back().started &&
+                        (StringUtil::CIEquals(item.text, "VALUES") || StringUtil::CIEquals(item.text, "FROM") ||
+                         StringUtil::CIEquals(item.text, "WITH") || StringUtil::CIEquals(item.text, "TABLE") ||
+                         StringUtil::CIEquals(item.text, "PIVOT") || StringUtil::CIEquals(item.text, "UNPIVOT")))) {
+                frames.back().query = true;
+                frames.back().started = true;
+            } else if (frames.back().at) {
+                if (StringUtil::CIEquals(item.text, "SET")) {
+                    frames.back().set = true;
+                    frames.back().value = false;
+                } else if (StringUtil::CIEquals(item.text, "WHERE")) {
+                    frames.back().set = false;
+                    frames.back().value = true;
+                } else if (frames.back().set && item.text == "=") {
+                    frames.back().value = true;
+                } else if (StringUtil::CIEquals(item.text, "ALL") ||
+                           StringUtil::CIEquals(item.text, "VISIBLE")) {
+                    frames.back().set = false;
+                    frames.back().value = false;
+                }
+                frames.back().started = true;
+            } else {
+                frames.back().started = true;
+            }
+            previous = &item;
+        }
+        bool allowed = false;
+        for (auto frame = frames.rbegin(); frame != frames.rend(); ++frame) {
+            if (frame->query) {
+                break;
+            }
+            if (frame->at) {
+                allowed = frame->value;
+                break;
+            }
+        }
+        if (!allowed) {
+            return MatcherResult::Failure();
+        }
+        auto result = state.AllocateParseResult<KeywordParseResult>(token->text, token->offset, token->length);
+        state.token_iterator.Advance();
+        state.UpdateMaxTokenIndex();
+        return result;
+    }
+
+    SuggestionType AddSuggestionInternal(MatchState &) const override {
+        return SuggestionType::OPTIONAL;
+    }
+    string ToString() const override { return "CURRENT in AT expression"; }
+};
 
 struct CaptureScope {
     explicit CaptureScope(SyntaxCapture &capture) : previous(active_capture) {
@@ -215,8 +327,81 @@ unique_ptr<TransformProcess> StartAt(PEGTransformer &transformer, ParseResult &r
     return make_uniq<FinalizeTransformProcess>(transformer, result, TransformAt);
 }
 
+unique_ptr<TransformResultValue> TransformCurrentDimension(PEGTransformer &transformer, ParseResult &result,
+                                                         idx_t dimension_index) {
+    auto &list = result.Cast<ListParseResult>();
+    vector<unique_ptr<ParsedExpression>> children;
+    children.push_back(transformer.Transform<unique_ptr<ParsedExpression>>(list.GetChild(dimension_index)));
+    if (active_capture) {
+        active_capture->current_references.push_back({children[0]->ToString(), result.offset.GetIndex(),
+                                                      result.offset.GetIndex() + result.length.GetIndex()});
+    }
+    unique_ptr<ParsedExpression> expression = make_uniq<FunctionExpression>("current", std::move(children));
+    return make_uniq<TypedTransformResult<unique_ptr<ParsedExpression>>>(std::move(expression));
+}
+
+unique_ptr<TransformProcess> StartCurrentReference(PEGTransformer &transformer, ParseResult &result) {
+    return make_uniq<FinalizeTransformProcess>(transformer, result,
+        [](PEGTransformer &transformer, ParseResult &result) {
+            return TransformCurrentDimension(transformer, result, 1);
+        });
+}
+
+unique_ptr<TransformProcess> StartCurrentCall(PEGTransformer &transformer, ParseResult &result) {
+    return make_uniq<FinalizeTransformProcess>(transformer, result,
+        [](PEGTransformer &transformer, ParseResult &result) {
+            return TransformCurrentDimension(transformer, result, 2);
+        });
+}
+
 unique_ptr<TransformProcess> StartMeasure(PEGTransformer &transformer, ParseResult &result) {
     return make_uniq<FinalizeTransformProcess>(transformer, result, TransformMeasure);
+}
+
+bool ExpandDeclarationReferences(unique_ptr<ParsedExpression> &expression,
+                                 const vector<SyntaxCapture::Measure> &declarations,
+                                 vector<idx_t> &active) {
+    if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY ||
+        expression->GetExpressionClass() == ExpressionClass::WINDOW) {
+        return false;
+    }
+    const ParsedExpression *reference = expression.get();
+    if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+        auto &function = expression->Cast<FunctionExpression>();
+        auto name = function.FunctionName().GetIdentifierName();
+        if (StringUtil::CIEquals(name, "aggregate") && function.GetArguments().size() == 1) {
+            reference = &function.GetArguments()[0].GetExpression();
+        } else if (IsYardstickStandardAggregate(name)) {
+            // These identifiers belong to base rows, not sibling declarations.
+            return false;
+        }
+    }
+    if (reference->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+        auto &names = reference->Cast<ColumnRefExpression>().ColumnNames();
+        if (names.size() == 1) {
+            for (idx_t i = 0; i < declarations.size(); i++) {
+                auto &declaration = declarations[i];
+                if (names[0] != declaration.marker->GetAlias()) {
+                    continue;
+                }
+                if (std::find(active.begin(), active.end(), i) != active.end()) {
+                    throw ParserException("Cyclic AS MEASURE declaration reference");
+                }
+                auto replacement = declaration.marker->Cast<FunctionExpression>()
+                    .GetArguments()[0].GetExpression().Copy();
+                active.push_back(i);
+                ExpandDeclarationReferences(replacement, declarations, active);
+                active.pop_back();
+                expression = std::move(replacement);
+                return true;
+            }
+        }
+    }
+    bool changed = false;
+    ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+        changed |= ExpandDeclarationReferences(child, declarations, active);
+    });
+    return changed;
 }
 
 class YardstickGrammar final : public GrammarExtension {
@@ -225,6 +410,14 @@ public:
 
     vector<GrammarChange> GetChanges() const override {
         return {
+            GrammarChange::AddRule("YardstickCurrentKeyword <- 'CURRENT'"),
+            GrammarChange::AddTerminalRuleOverride("YardstickCurrentKeyword", [](const PEGKeywordHelper &) {
+                return make_uniq<CurrentKeywordMatcher>();
+            }),
+            GrammarChange::AddRule("YardstickCurrentReference <- YardstickCurrentKeyword ColumnReference", StartCurrentReference),
+            GrammarChange::AddRule("YardstickCurrentCall <- YardstickCurrentKeyword '(' ColumnReference ')'", StartCurrentCall),
+            GrammarChange::PrependChoice("SingleExpression", "YardstickCurrentReference"),
+            GrammarChange::PrependChoice("SingleExpression", "YardstickCurrentCall"),
             GrammarChange::AddRule("YardstickAtModifier <- 'AT' '(' YardstickAtClause+ ')'", StartAt),
             GrammarChange::AddRule("YardstickAtClause <- YardstickAtAll / YardstickAtSet / YardstickAtWhere / 'VISIBLE'"),
             GrammarChange::AddRule("YardstickAtAll <- 'ALL' YardstickAtAllTail?"),
@@ -286,6 +479,29 @@ const ParserOptions *CurrentNativeYardstickParserOptions() {
     return active_parse_scope ? &active_parse_scope->ParserConfig() : nullptr;
 }
 
+NativeYardstickBindScope::NativeYardstickBindScope(ClientContext &context) : previous(active_bind_context) {
+    active_bind_context = &context;
+}
+
+NativeYardstickBindScope::~NativeYardstickBindScope() {
+    active_bind_context = previous;
+}
+
+ClientContext *CurrentNativeYardstickClientContext() {
+    return active_bind_context;
+}
+
+bool ParseNativeYardstickQuery(const string &sql, Parser &parser) {
+    if (!active_parse_scope || !active_parse_scope->available || Parser::NormalizeSQLString(sql) != sql) {
+        return false;
+    }
+    SyntaxCapture capture;
+    capture.source = &sql;
+    CaptureScope capture_scope(capture);
+    parser.ParseQuery(sql);
+    return true;
+}
+
 YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql_p) {
     if (!sql_p || !active_parse_scope || !active_parse_scope->available) {
         return nullptr;
@@ -333,13 +549,6 @@ YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql_p) {
         result->view_name = duplicate(view.GetViewName().GetIdentifierName());
         result->native_parsed = true;
         result->is_measure_view = !capture.measures.empty();
-        if (!capture.measures.empty() && !view.aliases.empty()) {
-            // Header aliases rename both dimensions and measures after SELECT
-            // binding, including star expansion. Shared metadata is extracted
-            // before binding and cannot safely map those output positions.
-            result->error = duplicate("AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead");
-            return result.release();
-        }
         for (auto &measure : capture.measures) {
             bool top_level = false;
             if (view.query && view.query->node && view.query->node->type == QueryNodeType::SELECT_NODE) {
@@ -352,6 +561,157 @@ YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql_p) {
                 result->error = duplicate("AS MEASURE declarations must be in the top-level CREATE VIEW projection");
                 return result.release();
             }
+        }
+        if (!capture.measures.empty() && !view.aliases.empty()) {
+            // Publish header-renamed metadata only while binding, so a failed
+            // replacement restores the definition that DuckDB still owns.
+            result->requires_binding = true;
+            auto &select = view.query->node->Cast<SelectNode>();
+            std::function<bool(const ParsedExpression &)> contains_star = [&](const ParsedExpression &expression) {
+                if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY ||
+                    expression.GetExpressionClass() == ExpressionClass::WINDOW) {
+                    return false;
+                }
+                if (expression.GetExpressionClass() == ExpressionClass::FUNCTION &&
+                    IsYardstickStandardAggregate(expression.Cast<FunctionExpression>().FunctionName().GetIdentifierName())) {
+                    return false;
+                }
+                bool found = expression.GetExpressionClass() == ExpressionClass::STAR;
+                ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
+                    found |= contains_star(child);
+                });
+                return found;
+            };
+            bool has_star = false;
+            for (auto &projection : select.select_list) {
+                has_star |= contains_star(*projection);
+            }
+            if (has_star && !active_bind_context) {
+                result->error = duplicate("AS MEASURE column lists with star expansion require the originating bind context");
+                return result.release();
+            }
+            if (has_star) {
+                // Bind only a layout probe in the originating transaction.
+                // Placeholders retain the positions of ordinary projections;
+                // DuckDB expands stars against the actual FROM/CTE bindings.
+                auto probe = select.Copy();
+                auto &probe_select = probe->Cast<SelectNode>();
+                probe_select.groups = GroupByNode();
+                probe_select.having.reset();
+                probe_select.qualify.reset();
+                probe_select.where_clause.reset();
+                probe_select.modifiers.clear();
+                probe_select.aggregate_handling = AggregateHandling::STANDARD_HANDLING;
+                string prefix = "__yardstick_projection_";
+                while (sql.find(prefix) != string::npos) {
+                    prefix += "_";
+                }
+                vector<string> placeholders(select.select_list.size());
+                for (idx_t i = 0; i < select.select_list.size(); i++) {
+                    if (contains_star(*select.select_list[i])) {
+                        continue;
+                    }
+                    placeholders[i] = prefix + std::to_string(i);
+                    auto placeholder = ConstantExpression::FromValue(Value());
+                    placeholder->SetAlias(Identifier(placeholders[i]));
+                    probe_select.select_list[i] = std::move(placeholder);
+                }
+                try {
+                    auto binder = Binder::CreateBinder(*active_bind_context);
+                    auto bound = binder->Bind(*probe);
+                    vector<unique_ptr<ParsedExpression>> expanded;
+                    vector<bool> restored_placeholders(placeholders.size(), false);
+                    for (auto &projection : bound.extra_info.original_expressions) {
+                        bool restored = false;
+                        if (projection->GetExpressionClass() == ExpressionClass::CONSTANT && projection->HasAlias()) {
+                            auto alias = projection->GetAlias().GetIdentifierName();
+                            for (idx_t i = 0; i < placeholders.size(); i++) {
+                                if (!placeholders[i].empty() && placeholders[i] == alias) {
+                                    if (restored_placeholders[i]) {
+                                        throw ParserException("Ambiguous expanded AS MEASURE view projection");
+                                    }
+                                    expanded.push_back(std::move(select.select_list[i]));
+                                    restored_placeholders[i] = true;
+                                    restored = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!restored) {
+                            expanded.push_back(std::move(projection));
+                        }
+                    }
+                    if (expanded.size() != bound.names.size()) {
+                        throw ParserException("Unable to map expanded AS MEASURE view columns");
+                    }
+                    for (idx_t i = 0; i < placeholders.size(); i++) {
+                        if (!placeholders[i].empty() && !restored_placeholders[i]) {
+                            throw ParserException("Missing expanded AS MEASURE view projection");
+                        }
+                    }
+                    select.select_list = std::move(expanded);
+                } catch (const std::exception &error) {
+                    result->error = duplicate(error.what());
+                    return result.release();
+                }
+            }
+            if (view.aliases.size() > select.select_list.size()) {
+                result->error = duplicate("More VIEW aliases than columns in query result");
+                return result.release();
+            }
+            // Derived expressions retain their original declaration namespace
+            // even when the header renames exposed columns. Expand references
+            // before renaming, with aggregate argument and subquery boundaries.
+            for (idx_t i = 0; i < capture.measures.size(); i++) {
+                auto &declaration = capture.measures[i];
+                auto expression = declaration.marker->Cast<FunctionExpression>()
+                    .GetArguments()[0].GetExpression().Copy();
+                vector<idx_t> active {i};
+                try {
+                    if (ExpandDeclarationReferences(expression, capture.measures, active)) {
+                        declaration.expression = expression->ToString();
+                    }
+                } catch (const ParserException &error) {
+                    result->error = duplicate(error.what());
+                    return result.release();
+                }
+            }
+            auto metadata_statement = view.query->Copy();
+            auto &metadata = metadata_statement->Cast<SelectStatement>().node->Cast<SelectNode>();
+            for (idx_t i = 0; i < select.select_list.size(); i++) {
+                auto &projection = select.select_list[i];
+                auto declaration = std::find_if(capture.measures.begin(), capture.measures.end(),
+                                                [&](const SyntaxCapture::Measure &measure) {
+                    return measure.marker == projection.get();
+                });
+                if (declaration != capture.measures.end()) {
+                    metadata.select_list[i] = projection->Cast<FunctionExpression>().GetArguments()[0].GetExpression().Copy();
+                    metadata.select_list[i]->SetAlias(projection->GetAlias());
+                }
+                if (i >= view.aliases.size()) {
+                    continue;
+                }
+                auto &alias = view.aliases[i];
+                // Only metadata receives the new SELECT aliases. Executable SQL
+                // keeps the header and original aliases used by GROUP BY/HAVING.
+                metadata.select_list[i]->SetAlias(alias);
+                if (declaration != capture.measures.end()) {
+                    declaration->name = alias.GetIdentifierName();
+                }
+                for (auto &group : metadata.groups.group_expressions) {
+                    auto group_sql = group->ToString();
+                    bool matches_alias = projection->HasAlias() &&
+                        group->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+                        group->Cast<ColumnRefExpression>().ColumnNames().size() == 1 &&
+                        group->Cast<ColumnRefExpression>().ColumnNames()[0] == projection->GetAlias();
+                    auto original = projection->Copy();
+                    original->ClearAlias();
+                    if (matches_alias || group_sql == original->ToString()) {
+                        group = make_uniq<ColumnRefExpression>(alias);
+                    }
+                }
+            }
+            result->metadata_query_sql = duplicate(metadata_statement->ToString());
         }
         if (!capture.measures.empty()) {
             result->measures = new YardstickMeasureDef[capture.measures.size()] {};
@@ -370,6 +730,51 @@ YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql_p) {
     } catch (const std::exception &) {
         return nullptr;
     }
+}
+
+YardstickCurrentReferenceList *FindNativeYardstickCurrentReferences(const char *expression) {
+    if (!expression || !active_parse_scope || !active_parse_scope->available) {
+        return nullptr;
+    }
+    const string prefix = "SELECT AGGREGATE(__yardstick_probe) AT (SET __yardstick_dimension = ";
+    string sql = prefix + expression + ")";
+    if (sql.size() > std::numeric_limits<uint32_t>::max() || Parser::NormalizeSQLString(sql) != sql) {
+        return nullptr;
+    }
+    std::unique_ptr<YardstickCurrentReferenceList, decltype(&yardstick_free_current_reference_list)> output(
+        new YardstickCurrentReferenceList {}, yardstick_free_current_reference_list);
+    try {
+        SyntaxCapture capture;
+        capture.source = &sql;
+        CaptureScope capture_scope(capture);
+        Parser parser(active_parse_scope->ParserConfig());
+        parser.ParseQuery(sql);
+        auto &references = capture.current_references;
+        std::sort(references.begin(), references.end(), [](const SyntaxCapture::CurrentReference &left,
+                                                         const SyntaxCapture::CurrentReference &right) {
+            return left.start < right.start;
+        });
+        if (!references.empty()) {
+            output->references = new YardstickCurrentReference[references.size()] {};
+            output->count = references.size();
+        }
+        for (idx_t i = 0; i < references.size(); i++) {
+            auto &source = references[i];
+            if (source.start < prefix.size() || source.end > sql.size() - 1) {
+                throw ParserException("CURRENT reference is outside its modifier expression");
+            }
+            auto *dimension = static_cast<char *>(std::malloc(source.dimension.size() + 1));
+            if (!dimension) {
+                throw std::bad_alloc();
+            }
+            std::memcpy(dimension, source.dimension.c_str(), source.dimension.size() + 1);
+            output->references[i] = {dimension, static_cast<uint32_t>(source.start - prefix.size()),
+                                    static_cast<uint32_t>(source.end - prefix.size())};
+        }
+    } catch (const std::exception &error) {
+        output->error = strdup(error.what());
+    }
+    return output.release();
 }
 
 YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {

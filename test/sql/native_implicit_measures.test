@@ -1,0 +1,144 @@
+# name: test/sql/native_implicit_measures.test
+# description: Native implicit references use expression spans and local relation scope.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE native_implicit_inserted(year INTEGER, total DOUBLE);
+
+statement ok
+CREATE TABLE native_implicit_sales(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO native_implicit_sales VALUES (2022, 100), (2022, 50), (2023, 225);
+
+statement ok
+CREATE VIEW native_implicit_v AS
+SELECT year, SUM(amount) AS MEASURE revenue, SUM(amount) AS MEASURE "Gross revenue"
+FROM native_implicit_sales;
+
+statement ok
+CREATE VIEW native_implicit_amount_v AS
+SELECT amount, SUM(amount) AS MEASURE amount_revenue FROM native_implicit_sales;
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+# INSERT's input SELECT retains its own projection and relation scope.
+statement ok
+INSERT INTO native_implicit_inserted
+SELECT year, revenue FROM native_implicit_v;
+
+statement ok
+WITH native_implicit_v AS (SELECT 17 AS revenue)
+INSERT INTO native_implicit_inserted SELECT 2024, revenue FROM native_implicit_v;
+
+query IR rowsort
+SELECT * FROM native_implicit_inserted;
+----
+2022	150.0
+2023	225.0
+2024	17.0
+
+statement ok
+DELETE FROM native_implicit_inserted;
+
+# Spans cover only the column expression; all aliases and trivia remain SQL.
+query IR rowsort
+SELECT year, revenue /* alias */ AS "Net revenue" FROM native_implicit_v;
+----
+2022	150.0
+2023	225.0
+
+query TRR
+SELECT '東京, AS revenue', "Gross revenue" AS "Escaped""alias", revenue plain_alias
+FROM native_implicit_v;
+----
+東京, AS revenue	375.0	375.0
+
+query IRR rowsort
+SELECT v.year, v /* qualifier */ . "Gross revenue" AS gross,
+       "AGGREGATE"(v.revenue) AT (ALL) AS global_total
+FROM native_implicit_v AS v;
+----
+2022	150.0	375.0
+2023	225.0	375.0
+
+# A local CTE or derived table with a catalog view's name exposes ordinary
+# columns. Its values must not be replaced with that catalog view's measures.
+query I
+WITH native_implicit_v AS (SELECT 17 AS revenue)
+SELECT revenue FROM native_implicit_v;
+----
+17
+
+query I
+SELECT revenue FROM (SELECT 23 AS revenue) AS native_implicit_v;
+----
+23
+
+# A catalog view inside a scalar subquery is not a root relation.
+query II
+SELECT 19 AS revenue, (SELECT COUNT(*) FROM native_implicit_v) AS rows;
+----
+19	3
+
+# Explicit schema qualification escapes an identically named CTE.
+query R
+WITH native_implicit_v AS (SELECT 17 AS revenue)
+SELECT revenue FROM main.native_implicit_v;
+----
+375.0
+
+# A known measure name elsewhere in the catalog cannot capture an ordinary
+# column from another relation just because another select item has AT syntax.
+query RI
+SELECT AGGREGATE(v.revenue) AT (ALL), other.revenue
+FROM native_implicit_v v CROSS JOIN (SELECT 7 AS revenue) other;
+----
+375.0	7
+
+# Shorthand operands are native column nodes even inside scalar expressions;
+# comments and quoted qualifiers remain part of the exact replacement span.
+query RR
+SELECT "Gross revenue" AT (ALL) AS gross,
+       coalesce(v /* qualifier */ . "Gross revenue" /* suffix */ AT (ALL) AT (VISIBLE), 0) AS wrapped
+FROM native_implicit_v v;
+----
+375.0	375.0
+
+# Root scope cannot borrow a catalog measure from a shadowing relation.
+statement error
+WITH native_implicit_v AS (SELECT 17 AS revenue)
+SELECT revenue AT (ALL) FROM native_implicit_v;
+----
+<REGEX>:.*(Parser Error|Catalog Error|Binder Error).*
+
+statement error
+SELECT revenue AT (ALL) FROM (SELECT 23 AS revenue) AS native_implicit_v;
+----
+<REGEX>:.*(Parser Error|Catalog Error|Binder Error).*
+
+statement error
+SELECT missing.revenue AT (ALL) FROM native_implicit_v v;
+----
+<REGEX>:.*(Parser Error|Catalog Error|Binder Error).*
+
+# A scalar subquery's source is not a root relation for shorthand lookup.
+statement error
+SELECT (SELECT revenue AT (ALL) FROM native_implicit_v);
+----
+<REGEX>:.*(Parser Error|Catalog Error|Binder Error).*
+
+# Standard aggregate expressions must not become implicit grouping dimensions.
+query RR
+SELECT MEDIAN(amount), amount_revenue FROM native_implicit_amount_v;
+----
+100.0	375.0
+
+endloop
