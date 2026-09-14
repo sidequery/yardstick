@@ -10,6 +10,10 @@
 #include "yardstick_ffi.h"
 #include "yardstick_compat.hpp"
 #include "frontend_peg.hpp"
+#if YARDSTICK_GRAMMAR_EXTENSION
+#include "duckdb/parser/peg/compiled_grammar.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#endif
 
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node.hpp"
@@ -713,7 +717,9 @@ static bool IsStandardAggregate(const std::string& name) {
         "stddev", "stddev_pop", "stddev_samp",
         "variance", "var_pop", "var_samp",
         "string_agg", "listagg", "group_concat",
-        "array_agg", "list"
+        "array_agg", "list", "count_star", "median", "mode",
+        "quantile", "quantile_cont", "quantile_disc", "percentile_cont", "percentile_disc",
+        "bool_and", "bool_or", "bit_and", "bit_or", "bit_xor"
     };
     std::string lower = StringUtil::Lower(name);
     for (const auto& agg : aggregates) {
@@ -735,7 +741,8 @@ struct AggregateCallInfo {
 
 static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCallInfo>& results,
                                const std::string& sql);
-static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableRef>& tables);
+static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableRef>& tables,
+                                     const std::unordered_set<std::string>* cte_names = nullptr);
 static bool ExpressionContainsAggregate(ParsedExpression* expr);
 static bool ExpressionContainsMeasureRef(ParsedExpression* expr);
 static void QualifyColumnRefs(ParsedExpression* expr, const std::string& qualifier);
@@ -937,7 +944,8 @@ static void FindAggregateCalls(ParsedExpression* expr, std::vector<AggregateCall
 // AST Walking: Collect tables from FROM clause
 //=============================================================================
 
-static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableRef>& tables) {
+static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableRef>& tables,
+                                     const std::unordered_set<std::string>* cte_names) {
     if (!ref) return;
 
     switch (ref->type) {
@@ -947,14 +955,21 @@ static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableR
             t.table_name = safe_strdup(YsBaseTableName(*base));
             t.alias = base->alias.empty() ? nullptr : safe_strdup(YsName(base->alias));
             t.is_subquery = false;
+#if YARDSTICK_GRAMMAR_EXTENSION
+            if (cte_names && base->GetQualifiedName().Schema().empty() &&
+                cte_names->count(StringUtil::Lower(YsBaseTableName(*base)))) {
+                // A local CTE shadows the catalog view with the same name.
+                t.is_subquery = true;
+            }
+#endif
             tables.push_back(t);
             break;
         }
 
         case TableReferenceType::JOIN: {
             auto* join = static_cast<JoinRef*>(ref);
-            CollectTablesFromTableRef(join->left.get(), tables);
-            CollectTablesFromTableRef(join->right.get(), tables);
+            CollectTablesFromTableRef(join->left.get(), tables, cte_names);
+            CollectTablesFromTableRef(join->right.get(), tables, cte_names);
             break;
         }
 
@@ -1059,7 +1074,9 @@ static bool ExpressionContainsMeasureRef(ParsedExpression* expr) {
     switch (expr->GetExpressionClass()) {
         case ExpressionClass::FUNCTION: {
             auto* func = static_cast<FunctionExpression*>(expr);
-            if (StringUtil::Lower(YsFuncName(*func)) == "aggregate") {
+            auto name = StringUtil::Lower(YsFuncName(*func));
+            if ((name == "aggregate" && YsArgs(*func).size() == 1) ||
+                name == "__yardstick_at" || name == "__yardstick_measure") {
                 return true;
             }
             for (auto* child : YsArgs(*func)) {
@@ -1213,6 +1230,98 @@ static void QualifyColumnRefs(ParsedExpression* expr, const std::string& qualifi
 // FFI Implementation: yardstick_find_aggregates
 //=============================================================================
 
+#if YARDSTICK_GRAMMAR_EXTENSION
+namespace {
+bool CurrentConstantExpression(const ParsedExpression &expression) {
+    if (expression.GetExpressionClass() == ExpressionClass::CONSTANT) {
+        return true;
+    }
+    if (expression.GetExpressionClass() == ExpressionClass::CAST) {
+        return CurrentConstantExpression(expression.Cast<CastExpression>().Child());
+    }
+    return false;
+}
+
+bool CurrentEqualityProof(const ParsedExpression &predicate, const ColumnRefExpression &dimension,
+                          const string &qualifier) {
+    if (predicate.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+        for (auto &child : predicate.Cast<ConjunctionExpression>().GetChildren()) {
+            if (CurrentEqualityProof(*child, dimension, qualifier)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (predicate.GetExpressionType() != ExpressionType::COMPARE_EQUAL) {
+        return false;
+    }
+    auto &comparison = predicate.Cast<ComparisonExpression>();
+    auto matches = [&](const ParsedExpression &candidate, const ParsedExpression &value) {
+        if (candidate.GetExpressionClass() != ExpressionClass::COLUMN_REF || !CurrentConstantExpression(value)) {
+            return false;
+        }
+        auto &names = candidate.Cast<ColumnRefExpression>().ColumnNames();
+        auto &wanted = dimension.ColumnNames();
+        if (names.empty() || wanted.empty() || names.back() != wanted.back()) {
+            return false;
+        }
+        if (names.size() == 1) {
+            return true;
+        }
+        if (wanted.size() > 1) {
+            return names == wanted;
+        }
+        return qualifier.empty() || names[names.size() - 2] == Identifier(qualifier);
+    };
+    return matches(comparison.Left(), comparison.Right()) || matches(comparison.Right(), comparison.Left());
+}
+} // namespace
+#endif
+
+extern "C" int32_t yardstick_current_where_is_single_valued(const char* predicate, const char* dimension,
+                                                            const char* qualifier) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    auto *options = CurrentNativeYardstickParserOptions();
+    if (!options || !options->compiled_grammar || !options->compiled_grammar->HasGrammarChanges()) {
+        return -1;
+    }
+    try {
+        auto predicates = Parser::ParseExpressionList(predicate, *options);
+        auto dimensions = Parser::ParseExpressionList(dimension, *options);
+        if (predicates.size() != 1 || dimensions.size() != 1 ||
+            dimensions[0]->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+            return 0;
+        }
+        return CurrentEqualityProof(*predicates[0], dimensions[0]->Cast<ColumnRefExpression>(),
+                                    qualifier ? qualifier : string()) ? 1 : 0;
+    } catch (const std::exception &) {
+        return 0;
+    }
+#else
+    return -1;
+#endif
+}
+
+extern "C" YardstickCurrentReferenceList* yardstick_find_current_references(const char* expression) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    return FindNativeYardstickCurrentReferences(expression);
+#else
+    return nullptr;
+#endif
+}
+
+extern "C" void yardstick_free_current_reference_list(YardstickCurrentReferenceList* list) {
+    if (!list) {
+        return;
+    }
+    for (size_t i = 0; i < list->count; i++) {
+        free(const_cast<char*>(list->references[i].dimension));
+    }
+    delete[] list->references;
+    free(const_cast<char*>(list->error));
+    delete list;
+}
+
 extern "C" YardstickAggregateCallList* yardstick_find_aggregates(const char* sql) {
 #if YARDSTICK_GRAMMAR_EXTENSION
     if (auto *native = FindNativeYardstickAggregates(sql)) {
@@ -1331,6 +1440,47 @@ extern "C" void yardstick_free_aggregate_list(YardstickAggregateCallList* list) 
 // FFI Implementation: yardstick_parse_select
 //=============================================================================
 
+#if YARDSTICK_GRAMMAR_EXTENSION
+static void CollectNativeAtReferences(ParsedExpression &expression,
+                                      vector<YardstickMeasureReference> &references) {
+    if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+        // Nested query bodies have independent relation scope. An IN/ANY left
+        // operand, when present, still belongs to this SELECT.
+        if (auto *child = YsChild(expression.Cast<SubqueryExpression>())) {
+            CollectNativeAtReferences(*child, references);
+        }
+        return;
+    }
+    if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+        auto &function = expression.Cast<FunctionExpression>();
+        if (YsFuncName(function) == "__yardstick_at") {
+            auto arguments = YsArgs(function);
+            if (!arguments.empty()) {
+                auto &operand = *arguments.front();
+                if (operand.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+                    auto &names = operand.Cast<ColumnRefExpression>().ColumnNames();
+                    auto location = operand.GetQueryLocation();
+                    if ((names.size() == 1 || names.size() == 2) && location.IsValid()) {
+                        YardstickMeasureReference reference {};
+                        reference.column = safe_strdup(YsName(names.back()));
+                        if (names.size() == 2) {
+                            reference.qualifier = safe_strdup(YsName(names.front()));
+                        }
+                        reference.start_pos = location.Start();
+                        reference.end_pos = location.End();
+                        references.push_back(reference);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    ParsedExpressionIterator::EnumerateChildren(expression, [&](ParsedExpression &child) {
+        CollectNativeAtReferences(child, references);
+    });
+}
+#endif
+
 extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
     auto* result = new YardstickSelectInfo();
     result->items = nullptr;
@@ -1344,6 +1494,9 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
     result->group_by_all = false;
     result->where_clause = nullptr;
     result->error = nullptr;
+    result->native_parsed = false;
+    result->at_references = nullptr;
+    result->at_reference_count = 0;
 
     if (!sql) {
         result->error = safe_strdup("NULL SQL input");
@@ -1352,7 +1505,12 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
 
     try {
         Parser parser(YardstickParserOptions());
-        parser.ParseQuery(sql);
+#if YARDSTICK_GRAMMAR_EXTENSION
+        result->native_parsed = ParseNativeYardstickQuery(sql, parser);
+#endif
+        if (!result->native_parsed) {
+            parser.ParseQuery(sql);
+        }
 
         if (parser.statements.empty()) {
             result->error = safe_strdup("No statements parsed");
@@ -1360,18 +1518,67 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
         }
 
         auto& stmt = parser.statements[0];
-        if (stmt->type != StatementType::SELECT_STATEMENT) {
+        SelectStatement *select_stmt = nullptr;
+        std::unordered_set<std::string> enclosing_cte_names;
+        if (stmt->type == StatementType::SELECT_STATEMENT) {
+            select_stmt = static_cast<SelectStatement*>(stmt.get());
+        }
+#if YARDSTICK_GRAMMAR_EXTENSION
+        if (result->native_parsed && stmt->type == StatementType::INSERT_STATEMENT) {
+            auto &insert = stmt->Cast<InsertStatement>();
+            if (insert.node) {
+                select_stmt = insert.node->select_statement.get();
+                for (auto &cte : insert.node->cte_map.map) {
+                    enclosing_cte_names.insert(StringUtil::Lower(YsName(cte.first)));
+                }
+            }
+        }
+#endif
+        if (!select_stmt) {
+            if (result->native_parsed) {
+                return result; // No root SELECT references to lower.
+            }
             result->error = safe_strdup("Not a SELECT statement");
             return result;
         }
 
-        auto* select_stmt = static_cast<SelectStatement*>(stmt.get());
         if (!select_stmt->node || select_stmt->node->type != QueryNodeType::SELECT_NODE) {
+            if (result->native_parsed) {
+                return result; // Set operations have separate SELECT scopes.
+            }
             result->error = safe_strdup("Not a simple SELECT node");
             return result;
         }
 
         auto* select_node = static_cast<SelectNode*>(select_stmt->node.get());
+#if YARDSTICK_GRAMMAR_EXTENSION
+        if (result->native_parsed) {
+            vector<YardstickMeasureReference> references;
+            for (auto &expression : select_node->select_list) {
+                CollectNativeAtReferences(*expression, references);
+            }
+            for (auto &expression : select_node->groups.group_expressions) {
+                CollectNativeAtReferences(*expression, references);
+            }
+            for (auto *expression : {select_node->where_clause.get(), select_node->having.get(),
+                                     select_node->qualify.get()}) {
+                if (expression) {
+                    CollectNativeAtReferences(*expression, references);
+                }
+            }
+            ParsedExpressionIterator::EnumerateQueryNodeModifiers(*select_node,
+                [&](unique_ptr<ParsedExpression> &expression) {
+                    CollectNativeAtReferences(*expression, references);
+                });
+            if (!references.empty()) {
+                result->at_reference_count = references.size();
+                result->at_references = new YardstickMeasureReference[references.size()];
+                for (idx_t i = 0; i < references.size(); i++) {
+                    result->at_references[i] = references[i];
+                }
+            }
+        }
+#endif
         size_t from_pos = FindTopLevelFrom(sql);
         if (from_pos == std::string::npos) {
             from_pos = std::strlen(sql);
@@ -1380,7 +1587,7 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
         // Process SELECT list
         std::vector<YardstickSelectItem> items;
         for (auto& expr : select_node->select_list) {
-            YardstickSelectItem item;
+            YardstickSelectItem item {};
             item.expression_sql = safe_strdup(expr->ToString());
             item.alias = expr->HasAlias() ? safe_strdup(YsName(expr->GetAlias())) : nullptr;
 
@@ -1392,6 +1599,24 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
             }
             size_t end_pos = FindSelectItemEnd(sql, item.start_pos, from_pos);
             item.end_pos = static_cast<uint32_t>(end_pos);
+#if YARDSTICK_GRAMMAR_EXTENSION
+            if (result->native_parsed) {
+                // Native locations cover the expression itself, excluding its
+                // SELECT alias. Replacements leave original alias/trivia intact.
+                auto location = expr->GetQueryLocation();
+                item.start_pos = location.IsValid() ? location.Start() : 0;
+                item.end_pos = location.IsValid() ? location.End() : 0;
+                if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+                    auto &names = expr->Cast<ColumnRefExpression>().ColumnNames();
+                    if (names.size() == 1 || names.size() == 2) {
+                        item.reference_column = safe_strdup(YsName(names.back()));
+                        if (names.size() == 2) {
+                            item.reference_qualifier = safe_strdup(YsName(names.front()));
+                        }
+                    }
+                }
+            }
+#endif
 
             item.is_aggregate = ExpressionContainsAggregate(expr.get());
             item.is_star = expr->GetExpressionClass() == ExpressionClass::STAR;
@@ -1410,8 +1635,17 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
 
         // Process FROM clause
         std::vector<YardstickTableRef> tables;
+        auto cte_names = std::move(enclosing_cte_names);
+#if YARDSTICK_GRAMMAR_EXTENSION
+        if (result->native_parsed) {
+            for (auto &cte : select_node->cte_map.map) {
+                cte_names.insert(StringUtil::Lower(YsName(cte.first)));
+            }
+        }
+#endif
         if (select_node->from_table) {
-            CollectTablesFromTableRef(select_node->from_table.get(), tables);
+            CollectTablesFromTableRef(select_node->from_table.get(), tables,
+                                      result->native_parsed ? &cte_names : nullptr);
         }
 
         if (!tables.empty()) {
@@ -1461,9 +1695,17 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
 extern "C" void yardstick_free_select_info(YardstickSelectInfo* info) {
     if (!info) return;
 
+    for (size_t i = 0; i < info->at_reference_count; i++) {
+        free(const_cast<char*>(info->at_references[i].column));
+        free(const_cast<char*>(info->at_references[i].qualifier));
+    }
+    delete[] info->at_references;
+
     for (size_t i = 0; i < info->item_count; i++) {
         free(const_cast<char*>(info->items[i].expression_sql));
         free(const_cast<char*>(info->items[i].alias));
+        free(const_cast<char*>(info->items[i].reference_column));
+        free(const_cast<char*>(info->items[i].reference_qualifier));
     }
     delete[] info->items;
 
@@ -1710,6 +1952,10 @@ extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
 // FFI Implementation: yardstick_parse_expression
 //=============================================================================
 
+bool duckdb::IsYardstickStandardAggregate(const string &name) {
+    return IsStandardAggregate(name);
+}
+
 extern "C" YardstickExpressionInfo* yardstick_parse_expression(const char* expr_str) {
     auto* result = new YardstickExpressionInfo();
     result->sql = nullptr;
@@ -1759,6 +2005,23 @@ extern "C" YardstickExpressionInfo* yardstick_parse_expression(const char* expr_
     return result;
 }
 
+extern "C" int32_t yardstick_expressions_equal(const char* left, const char* right) {
+    if (!left || !right) {
+        return 0;
+    }
+    try {
+        auto options = YardstickParserOptions();
+        auto left_expressions = Parser::ParseExpressionList(left, options);
+        auto right_expressions = Parser::ParseExpressionList(right, options);
+        if (left_expressions.size() != 1 || right_expressions.size() != 1) {
+            return 0;
+        }
+        return ParsedExpression::Equals(left_expressions[0], right_expressions[0]) ? 1 : 0;
+    } catch (const std::exception &) {
+        return 0;
+    }
+}
+
 //=============================================================================
 // FFI Implementation: yardstick_free_expression_info
 //=============================================================================
@@ -1786,6 +2049,8 @@ extern "C" YardstickCreateViewInfo* yardstick_parse_create_view(const char* sql)
 #endif
     auto* result = new YardstickCreateViewInfo();
     result->native_parsed = false;
+    result->metadata_query_sql = nullptr;
+    result->requires_binding = false;
     result->is_measure_view = false;
     result->view_name = nullptr;
     result->clean_sql = nullptr;
@@ -1841,6 +2106,7 @@ extern "C" void yardstick_free_create_view_info(YardstickCreateViewInfo* info) {
     if (!info) return;
 
     free(const_cast<char*>(info->view_name));
+    free(const_cast<char*>(info->metadata_query_sql));
     free(const_cast<char*>(info->clean_sql));
 
     for (size_t i = 0; i < info->measure_count; i++) {

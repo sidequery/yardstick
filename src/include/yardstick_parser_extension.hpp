@@ -71,6 +71,21 @@ struct YardstickParseData : ParserExtensionParseData {
         : statement(std::move(statement)) {}
 };
 
+#if YARDSTICK_GRAMMAR_EXTENSION
+// Only batches requiring session-bound star expansion use deferred statements.
+struct YardstickDeferredParseData : ParserExtensionParseData {
+    string sql;
+    ParserOptions options;
+
+    YardstickDeferredParseData(string sql, ParserOptions options)
+        : sql(std::move(sql)), options(std::move(options)) {}
+    unique_ptr<ParserExtensionParseData> Copy() const override {
+        return make_uniq_base<ParserExtensionParseData, YardstickDeferredParseData>(sql, options);
+    }
+    string ToString() const override { return sql; }
+};
+#endif
+
 // State stored in ClientContext between parse and bind
 class YardstickState : public ClientContextState {
 public:

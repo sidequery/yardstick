@@ -59,6 +59,27 @@ typedef struct {
     bool native_parsed;        /* Complete grammar-validated source spans */
 } YardstickAggregateCallList;
 
+/* Grammar-owned CURRENT references, relative to the supplied expression. */
+typedef struct {
+    const char* dimension;
+    uint32_t start_pos;
+    uint32_t end_pos;
+} YardstickCurrentReference;
+
+typedef struct {
+    YardstickCurrentReference* references;
+    size_t count;
+    const char* error;
+} YardstickCurrentReferenceList;
+
+YardstickCurrentReferenceList* yardstick_find_current_references(const char* expression);
+void yardstick_free_current_reference_list(YardstickCurrentReferenceList* references);
+/* -1 when native grammar unavailable; otherwise 0/1 for a constant equality proof. */
+int32_t yardstick_current_where_is_single_valued(const char* predicate, const char* dimension,
+                                               const char* qualifier);
+/* Structural expression equality, including identifier and literal semantics. */
+int32_t yardstick_expressions_equal(const char* left, const char* right);
+
 /* =============================================================================
  * SELECT Clause Information
  * ============================================================================= */
@@ -72,6 +93,8 @@ typedef struct {
     bool is_aggregate;          /* Contains SUM/COUNT/AVG/MIN/MAX */
     bool is_star;               /* True if SELECT * or table.* */
     bool is_measure_ref;        /* True if references AGGREGATE() */
+    const char* reference_column; /* Native direct column reference, decoded */
+    const char* reference_qualifier; /* Native direct qualifier, decoded or NULL */
 } YardstickSelectItem;
 
 /* Information about FROM clause tables */
@@ -80,6 +103,14 @@ typedef struct {
     const char* alias;          /* Alias if present (NULL = same as table_name) */
     bool is_subquery;           /* True if derived table */
 } YardstickTableRef;
+
+/* Native shorthand operand, excluding its AT suffix and SELECT alias. */
+typedef struct {
+    const char* column;
+    const char* qualifier;
+    uint32_t start_pos;
+    uint32_t end_pos;
+} YardstickMeasureReference;
 
 /* Full SELECT clause information */
 typedef struct {
@@ -100,6 +131,9 @@ typedef struct {
     const char* where_clause;   /* NULL if none */
 
     const char* error;          /* NULL if success */
+    bool native_parsed;         /* Exact expression-only spans and scoped references */
+    YardstickMeasureReference* at_references;
+    size_t at_reference_count;
 } YardstickSelectInfo;
 
 /* =============================================================================
@@ -140,6 +174,8 @@ typedef struct {
     size_t measure_count;
     const char* error;
     bool native_parsed;        /* Native declaration list is authoritative, including empty */
+    const char* metadata_query_sql; /* SELECT with effective view output aliases, for metadata only */
+    bool requires_binding;     /* Star layout needs the originating ClientContext */
 } YardstickCreateViewInfo;
 
 /* =============================================================================

@@ -1,5 +1,5 @@
 # name: test/sql/native_view_column_aliases.test
-# description: Explicit view column lists cannot silently rename measure metadata.
+# description: Explicit view aliases rename measure and dimension metadata together.
 # group: [yardstick]
 
 require-env YARDSTICK_NATIVE_PEG 1
@@ -12,70 +12,151 @@ CREATE TABLE native_column_sales(year INTEGER, amount INTEGER);
 statement ok
 INSERT INTO native_column_sales VALUES (2022, 100), (2022, 50), (2023, 225);
 
+statement ok
+CREATE TABLE native_column_overlap(amount INTEGER, revenue INTEGER);
+
+statement ok
+INSERT INTO native_column_overlap VALUES (10, 1), (20, 2);
+
 foreach parser_mode true false
 
 statement ok
 SET heap_based_parser=${parser_mode};
 
-# Default fallback mode must also reject the view, even though DuckDB replaces
-# the extension diagnostic with its own parse error.
-statement error
-CREATE VIEW native_column_fallback(year, total) AS
-SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
-----
-Parser Error
-
 statement ok
-SET allow_parser_override_extension='strict';
-
-# An output list renames the measure independently of its declaration.
-statement error
-CREATE VIEW native_column_conflict(year, total) AS
+CREATE OR REPLACE VIEW native_column_full(fiscal_year, total) AS
 SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
-----
-AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead
-
-# A partial list can rename only a dimension; mapping measure names alone is
-# insufficient to keep correlation metadata correct.
-statement error
-CREATE VIEW native_column_partial(fiscal_year) AS
-SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
-----
-AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead
-
-# Matching lists follow the same explicit unsupported contract.
-statement error
-CREATE VIEW native_column_matching(year, revenue) AS
-SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
-----
-AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead
-
-# Star expansion happens at binding, so projection offsets cannot determine the
-# final output position of a measure.
-statement error
-CREATE VIEW native_column_star(fiscal_year, value, total) AS
-SELECT *, SUM(amount) AS MEASURE revenue FROM native_column_sales;
-----
-AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead
-
-# Rejected replacements must preserve both the view and its existing metadata.
-statement ok
-CREATE OR REPLACE VIEW native_column_existing AS
-SELECT year AS fiscal_year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
-
-statement error
-CREATE OR REPLACE VIEW native_column_existing(year, total) AS
-SELECT year, SUM(amount * 10) AS MEASURE revenue FROM native_column_sales;
-----
-AS MEASURE does not support CREATE VIEW column lists; alias columns in SELECT instead
 
 query IR rowsort
-SELECT fiscal_year, AGGREGATE(revenue) FROM native_column_existing;
+SELECT fiscal_year, AGGREGATE(total) FROM native_column_full;
 ----
 2022	150.0
 2023	225.0
 
-# Ordinary views, including a column called measure, still support header lists.
+statement ok
+CREATE OR REPLACE VIEW native_column_partial(fiscal_year) AS
+SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
+
+query IR rowsort
+SELECT fiscal_year, AGGREGATE(revenue) FROM native_column_partial;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE OR REPLACE VIEW native_column_materialized("Fiscal year", "Distinct total") AS
+SELECT year AS original_year, COUNT(DISTINCT amount) AS MEASURE original_total
+FROM native_column_sales GROUP BY original_year;
+
+query II rowsort
+SELECT "Fiscal year", AGGREGATE("Distinct total") FROM native_column_materialized;
+----
+2022	2
+2023	1
+
+query I
+SELECT AGGREGATE("Distinct total") FROM native_column_materialized;
+----
+3
+
+statement ok
+CREATE OR REPLACE VIEW native_column_count(fiscal_year, total_rows) AS
+SELECT year, COUNT(*) AS MEASURE row_count FROM native_column_sales;
+
+query II rowsort
+SELECT fiscal_year, AGGREGATE(total_rows) FROM native_column_count;
+----
+2022	2
+2023	1
+
+statement ok
+CREATE OR REPLACE VIEW native_column_partial_group(fiscal_year) AS
+SELECT year AS original_year, COUNT(DISTINCT amount) AS MEASURE revenue
+FROM native_column_sales GROUP BY original_year;
+
+query II rowsort
+SELECT fiscal_year, AGGREGATE(revenue) FROM native_column_partial_group;
+----
+2022	2
+2023	1
+
+statement ok
+CREATE OR REPLACE VIEW native_column_expression(next_year, total) AS
+SELECT year + 1 AS original_year, SUM(amount) AS MEASURE revenue
+FROM native_column_sales;
+
+query R
+SELECT AGGREGATE(total) AT (SET next_year = 2023) FROM native_column_expression;
+----
+150.0
+
+statement ok
+CREATE OR REPLACE VIEW native_column_derived(total, doubled, base_total, rounded) AS
+SELECT SUM(amount) AS MEASURE revenue,
+       revenue * 2 AS MEASURE twice,
+       SUM(revenue) AS MEASURE base_revenue,
+       ROUND(revenue * 2) AS MEASURE rounded_revenue
+FROM native_column_overlap;
+
+query RRRR
+SELECT AGGREGATE(total), AGGREGATE(doubled), AGGREGATE(base_total), AGGREGATE(rounded)
+FROM native_column_derived;
+----
+30.0	60.0	3.0	60.0
+
+statement ok
+CREATE OR REPLACE VIEW native_column_quoted_derived("Total revenue", "Double revenue") AS
+SELECT SUM(amount) AS MEASURE "gross revenue",
+       "gross revenue" * 2 AS MEASURE "double gross"
+FROM native_column_overlap;
+
+query RR
+SELECT AGGREGATE("Total revenue"), AGGREGATE("Double revenue") FROM native_column_quoted_derived;
+----
+30.0	60.0
+
+statement ok
+CREATE OR REPLACE VIEW native_column_full(fiscal_year, total) AS
+SELECT year, SUM(amount * 10) AS MEASURE revenue FROM native_column_sales;
+
+query IR rowsort
+SELECT fiscal_year, AGGREGATE(total) FROM native_column_full;
+----
+2022	1500.0
+2023	2250.0
+
+statement ok
+SET allow_parser_override_extension='strict';
+
+statement error
+CREATE VIEW native_column_cycle(total, other) AS
+SELECT second_measure + 1 AS MEASURE first_measure,
+       first_measure + 1 AS MEASURE second_measure
+FROM native_column_sales;
+----
+Cyclic AS MEASURE declaration reference
+
+statement error
+CREATE OR REPLACE VIEW native_column_full(a, b, c) AS
+SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
+----
+More VIEW aliases than columns in query result
+
+query IR rowsort
+SELECT fiscal_year, AGGREGATE(total) FROM native_column_full;
+----
+2022	1500.0
+2023	2250.0
+
+statement ok
+CREATE OR REPLACE VIEW native_column_star(fiscal_year, value, total) AS
+SELECT *, SUM(amount) AS MEASURE revenue FROM native_column_sales;
+
+query R
+SELECT AGGREGATE(total) FROM native_column_star;
+----
+375.0
+
 statement ok
 CREATE OR REPLACE VIEW native_column_ordinary(fiscal_year, total) AS
 SELECT year, amount AS measure FROM native_column_sales;

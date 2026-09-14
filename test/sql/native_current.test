@@ -1,0 +1,190 @@
+# name: test/sql/native_current.test
+# description: CURRENT uses native modifier scopes and structured references.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE current_sales (year INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO current_sales VALUES (2022, 'US', 100), (2022, 'EU', 50), (2023, 'US', 150), (2023, 'EU', 75);
+
+statement ok
+CREATE VIEW current_sales_v AS SELECT year, region, SUM(amount) AS MEASURE current_revenue FROM current_sales;
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+# The quoted AGGREGATE function and trivia require the native frontend.
+query IR rowsort
+SELECT year, "AGGREGATE"(current_revenue) AT (SET year = CURRENT /* dimension */ year - 1)
+FROM current_sales_v;
+----
+2022	NULL
+2023	150.0
+
+query IR rowsort
+SELECT year, "AGGREGATE"(current_revenue) AT (SET year = coalesce(CURRENT(year) - 1, 2022))
+FROM current_sales_v;
+----
+2022	NULL
+2023	150.0
+
+# DuckDB serializes CURRENT function names with quotes between native passes.
+query IR rowsort
+SELECT year, "AGGREGATE"(current_revenue) AT (SET year = "current"(year) - 1)
+FROM current_sales_v;
+----
+2022	NULL
+2023	150.0
+
+query IR rowsort
+SELECT v.year, "AGGREGATE"(current_revenue) AT (SET year = CURRENT v."year" - 1)
+FROM current_sales_v v;
+----
+2022	NULL
+2023	150.0
+
+query IR rowsort
+SELECT "Outer alias"."year", "AGGREGATE"(current_revenue) AT (
+    SET year = CURRENT "Outer alias"."year" - 1
+) FROM current_sales_v AS "Outer alias";
+----
+2022	NULL
+2023	150.0
+
+query R
+SELECT "AGGREGATE"(current_revenue) AT (SET year = CURRENT "year" - 1)
+FROM current_sales_v AS "Outer alias" WHERE "Outer alias"."year" = 2023;
+----
+150.0
+
+# Chained modifiers also replace the SET dimension's original correlation.
+query IR rowsort
+SELECT year, "AGGREGATE"(current_revenue) AT (VISIBLE SET year = CURRENT year - 1)
+FROM current_sales_v;
+----
+2022	NULL
+2023	150.0
+
+# Ungrouped and unconstrained CURRENT is NULL, even inside nested expressions.
+query R
+SELECT "AGGREGATE"(current_revenue) AT (SET year = coalesce(CURRENT year, 2022))
+FROM current_sales_v;
+----
+150.0
+
+query R
+SELECT "AGGREGATE"(current_revenue) AT (SET year = CURRENT(year) - 1)
+FROM current_sales_v WHERE year = 2023;
+----
+150.0
+
+query R
+SELECT "AGGREGATE"(current_revenue) AT (SET year = CURRENT(year) - 1)
+FROM current_sales_v WHERE CAST(2023 AS BIGINT) = year;
+----
+150.0
+
+# Equality proof uses predicate ASTs, not text inside literals/comments or a
+# comparison against another row-dependent expression.
+query R
+SELECT "AGGREGATE"(current_revenue) AT (SET year = coalesce(CURRENT year, 2022))
+FROM current_sales_v WHERE year = year;
+----
+150.0
+
+query R
+SELECT "AGGREGATE"(current_revenue) AT (SET year = coalesce(CURRENT year, 2022))
+FROM current_sales_v WHERE year = 2022 OR year = 2023;
+----
+150.0
+
+query R
+SELECT "AGGREGATE"(current_revenue) AT (SET year = coalesce(CURRENT year, 2022))
+FROM current_sales_v WHERE 'year=2023' = 'year=2023' /* year = 2023 */;
+----
+150.0
+
+# WHERE's regular dimensions refer to inner rows, CURRENT refers to outer rows.
+query IR rowsort
+SELECT year, "AGGREGATE"(current_revenue) AT (WHERE year = CURRENT year - 1)
+FROM current_sales_v;
+----
+2022	NULL
+2023	150.0
+
+query IR rowsort
+SELECT v.year, "AGGREGATE"(current_revenue) AT (WHERE year = CURRENT(v."year") - 1)
+FROM current_sales_v v;
+----
+2022	NULL
+2023	150.0
+
+# CURRENT in literals and nested SELECT scopes remains ordinary SQL.
+query IR rowsort
+SELECT year, "AGGREGATE"(current_revenue) AT (
+    SET year = CASE WHEN $$CURRENT year$$ = 'CURRENT year' THEN CURRENT(year) - 1 ELSE 0 END
+) FROM current_sales_v;
+----
+2022	NULL
+2023	150.0
+
+query IR rowsort
+SELECT year, "AGGREGATE"(current_revenue) AT (
+    SET year = (SELECT current year FROM (SELECT 2022 AS current))
+) FROM current_sales_v;
+----
+2022	150.0
+2023	150.0
+
+statement ok
+SET active_grammar_extensions=['yardstick'];
+
+query I
+SELECT current year FROM (SELECT 2023 AS current);
+----
+2023
+
+query I
+SELECT "current" year FROM (SELECT 2023 AS current);
+----
+2023
+
+# Other nested query forms establish their own CURRENT namespace as well.
+statement ok
+CREATE OR REPLACE MACRO "current"(x) AS 2022;
+
+query IR rowsort
+SELECT year, "AGGREGATE"(current_revenue) AT (SET year = (VALUES (current(year))))
+FROM current_sales_v;
+----
+2022	150.0
+2023	150.0
+
+query IR rowsort
+SELECT year, "AGGREGATE"(current_revenue) AT (
+    SET year = (FROM (SELECT 2023 AS current) SELECT "current"(current))
+) FROM current_sales_v;
+----
+2022	150.0
+2023	150.0
+
+statement ok
+DROP MACRO "current";
+
+statement ok
+SET active_grammar_extensions=[];
+
+endloop
+
+statement ok
+DROP VIEW current_sales_v;
+
+statement ok
+DROP TABLE current_sales;
