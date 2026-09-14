@@ -563,6 +563,9 @@ YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql_p) {
             }
         }
         if (!capture.measures.empty() && !view.aliases.empty()) {
+            // Publish header-renamed metadata only while binding, so a failed
+            // replacement restores the definition that DuckDB still owns.
+            result->requires_binding = true;
             auto &select = view.query->node->Cast<SelectNode>();
             std::function<bool(const ParsedExpression &)> contains_star = [&](const ParsedExpression &expression) {
                 if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY ||
@@ -584,7 +587,6 @@ YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql_p) {
                 has_star |= contains_star(*projection);
             }
             if (has_star && !active_bind_context) {
-                result->requires_binding = true;
                 result->error = duplicate("AS MEASURE column lists with star expansion require the originating bind context");
                 return result.release();
             }

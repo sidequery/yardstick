@@ -72,7 +72,7 @@ struct YardstickParseData : ParserExtensionParseData {
 };
 
 #if YARDSTICK_GRAMMAR_EXTENSION
-// Only batches requiring session-bound star expansion use deferred statements.
+// Column-list declarations and temporary metadata use bind-time lifecycle handling.
 struct YardstickDeferredParseData : ParserExtensionParseData {
     string sql;
     ParserOptions options;

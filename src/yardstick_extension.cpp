@@ -1781,7 +1781,7 @@ ParserExtensionParseResult yardstick_parse(ParserExtensionInfo *,
 #if YARDSTICK_GRAMMAR_EXTENSION
 static std::atomic<size_t> deferred_temporary_contexts {0};
 
-static vector<unique_ptr<SQLStatement>> DeferStarMeasureBatch(const string &query) {
+static vector<unique_ptr<SQLStatement>> DeferMeasureColumnListBatch(const string &query) {
     if (CurrentNativeYardstickClientContext()) {
         return {};
     }
@@ -1860,7 +1860,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
 
 #if YARDSTICK_GRAMMAR_EXTENSION
     try {
-        auto deferred = DeferStarMeasureBatch(sql_to_check);
+        auto deferred = DeferMeasureColumnListBatch(sql_to_check);
         if (!deferred.empty()) {
             return ParserOverrideResult(std::move(deferred));
         }

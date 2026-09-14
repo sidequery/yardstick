@@ -33,6 +33,34 @@ SELECT fiscal_year, AGGREGATE(total) FROM native_column_full;
 2022	150.0
 2023	225.0
 
+# A failed non-star replacement must preserve the engine view and its metadata.
+statement ok
+SET allow_parser_override_extension='strict';
+
+statement error
+CREATE OR REPLACE VIEW native_column_full(fiscal_year, total) AS
+SELECT missing_column, SUM(amount * 10) AS MEASURE revenue FROM native_column_sales;
+----
+missing_column
+
+query IR rowsort
+SELECT fiscal_year, AGGREGATE(total) FROM native_column_full;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+CREATE VIEW IF NOT EXISTS native_column_full(fiscal_year, total) AS
+SELECT missing_column, SUM(amount * 10) AS MEASURE revenue FROM native_column_sales;
+
+query R
+SELECT AGGREGATE(total) FROM native_column_full;
+----
+375.0
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
 statement ok
 CREATE OR REPLACE VIEW native_column_partial(fiscal_year) AS
 SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
@@ -42,6 +70,25 @@ SELECT fiscal_year, AGGREGATE(revenue) FROM native_column_partial;
 ----
 2022	150.0
 2023	225.0
+
+statement ok
+SET allow_parser_override_extension='strict';
+
+statement error
+CREATE OR REPLACE VIEW native_column_partial(fiscal_year) AS
+SELECT year, SUM(amount * 10) AS MEASURE revenue FROM native_column_sales
+WHERE missing_column = 1;
+----
+missing_column
+
+query IR rowsort
+SELECT fiscal_year, AGGREGATE(revenue) FROM native_column_partial;
+----
+2022	150.0
+2023	225.0
+
+statement ok
+SET allow_parser_override_extension='fallback';
 
 statement ok
 CREATE OR REPLACE VIEW native_column_materialized("Fiscal year", "Distinct total") AS

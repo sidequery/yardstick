@@ -175,7 +175,7 @@ typedef struct {
     const char* error;
     bool native_parsed;        /* Native declaration list is authoritative, including empty */
     const char* metadata_query_sql; /* SELECT with effective view output aliases, for metadata only */
-    bool requires_binding;     /* Star layout needs the originating ClientContext */
+    bool requires_binding;     /* Column-list metadata needs bind-time lifecycle handling */
 } YardstickCreateViewInfo;
 
 /* =============================================================================
