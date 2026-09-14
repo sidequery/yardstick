@@ -3535,6 +3535,9 @@ fn expand_derived_measure_expr(expr: &str, measure_view: &MeasureView) -> String
 /// Qualify dimension reference in expression for correlated subquery
 /// "year - 1" with table "sales" and dim "year" -> "sales.year - 1"
 pub fn qualify_outer_reference(expr: &str, table_name: &str, dim: &str) -> String {
+    if let Some(qualified) = parser_ffi::qualify_outer_dimension(expr, table_name, dim) {
+        return qualified;
+    }
     // Parse expression into tokens and replace matching identifiers
     let mut result = String::new();
     let mut chars = expr.chars().peekable();
@@ -5164,7 +5167,7 @@ pub fn expand_aggregate(sql: &str) -> AggregateExpandResult {
 fn extract_dimension_columns_from_select_info(info: &SelectInfo) -> Vec<String> {
     info.items
         .iter()
-        .filter(|item| !item.is_aggregate && !item.is_star && !item.is_measure_ref)
+        .filter(|item| !item.is_aggregate && !item.is_star && !item.is_measure_ref && !item.contains_window)
         .filter(|item| !is_literal_constant(&item.expression_sql))
         .map(|item| {
             // Use alias if present, otherwise expression
@@ -6717,7 +6720,24 @@ fn validate_set_expression_requirements(
                     continue;
                 }
                 let dim_name = dim.split('.').next_back().unwrap_or(dim).trim();
-                if expr_mentions_identifier_outside_current(expr, dim_name)
+                let probe_sql = match default_qualifier {
+                    Some(qualifier) => format!("SELECT {expr} FROM {qualifier}"),
+                    None => format!("SELECT {expr}"),
+                };
+                let mentions_dimension = parser_ffi::parse_select(&probe_sql)
+                    .ok()
+                    .filter(|info| info.native_parsed)
+                    .and_then(|info| info.items.into_iter().next())
+                    .filter(|item| item.contains_subquery)
+                    .map(|item| {
+                        // A scalar subquery owns its input columns. Only its
+                        // outer dependencies require the consumer's grouping.
+                        item.subquery_dimensions.iter().any(|dependency| {
+                            expr_mentions_identifier_outside_current(dependency, dim_name)
+                        })
+                    })
+                    .unwrap_or_else(|| expr_mentions_identifier_outside_current(expr, dim_name));
+                if mentions_dimension
                     && !dimension_in_group_by(dim, group_by_cols, default_qualifier)
                 {
                     return Some(format!(
@@ -7466,18 +7486,6 @@ fn warning_for_at_all_ungrouped_where_with_qualifiers(
 
 /// Expand AGGREGATE() with AT modifiers in SQL
 pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
-    // Validate the complete statement before rewriting individual query scopes.
-    // This also covers calls in statement wrappers and nested expressions.
-    if let Err(error) = parser_ffi::find_aggregates_with_source(sql) {
-        if error.native_parsed {
-            return AggregateExpandResult {
-                had_aggregate: true,
-                expanded_sql: sql.to_string(),
-                error: Some(error.message),
-                warnings: Vec::new(),
-            };
-        }
-    }
     if let Some(scopes) = parser_ffi::find_query_scopes(sql) {
         return expand_native_query_scopes(sql, &scopes);
     }
@@ -7517,13 +7525,55 @@ fn expand_native_query_scopes(sql: &str, scopes: &[parser_ffi::QueryScope]) -> A
     let mut lowered: Vec<String> = vec![String::new(); scopes.len()];
     let mut had_aggregate = false;
     let mut warnings = Vec::new();
-    for index in (0..scopes.len()).rev() {
+    // Lower children before parents, but keep sibling declarations in source
+    // order: a consumer's binding probes need its earlier CTEs already lowered.
+    let mut pending: Vec<_> = roots.iter().rev().map(|&index| (index, false)).collect();
+    let mut order = Vec::with_capacity(scopes.len());
+    while let Some((index, visited)) = pending.pop() {
+        if visited {
+            order.push(index);
+        } else {
+            pending.push((index, true));
+            pending.extend(children[index].iter().rev().map(|&child| (child, false)));
+        }
+    }
+    for index in order {
         let scope = &scopes[index];
         let mut query = sql[scope.start..scope.end].to_string();
         for &child in children[index].iter().rev() {
             query.replace_range(scopes[child].start - scope.start..scopes[child].end - scope.start, &lowered[child]);
         }
         let _scope = parser_ffi::QueryScopeGuard::enter(&scope.visible_ctes);
+        let mut binding_ctes = Vec::new();
+        for definition in &scope.cte_definitions {
+            let start = definition.start_pos as usize;
+            let end = definition.end_pos as usize;
+            let Some(declaration) = sql.get(start..end) else {
+                return AggregateExpandResult {
+                    had_aggregate: true, expanded_sql: sql.to_string(),
+                    error: Some("Invalid native CTE source range".to_string()), warnings,
+                };
+            };
+            let mut declaration = declaration.to_string();
+            // Replace only the outermost completed scopes in this declaration;
+            // each replacement already contains its lowered descendants.
+            let mut replacements = Vec::new();
+            let mut previous_end = start;
+            for (cte_index, cte_scope) in scopes.iter().enumerate() {
+                if cte_scope.start >= previous_end && cte_scope.end <= end &&
+                    !lowered[cte_index].is_empty() {
+                    replacements.push(cte_index);
+                    previous_end = cte_scope.end;
+                }
+            }
+            for cte_index in replacements.into_iter().rev() {
+                declaration.replace_range(scopes[cte_index].start - start..scopes[cte_index].end - start,
+                                          &lowered[cte_index]);
+            }
+            let recursive = if definition.recursive { "RECURSIVE " } else { "" };
+            binding_ctes.push(format!("WITH {recursive}{declaration} SELECT 1"));
+        }
+        let _binding_scope = parser_ffi::BindingCteScopeGuard::enter(&binding_ctes);
         let expanded = expand_aggregate_query(&query, true);
         had_aggregate |= expanded.had_aggregate;
         for warning in expanded.warnings {
@@ -7543,6 +7593,134 @@ fn expand_native_query_scopes(sql: &str, scopes: &[parser_ffi::QueryScope]) -> A
         expanded_sql.replace_range(scopes[root].start..scopes[root].end, &lowered[root]);
     }
     AggregateExpandResult { had_aggregate, expanded_sql, error: None, warnings }
+}
+
+fn decorated_recomputation_alias(mut sql: String, base_relation_sql: &str) -> String {
+    let suffix = format!(" FROM {})", base_relation_for_subquery(base_relation_sql));
+    if sql.ends_with(&suffix) {
+        sql.truncate(sql.len() - 1);
+        sql.push_str(" _inner)");
+    }
+    sql
+}
+
+fn wrap_decorated_scalar_recomputation(sql: &str) -> String {
+    // The outer relation can be empty even though recomputing COUNT (or an
+    // exported state) over that context produces a value. Retain that result.
+    format!("COALESCE(ANY_VALUE({sql}), {sql})")
+}
+
+fn expand_window_measure_query(
+    sql: &str,
+    native_calls: &[parser_ffi::AggregateCall],
+) -> AggregateExpandResult {
+    let expanded = (|| -> std::result::Result<AggregateExpandResult, String> {
+        let from = extract_from_clause_info(sql);
+        let primary = from
+            .primary_table
+            .as_ref()
+            .ok_or("Windowed AGGREGATE requires a measure relation")?;
+        let mut sources: Vec<parser_ffi::WindowSource> = Vec::new();
+        let mut windows = Vec::new();
+        let mut replacements = Vec::new();
+        for call in native_calls.iter().filter(|call| call.is_window) {
+            let (qualifier, measure) = parse_simple_measure_ref(&call.measure_name)
+                .ok_or("Windowed AGGREGATE requires a measure reference")?;
+            let relation = qualifier
+                .as_ref()
+                .and_then(|qualifier| {
+                    from.tables.values().find(|table| {
+                        normalize_identifier_name(&table.effective_name) == *qualifier
+                    })
+                })
+                .unwrap_or(primary);
+            let resolved = resolve_measure_source(&measure, &relation.name);
+            let view = get_measure_view(&resolved.source_view)
+                .ok_or_else(|| format!("Unknown window measure {}", call.measure_name))?;
+            let source_alias = if relation.name.eq_ignore_ascii_case(&resolved.source_view) {
+                relation.effective_name.clone()
+            } else {
+                find_alias_for_view(&from, &resolved.source_view)
+                    .unwrap_or(&resolved.source_view)
+                    .to_string()
+            };
+            let source_key = source_alias.clone();
+            if !sources.iter().any(|source| source.key == source_key) {
+                let select_sql =
+                    extract_view_query(&view.base_query).unwrap_or(view.base_query.clone());
+                sources.push(parser_ffi::WindowSource {
+                    key: source_key.clone(),
+                    relation_name: resolved.source_view.clone(),
+                    alias: source_alias.clone(),
+                    grouped: has_top_level_group_by(&select_sql),
+                    clean_select_sql: view.base_query.clone(),
+                    dimensions: resolved.dimension_exprs.clone(),
+                });
+            }
+            let mut marker_index = windows.len();
+            let marker = loop {
+                let candidate = format!("__yardstick_window_call_{marker_index}");
+                if !sql.contains(&candidate)
+                    && !windows
+                        .iter()
+                        .any(|call: &parser_ffi::WindowCall| call.marker_name == candidate)
+                {
+                    break candidate;
+                }
+                marker_index += 1;
+            };
+            let call_sql = call
+                .call_sql
+                .as_deref()
+                .ok_or("Missing native window expression")?;
+            let expression = resolved
+                .derived_expr
+                .as_deref()
+                .unwrap_or(&resolved.expression);
+            let expression_sql = parser_ffi::decorate_measure(
+                expression,
+                call_sql,
+                &resolved.dimension_exprs,
+                &[source_alias, resolved.source_view.clone()],
+            )?;
+            replacements.push((
+                call.start_pos as usize,
+                call.end_pos as usize,
+                parser_ffi::window_marker(call_sql, &marker)?,
+            ));
+            windows.push(parser_ffi::WindowCall {
+                marker_name: marker,
+                source_key,
+                expression_sql,
+                modifiers: call.modifiers.clone(),
+            });
+        }
+        replacements.sort_by(|left, right| right.0.cmp(&left.0));
+        let mut marked_sql = sql.to_string();
+        for (start, end, replacement) in replacements {
+            marked_sql.replace_range(start..end, &replacement);
+        }
+        // Ordinary measures bind against the original source and grouping before
+        // window staging introduces generated projections and lineage columns.
+        let ordinary = expand_aggregate_query(&marked_sql, true);
+        if let Some(error) = ordinary.error {
+            return Err(error);
+        }
+        let expanded_sql =
+            parser_ffi::rewrite_measure_windows(&ordinary.expanded_sql, &sources, &windows)?;
+        Ok(AggregateExpandResult {
+            had_aggregate: true,
+            expanded_sql,
+            error: None,
+            warnings: ordinary.warnings,
+        })
+    })();
+    expanded.unwrap_or_else(|error| AggregateExpandResult {
+        had_aggregate: true,
+        expanded_sql: sql.to_string(),
+        error: Some(error),
+        warnings: Vec::new(),
+    })
 }
 
 fn expand_aggregate_query(sql: &str, native_scope: bool) -> AggregateExpandResult {
@@ -7597,6 +7775,13 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
     }
 
     // Check if we need the full expansion path (AT modifiers or non-decomposable measures)
+    if native_scope {
+        if let Ok((calls, true)) = parser_ffi::find_aggregates_with_source(&sql) {
+            if calls.iter().any(|call| call.is_window) {
+                return expand_window_measure_query(&sql, &calls);
+            }
+        }
+    }
     let has_aggregate = has_aggregate_function(&sql);
 
     // If no AGGREGATE function at all, nothing to do
@@ -7610,6 +7795,13 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
     }
     had_aggregate = true;
 
+    let native_calls = match parser_ffi::find_aggregates_with_source(&sql) {
+        Ok((calls, _)) => calls,
+        Err(error) if error.native_parsed => return AggregateExpandResult {
+            had_aggregate: true, expanded_sql: sql, error: Some(error.message), warnings,
+        },
+        Err(_) => Vec::new(),
+    };
     let at_patterns = parse_aggregate_modifiers(&sql);
     // Keep full expansion path even without AT to handle non-decomposable measures safely
 
@@ -7714,6 +7906,8 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
     let mut patterns = at_patterns;
     patterns.sort_by(|a, b| b.2.cmp(&a.2));
     for (measure_name, modifiers, start, end) in patterns {
+        let decorated_call = native_calls.iter()
+            .find(|call| call.start_pos as usize == start && call.has_decorations && !call.is_window);
         let measure_lookup_name = strip_measure_qualifier(&measure_name);
         // Look up which view contains this measure (for JOIN support)
         let resolved = resolve_measure_source(&measure_lookup_name, &primary_table_name);
@@ -7805,6 +7999,18 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
             .derived_expr
             .clone()
             .unwrap_or_else(|| resolved.expression.clone());
+        let expression_for_eval = if let Some(call) = decorated_call {
+            let qualifiers = allowed_qualifiers.iter().cloned().collect::<Vec<_>>();
+            match parser_ffi::decorate_measure(
+                &expression_for_eval, call.call_sql.as_deref().unwrap_or_default(),
+                &resolved.dimension_exprs, &qualifiers,
+            ) {
+                Ok(expression) => expression,
+                Err(error) => return AggregateExpandResult {
+                    had_aggregate: true, expanded_sql: result_sql, error: Some(error), warnings,
+                },
+            }
+        } else { expression_for_eval };
         let is_window_measure =
             is_window_expression(&expression_for_eval) || is_window_expression(&resolved.expression);
 
@@ -7833,8 +8039,15 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
                 }
             };
             let eval_sql = wrap_window_rows_as_single_value(&row_eval_sql, &measure_lookup_name);
+            let eval_sql = if decorated_call.is_some() {
+                decorated_recomputation_alias(eval_sql, &base_relation_sql)
+            } else { eval_sql };
             if original_dim_cols.is_empty() {
-                format!("MAX({eval_sql})")
+                if decorated_call.is_some() {
+                    wrap_decorated_scalar_recomputation(&eval_sql)
+                } else {
+                    format!("MAX({eval_sql})")
+                }
             } else {
                 eval_sql
             }
@@ -7848,8 +8061,15 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
                 &modifiers,
                 &resolved.dimension_exprs,
             );
+            let eval_sql = if decorated_call.is_some() {
+                decorated_recomputation_alias(eval_sql, &base_relation_sql)
+            } else { eval_sql };
             if original_dim_cols.is_empty() {
-                format!("MAX({eval_sql})")
+                if decorated_call.is_some() {
+                    wrap_decorated_scalar_recomputation(&eval_sql)
+                } else {
+                    format!("MAX({eval_sql})")
+                }
             } else {
                 eval_sql
             }
@@ -7868,10 +8088,13 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
     }
 
     // Also expand plain AGGREGATE() calls (without AT modifiers) using text replacement
+    let plain_native_calls = parser_ffi::find_aggregates(&result_sql).unwrap_or_default();
     let mut plain_calls = extract_all_aggregate_calls(&result_sql);
     plain_calls.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by position descending
 
     for (measure_name, start, end) in plain_calls {
+        let decorated_call = plain_native_calls.iter()
+            .find(|call| call.start_pos as usize == start && call.has_decorations && !call.is_window);
         let mut replacement_end = end;
         let mut use_default_context = false;
         let suffix = &result_sql[end..];
@@ -7952,6 +8175,18 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
             .derived_expr
             .clone()
             .unwrap_or_else(|| resolved.expression.clone());
+        let expression_for_eval = if let Some(call) = decorated_call {
+            let qualifiers = allowed_qualifiers.iter().cloned().collect::<Vec<_>>();
+            match parser_ffi::decorate_measure(
+                &expression_for_eval, call.call_sql.as_deref().unwrap_or_default(),
+                &resolved.dimension_exprs, &qualifiers,
+            ) {
+                Ok(expression) => expression,
+                Err(error) => return AggregateExpandResult {
+                    had_aggregate: true, expanded_sql: result_sql, error: Some(error), warnings,
+                },
+            }
+        } else { expression_for_eval };
         let is_window_measure =
             is_window_expression(&expression_for_eval) || is_window_expression(&resolved.expression);
 
@@ -7982,8 +8217,15 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
                     &resolved.dimension_exprs,
                 )
             };
+            let eval_sql = if decorated_call.is_some() {
+                decorated_recomputation_alias(eval_sql, &base_relation_sql)
+            } else { eval_sql };
             if original_dim_cols.is_empty() {
-                format!("MAX({eval_sql})")
+                if decorated_call.is_some() {
+                    wrap_decorated_scalar_recomputation(&eval_sql)
+                } else {
+                    format!("MAX({eval_sql})")
+                }
             } else {
                 eval_sql
             }
@@ -8318,7 +8560,7 @@ fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
     if let Ok(info) = parser_ffi::parse_select(sql) {
         if info.native_parsed {
             return info.items.into_iter()
-                .filter(|item| !item.is_aggregate && !item.is_star && !item.is_measure_ref)
+                .filter(|item| !item.is_aggregate && !item.is_star && !item.is_measure_ref && !item.contains_window)
                 .filter(|item| !is_literal_constant(&item.expression_sql))
                 .flat_map(|item| {
                     if item.contains_subquery {

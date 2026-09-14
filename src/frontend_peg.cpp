@@ -18,6 +18,8 @@
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/table_binding.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -446,16 +448,23 @@ public:
 
 struct YardstickGrammarInfo final : ParserExtensionInfo {
     shared_ptr<CompiledGrammar> grammar;
+    shared_ptr<CompiledGrammar> base_grammar;
 };
 
 shared_ptr<CompiledGrammar> SelectGrammar(ParserExtensionInfo *info, const ParserOptions &options) {
-    if (options.compiled_grammar && options.compiled_grammar->HasGrammarChanges()) {
-        return options.compiled_grammar->GetRule("YardstickAtModifier") ? options.compiled_grammar : nullptr;
+    if (options.compiled_grammar && options.compiled_grammar->GetRule("YardstickAtModifier")) {
+        return options.compiled_grammar;
     }
     if (!info) {
         return nullptr;
     }
-    return info->Cast<YardstickGrammarInfo>().grammar;
+    auto &yardstick = info->Cast<YardstickGrammarInfo>();
+    // Only replace the database's default grammar. A different active grammar
+    // or dialect that lacks Yardstick rules must retain its own parser.
+    if (options.compiled_grammar && options.compiled_grammar != yardstick.base_grammar) {
+        return nullptr;
+    }
+    return yardstick.grammar;
 }
 
 } // namespace
@@ -463,6 +472,7 @@ shared_ptr<CompiledGrammar> SelectGrammar(ParserExtensionInfo *info, const Parse
 shared_ptr<ParserExtensionInfo> RegisterYardstickGrammar(DatabaseInstance &db) {
     GrammarExtension::Register(db, make_shared_ptr<YardstickGrammar>());
     auto info = make_shared_ptr<YardstickGrammarInfo>();
+    info->base_grammar = db.GetParserCache().GetMatcher();
     ClientContext context(db.shared_from_this());
     // Compile without changing any connection's active_grammar_extensions.
     info->grammar = CompiledGrammar::Create(context, {"yardstick"});
@@ -500,6 +510,71 @@ NativeYardstickBindScope::~NativeYardstickBindScope() {
 
 ClientContext *CurrentNativeYardstickClientContext() {
     return active_bind_context;
+}
+
+namespace {
+thread_local const vector<unique_ptr<QueryNode>> *active_binding_ctes = nullptr;
+}
+
+const vector<unique_ptr<QueryNode>> *CurrentNativeYardstickCteBindings() {
+    return active_binding_ctes;
+}
+
+NativeYardstickCteBindScope::NativeYardstickCteBindScope(const vector<unique_ptr<QueryNode>> *context)
+    : previous(active_binding_ctes) {
+    active_binding_ctes = context;
+}
+
+NativeYardstickCteBindScope::NativeYardstickCteBindScope(const vector<string> &queries,
+                                                     const ParserOptions &options)
+    : previous(active_binding_ctes) {
+    for (auto &sql : queries) {
+        Parser parser(options);
+        parser.ParseQuery(sql);
+        if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+            throw ParserException("Expected a SELECT carrying native CTE definitions");
+        }
+        definitions.push_back(parser.statements[0]->Cast<SelectStatement>().node->Copy());
+    }
+    active_binding_ctes = &definitions;
+}
+
+NativeYardstickCteBindScope::~NativeYardstickCteBindScope() {
+    active_binding_ctes = previous;
+}
+
+BoundStatement BindNativeYardstickProbe(QueryNode &probe, const vector<QueryNode *> &local_scopes) {
+    auto context = CurrentNativeYardstickClientContext();
+    if (!context) {
+        throw BinderException("Native query binding requires the originating bind context");
+    }
+    // Mirror DuckDB's lazy CTE binder chain. Each definition retains its own
+    // lexical parent, so an inner name cannot change an earlier CTE's meaning.
+    // These plans are used only for schema inspection and are never executed.
+    vector<unique_ptr<CommonTableExpressionInfo>> definitions;
+    vector<shared_ptr<Binder>> binders {Binder::CreateBinder(*context)};
+    auto add_scope = [&](QueryNode &scope) {
+        for (auto &entry : scope.cte_map.map) {
+            // Binding consumes parts of the AST; every probe needs its own copy.
+            definitions.push_back(entry.second->Copy());
+            auto &definition = *definitions.back();
+            auto &parent = *binders.back();
+            auto state = make_shared_ptr<CTEBindState>(parent, *definition.query_node, definition.aliases);
+            auto child = Binder::CreateBinder(*context, parent);
+            child->bind_context.AddCTEBinding(
+                make_uniq<CTEBinding>(BindingAlias(entry.first), state, parent.GenerateTableIndex()));
+            binders.push_back(std::move(child));
+        }
+    };
+    if (active_binding_ctes) {
+        for (auto &scope : *active_binding_ctes) {
+            add_scope(*scope);
+        }
+    }
+    for (auto *scope : local_scopes) {
+        add_scope(*scope);
+    }
+    return binders.back()->Bind(probe);
 }
 
 bool ParseNativeYardstickQuery(const string &sql, Parser &parser) {
@@ -766,6 +841,7 @@ struct NativeQueryScope {
     idx_t start;
     idx_t end;
     vector<string> visible_ctes;
+    vector<YardstickCteDefinition> cte_definitions;
 };
 
 // QueryNode does not retain a complete source location. The native parse tree
@@ -776,10 +852,11 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
     struct Work {
         ParseResult *node;
         vector<string> visible_ctes;
+        vector<YardstickCteDefinition> cte_definitions;
         QueryLocation main_query;
         idx_t modifier_end = 0;
     };
-    vector<Work> pending {{&root, {}, {}, 0}};
+    vector<Work> pending {{&root, {}, {}, {}, 0}};
     while (!pending.empty()) {
         auto work = std::move(pending.back());
         pending.pop_back();
@@ -798,7 +875,7 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
                 end == work.main_query.End()) {
                 end = MaxValue(end, work.modifier_end);
             }
-            scopes.push_back({location.Start(), end, work.visible_ctes});
+            scopes.push_back({location.Start(), end, work.visible_ctes, work.cte_definitions});
         }
         // WITH is the first optional child of SELECT/INSERT/UPDATE/DELETE.
         // Handle its declarations in order: a non-recursive body sees earlier
@@ -828,13 +905,19 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
                     auto &list = declaration->Cast<ListParseResult>();
                     auto name = transformer.Transform<Identifier>(list.GetChild(0)).GetIdentifierName();
                     auto visible = work.visible_ctes;
+                    auto definitions = work.cte_definitions;
+                    auto location = declaration->GetLocation();
+                    YardstickCteDefinition definition {static_cast<uint32_t>(location.Start()),
+                                                      static_cast<uint32_t>(location.End()), recursive};
                     if (recursive) {
                         visible.push_back(name);
+                        definitions.push_back(definition);
                     }
                     // Visiting the declaration also finds CTE bodies nested in
                     // DML; it never infers a query from parentheses or text.
-                    pending.push_back({declaration, std::move(visible), {}, 0});
+                    pending.push_back({declaration, std::move(visible), std::move(definitions), {}, 0});
                     work.visible_ctes.push_back(std::move(name));
+                    work.cte_definitions.push_back(definition);
                 }
                 first_child = 1;
             }
@@ -844,7 +927,8 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
             work.modifier_end = node.GetLocation().End();
         }
         for (idx_t i = first_child; i < children.size(); i++) {
-            pending.push_back({&children[i].get(), work.visible_ctes, work.main_query, work.modifier_end});
+            pending.push_back({&children[i].get(), work.visible_ctes, work.cte_definitions,
+                               work.main_query, work.modifier_end});
         }
     }
     return true;
@@ -907,9 +991,11 @@ YardstickQueryScopeList *FindNativeYardstickQueryScopes(const char *sql_p) {
             scope.end_pos = static_cast<uint32_t>(source.end);
             if (!source.visible_ctes.empty()) {
                 scope.visible_ctes = new const char *[source.visible_ctes.size()] {};
+                scope.cte_definitions = new YardstickCteDefinition[source.cte_definitions.size()] {};
                 scope.visible_cte_count = source.visible_ctes.size();
                 for (idx_t j = 0; j < source.visible_ctes.size(); j++) {
                     scope.visible_ctes[j] = strdup(source.visible_ctes[j].c_str());
+                    scope.cte_definitions[j] = source.cte_definitions[j];
                     if (!scope.visible_ctes[j]) {
                         throw std::bad_alloc();
                     }
@@ -971,7 +1057,7 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
     if (!sql_p || !active_parse_scope || !active_parse_scope->available) {
         return nullptr;
     }
-    string semantic_error;
+    bool found_decorated_call = false;
     try {
         string sql(sql_p);
         if (sql.size() > std::numeric_limits<uint32_t>::max() || Parser::NormalizeSQLString(sql) != sql) {
@@ -987,46 +1073,14 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             return nullptr;
         }
 
-        // Validate every expression before source-span adaptation can choose
-        // compatibility lowering for a different operand in the same query.
-        std::function<void(unique_ptr<ParsedExpression> &)> validate_expression;
-        validate_expression = [&](unique_ptr<ParsedExpression> &expression) {
-            bool unsupported = false;
-            if (expression->GetExpressionClass() == ExpressionClass::WINDOW) {
-                auto &window = expression->Cast<WindowExpression>();
-                unsupported = StringUtil::CIEquals(window.FunctionName().GetIdentifierName(), "aggregate") &&
-                              window.GetArguments().size() == 1;
-            } else if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
-                auto &function = expression->Cast<FunctionExpression>();
-                unsupported = StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate") &&
-                              function.GetArguments().size() == 1 &&
-                              (function.Distinct() || function.Filter() || function.ExportState() ||
-                               (function.OrderBy() && !function.OrderBy()->orders.empty()));
-            }
-            if (unsupported) {
-                semantic_error = "Yardstick AGGREGATE does not support DISTINCT, FILTER, ORDER BY, OVER, or EXPORT_STATE; "
-                                 "define aggregation behavior in AS MEASURE or use AT modifiers";
-                throw ParserException(semantic_error);
-            }
-            if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
-                auto &subquery = expression->Cast<SubqueryExpression>();
-                ParsedExpressionIterator::EnumerateQueryNodeChildren(*subquery.SubqueryMutable()->node,
-                                                                     validate_expression);
-            }
-            ParsedExpressionIterator::EnumerateChildren(*expression, validate_expression);
-        };
-        for (auto &statement : parser.statements) {
-            EnumerateNativeStatementExpressions(*statement, validate_expression);
-        }
-        for (auto &expression : capture.modifier_expressions) {
-            validate_expression(expression);
-        }
-
         struct Aggregate {
             string measure;
             idx_t start;
             idx_t end;
             vector<NativeModifier> modifiers;
+            string call_sql;
+            bool is_window;
+            bool has_decorations;
         };
         vector<Aggregate> aggregates;
         vector<bool> used_clauses(capture.clauses.size(), false);
@@ -1084,35 +1138,50 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
                 base = arguments[0].GetExpressionMutable().get();
             }
 
-            bool is_measure_call = false;
+            const vector<FunctionArgument> *arguments = nullptr;
+            bool is_window = false;
+            bool has_decorations = false;
             if (base->GetExpressionClass() == ExpressionClass::FUNCTION) {
                 auto &function = base->Cast<FunctionExpression>();
-                is_measure_call = StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate") &&
-                                  function.GetArguments().size() == 1;
-                if (is_measure_call) {
-                    auto call_location = source_range(function);
-                    auto &argument = function.GetArguments()[0];
-                    auto argument_location = source_range(argument.GetExpression());
-                    if (argument.HasName() || argument_location.Start() < call_location.Start() ||
-                        argument_location.End() > call_location.End()) {
-                        throw ParserException("Unsupported Yardstick aggregate argument source");
-                    }
-                    Aggregate aggregate {sql.substr(argument_location.Start(), argument_location.length),
-                                         call_location.Start(), call_location.End(), {}};
-                    // AST parents run from the last suffix back to the first.
-                    // Modifier application retains the original SQL order.
-                    for (auto suffix = suffixes.rbegin(); suffix != suffixes.rend(); ++suffix) {
-                        auto &clause = capture.clauses[*suffix];
-                        if (clause.start < aggregate.end || clause.end > sql.size() ||
-                            !extend_operand(aggregate.start, aggregate.end, clause.start)) {
-                            throw ParserException("Invalid Yardstick AT source range");
-                        }
-                        aggregate.modifiers.insert(aggregate.modifiers.end(), clause.modifiers.begin(),
-                                                   clause.modifiers.end());
-                        aggregate.end = clause.end;
-                    }
-                    aggregates.push_back(std::move(aggregate));
+                if (StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate")) {
+                    arguments = &function.GetArguments();
+                    has_decorations = function.Distinct() || function.Filter() || function.ExportState() ||
+                                      (function.OrderBy() && !function.OrderBy()->orders.empty());
                 }
+            } else if (base->GetExpressionClass() == ExpressionClass::WINDOW) {
+                auto &window = base->Cast<WindowExpression>();
+                if (StringUtil::CIEquals(window.FunctionName().GetIdentifierName(), "aggregate")) {
+                    arguments = &window.GetArguments();
+                    is_window = true;
+                    has_decorations = true;
+                }
+            }
+            bool is_measure_call = arguments && arguments->size() == 1;
+            if (is_measure_call) {
+                found_decorated_call |= has_decorations;
+                auto call_location = source_range(*base);
+                auto &argument = (*arguments)[0];
+                auto argument_location = source_range(argument.GetExpression());
+                if (argument.HasName() || argument_location.Start() < call_location.Start() ||
+                    argument_location.End() > call_location.End()) {
+                    throw ParserException("Unsupported Yardstick aggregate argument source");
+                }
+                Aggregate aggregate {sql.substr(argument_location.Start(), argument_location.length),
+                                     call_location.Start(), call_location.End(), {}, base->ToString(),
+                                     is_window, has_decorations};
+                // AST parents run from the last suffix back to the first.
+                // Modifier application retains the original SQL order.
+                for (auto suffix = suffixes.rbegin(); suffix != suffixes.rend(); ++suffix) {
+                    auto &clause = capture.clauses[*suffix];
+                    if (clause.start < aggregate.end || clause.end > sql.size() ||
+                        !extend_operand(aggregate.start, aggregate.end, clause.start)) {
+                        throw ParserException("Invalid Yardstick AT source range");
+                    }
+                    aggregate.modifiers.insert(aggregate.modifiers.end(), clause.modifiers.begin(),
+                                               clause.modifiers.end());
+                    aggregate.end = clause.end;
+                }
+                aggregates.push_back(std::move(aggregate));
             }
             if (!suffixes.empty() && !is_measure_call) {
                 // Shorthand AT expressions still use compatibility lowering.
@@ -1166,6 +1235,9 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             auto &source = aggregates[i];
             auto &call = result->calls[i];
             call.measure_name = duplicate(source.measure);
+            call.call_sql = duplicate(source.call_sql);
+            call.is_window = source.is_window;
+            call.has_decorations = source.has_decorations;
             call.start_pos = static_cast<uint32_t>(source.start);
             call.end_pos = static_cast<uint32_t>(source.end);
             if (!source.modifiers.empty()) {
@@ -1185,11 +1257,11 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             }
         }
         return result.release();
-    } catch (const std::exception &) {
-        if (!semantic_error.empty()) {
+    } catch (const std::exception &error) {
+        if (found_decorated_call) {
             auto *result = new YardstickAggregateCallList {};
             result->native_parsed = true;
-            result->error = strdup(semantic_error.c_str());
+            result->error = strdup(error.what());
             return result;
         }
         return nullptr;

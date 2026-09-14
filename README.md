@@ -158,7 +158,33 @@ On DuckDB builds with grammar-extension support, Yardstick recognizes `AS MEASUR
 
 Native query traversal lowers CTE bodies, subqueries, and set-operation operands independently. Aggregate calls are discovered from expression nodes, including parenthesized `AT` operands and queries inside INSERT, UPDATE, DELETE, CREATE VIEW, CREATE TABLE AS, EXPLAIN, and COPY statements. Visible filters retain outer query correlations. Subquery projections group their outer column dependencies, while implicit measure projections preserve their column names. DuckDB 1.5.5 retains the compatibility parser; native forms whose source spans cannot be represented also use that path.
 
-The native frontend rejects `DISTINCT`, `FILTER`, `ORDER BY`, `OVER`, and `EXPORT_STATE` directly on one-argument `AGGREGATE()` calls. Their semantics are not implemented, and compatibility lowering could produce incorrect results. Define aggregation behavior in the `AS MEASURE` expression or use supported `AT` modifiers instead. DuckDB's multiargument `aggregate(list, function_name)` remains ordinary DuckDB syntax.
+The native frontend supports `DISTINCT`, `FILTER`, argument `ORDER BY`, `OVER`, and `EXPORT_STATE` on one-argument `AGGREGATE()` calls. DuckDB 1.5.5 retains its compatibility frontend; these call decorations require the native frontend. DuckDB's multiargument `aggregate(list, function_name)` remains ordinary DuckDB syntax.
+
+```sql
+SELECT AGGREGATE(DISTINCT revenue),
+       AGGREGATE(revenue) FILTER (WHERE region = 'US')
+FROM sales;
+
+SELECT year, AGGREGATE(revenue) OVER (
+    ORDER BY year ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+) AS rolling_revenue
+FROM sales_by_year;
+```
+
+Call decorations operate on the aggregate functions in the measure definition. For a derived measure such as `SUM(amount) / COUNT(amount)`, `DISTINCT` applies separately to both aggregate inputs, and `FILTER` restricts the base rows for both sides. Scalar arithmetic, casts, and wrappers remain intact. A call filter is combined with an existing definition filter using `AND`. Argument ordering, as in `AGGREGATE(labels ORDER BY priority DESC NULLS LAST)`, takes precedence over definition ordering; the definition's ordering remains as tie breakers. Filter and ordering expressions can reference exposed dimension aliases, including computed dimensions.
+
+Window partitions and `ROWS`, `RANGE`, or `GROUPS` frames select visible rows, then recompute the measure from their original base rows. This preserves averages and derived ratios when visible rows represent groups of unequal size. A window call's `FILTER` selects frame input rows, so it can reference joined relations; filters in the measure definition still apply to aggregate leaves. Frames retain DuckDB's peer, exclusion, and empty-frame behavior; repeated references introduced by joins do not duplicate the same base row. Window calls also support `AT` context modifiers, which transform the context selected by the filtered frame.
+
+Window argument ordering can mix source and joined input fields. When a join repeats a base row, its first occurrence under the caller's ordering supplies the joined keys; definition ordering still breaks ties. If `AT` expands the context to a base row absent from the frame, its joined keys are `NULL`, while its source keys are recomputed.
+
+`AGGREGATE(measure) EXPORT_STATE` exports sufficient aggregate state for later finalization. A single aggregate produces DuckDB's native state; a derived measure produces a composite state carrying its aggregate leaves and scalar formula. `yardstick_finalize(state)` accepts either form. `yardstick_combine(left, right)` combines two states with matching formulas and aggregate types, then `yardstick_finalize` evaluates the result. DuckDB's own aggregate-specific export restrictions still apply.
+
+```sql
+SELECT yardstick_finalize(state)
+FROM (SELECT AGGREGATE(revenue) EXPORT_STATE AS state FROM sales);
+```
+
+Combining exported states follows DuckDB's native state semantics: it does not retain a cross-shard set of distinct input values. Combining states exported with `DISTINCT` therefore does not remove duplicates shared by different shards. Recompute from the combined base rows when global distinctness is required.
 
 The native frontend also supports full and partial `CREATE VIEW` column lists for measure views. Header names apply to both dimensions and measures, while derived measures retain their declaration dependencies. Star projections are expanded against the originating session before header positions are mapped. Temporary definitions stay session-local; a single statement cannot combine temporary and permanent measure views with the same name.
 

@@ -1,5 +1,5 @@
 # name: test/sql/native_aggregate_errors.test
-# description: Unsupported measure-call decorations fail instead of losing semantics in compatibility lowering.
+# description: Decorations retain semantics through statement scopes and preserve invalid-input errors.
 # group: [yardstick]
 
 require-env YARDSTICK_NATIVE_PEG 1
@@ -26,115 +26,139 @@ foreach parser_mode true false
 statement ok
 SET heap_based_parser=${parser_mode};
 
-statement error
+query R
 SELECT AGGREGATE(DISTINCT revenue) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+40.0
 
-statement error
+query R
 SELECT AGGREGATE(revenue ORDER BY amount) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+50.0
 
-statement error
+query R
 SELECT AGGREGATE(revenue) FILTER (WHERE amount > 10) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+30.0
 
-statement error
+query R
 SELECT AGGREGATE(revenue) OVER () FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+50.0
+50.0
+50.0
 
-statement error
+query R rowsort
 SELECT AGGREGATE(revenue) OVER (PARTITION BY region) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+20.0
+20.0
+30.0
 
-statement error
-SELECT AGGREGATE(revenue) EXPORT_STATE FROM aggregate_error_v;
+query R
+SELECT yardstick_finalize(state)
+FROM (SELECT AGGREGATE(revenue) EXPORT_STATE AS state FROM aggregate_error_v);
 ----
-Yardstick AGGREGATE does not support
+50.0
 
-# Trivia, nested scopes, built-in calls, and AT must not hide the error.
-statement error
+# Trivia, nested scopes, built-in calls, and AT retain decoration semantics.
+query R
 SELECT "AGGREGATE"/* comment */(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+NULL
 
-statement error
+query IRR
 SELECT aggregate([1, 2], 'sum'), AGGREGATE(revenue),
        AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+3	50.0	NULL
 
-statement error
+query RR
 SELECT revenue AT (ALL), AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+50.0	NULL
 
-statement error
+query RR
 SELECT AGGREGATE(revenue) FILTER (WHERE FALSE), revenue AT (ALL) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+NULL	50.0
 
-statement error
+query R
 SELECT (SELECT AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v);
 ----
-Yardstick AGGREGATE does not support
+NULL
 
-statement error
+query R rowsort
 WITH totals AS (SELECT AGGREGATE(revenue) OVER (PARTITION BY region) AS total FROM aggregate_error_v)
 SELECT * FROM totals;
 ----
-Yardstick AGGREGATE does not support
+20.0
+20.0
+30.0
 
-statement error
+query R rowsort
 SELECT AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v
 UNION ALL SELECT AGGREGATE(revenue) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+50.0
+NULL
 
-statement error
+query R
 SELECT AGGREGATE(DISTINCT revenue) AT (ALL) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+40.0
 
-statement error
+query R
 SELECT AGGREGATE(revenue ORDER BY amount) AT (ALL) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+50.0
 
-statement error
+query R
 SELECT AGGREGATE(revenue) FILTER (WHERE FALSE) AT (ALL) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+NULL
 
-statement error
+query R
 SELECT AGGREGATE(revenue) OVER () AT (ALL) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+50.0
+50.0
+50.0
 
-statement error
+statement ok
 INSERT INTO aggregate_error_results
 SELECT AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v;
-----
-Yardstick AGGREGATE does not support
 
-# Modifier subqueries retain their own expression validation.
-statement error
+# Modifier subqueries lower their own decorated calls before the outer context.
+query R
 SELECT AGGREGATE(revenue) AT (WHERE amount = (
     SELECT AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v
 )) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+NULL
 
-statement error
+query R
 SELECT AGGREGATE(revenue) AT (SET amount = (
     SELECT AGGREGATE(revenue) OVER () FROM aggregate_error_v LIMIT 1
 )) FROM aggregate_error_v;
 ----
-Yardstick AGGREGATE does not support
+NULL
+
+# The inner amount is local; the sibling amount belongs to the consumer group.
+query IR
+SELECT amount, AGGREGATE(revenue) AT (
+    SET amount = (SELECT max(amount) FROM aggregate_error_v) + amount - 30
+) FROM aggregate_error_v ORDER BY amount;
+----
+10	20.0
+30	30.0
+
+query IR
+SELECT amount, AGGREGATE(revenue) AT (SET amount = amount)
+FROM main.aggregate_error_v ORDER BY amount;
+----
+10	20.0
+30	30.0
 
 # Ordinary aggregate decorations in a measure definition remain valid.
 query RR
@@ -152,6 +176,17 @@ SELECT AGGREGATE(revenue) AS export_state FROM aggregate_error_v;
 ----
 50.0
 
+# Decorations must still bind their referenced columns.
+statement error
+SELECT AGGREGATE(revenue) FILTER (WHERE missing_filter_column > 0) FROM aggregate_error_v;
+----
+missing_filter_column
+
+statement error
+SELECT AGGREGATE(revenue ORDER BY missing_order_column) FROM aggregate_error_v;
+----
+missing_order_column
+
 # DuckDB retains ownership of invalid decorations on its multiargument scalar.
 statement error
 SELECT aggregate(DISTINCT [1, 2], 'sum');
@@ -168,4 +203,4 @@ endloop
 query I
 SELECT COUNT(*) FROM aggregate_error_results;
 ----
-0
+2

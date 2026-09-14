@@ -22,12 +22,25 @@ statement ok
 INSERT INTO combined_sales VALUES (2022, 100), (2023, 225);
 
 statement ok
-SET active_grammar_extensions=['yardstick', 'yardstick_test_grammar'];
+CREATE VIEW combined_plain_v AS SELECT SUM(amount) AS MEASURE revenue FROM combined_sales;
 
 foreach parser_mode true false
 
 statement ok
 SET heap_based_parser=${parser_mode};
+
+# A selected grammar without Yardstick rules must not be replaced by the
+# extension's private grammar merely because Yardstick is loaded.
+statement ok
+SET active_grammar_extensions=['yardstick_test_grammar'];
+
+query I
+SELECT yardstick_test_year!();
+----
+2023
+
+statement ok
+SET active_grammar_extensions=['yardstick', 'yardstick_test_grammar'];
 
 query I
 SELECT yardstick_test_year!();
@@ -78,6 +91,11 @@ SELECT yardstick_test_year!();
 
 statement ok
 RESET active_grammar_extensions;
+
+query I
+SELECT AGGREGATE(revenue) FROM combined_plain_v;
+----
+325
 
 statement error
 SELECT yardstick_test_year!();

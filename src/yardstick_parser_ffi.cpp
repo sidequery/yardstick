@@ -10,6 +10,8 @@
 #include "yardstick_ffi.h"
 #include "yardstick_compat.hpp"
 #include "frontend_peg.hpp"
+#include "aggregate_decorations.hpp"
+#include "measure_windows.hpp"
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
@@ -1290,7 +1292,7 @@ extern "C" int32_t yardstick_current_where_is_single_valued(const char* predicat
                                                             const char* qualifier) {
 #if YARDSTICK_GRAMMAR_EXTENSION
     auto *options = CurrentNativeYardstickParserOptions();
-    if (!options || !options->compiled_grammar || !options->compiled_grammar->HasGrammarChanges()) {
+    if (!options || !options->compiled_grammar || !options->compiled_grammar->GetRule("YardstickAtModifier")) {
         return -1;
     }
     try {
@@ -1335,6 +1337,7 @@ extern "C" void yardstick_free_query_scopes(YardstickQueryScopeList* list) {
             free(const_cast<char*>(list->scopes[i].visible_ctes[j]));
         }
         delete[] list->scopes[i].visible_ctes;
+        delete[] list->scopes[i].cte_definitions;
     }
     delete[] list->scopes;
     delete list;
@@ -1415,7 +1418,7 @@ extern "C" YardstickAggregateCallList* yardstick_find_aggregates(const char* sql
         // Convert to C structs
         if (!aggregates.empty()) {
             result->count = aggregates.size();
-            result->calls = new YardstickAggregateCall[result->count];
+            result->calls = new YardstickAggregateCall[result->count] {};
 
             for (size_t i = 0; i < aggregates.size(); i++) {
                 auto& info = aggregates[i];
@@ -1455,6 +1458,7 @@ extern "C" void yardstick_free_aggregate_list(YardstickAggregateCallList* list) 
     for (size_t i = 0; i < list->count; i++) {
         auto& call = list->calls[i];
         free(const_cast<char*>(call.measure_name));
+        free(const_cast<char*>(call.call_sql));
         for (size_t j = 0; j < call.modifier_count; j++) {
             free(const_cast<char*>(call.modifiers[j].dimension));
             free(const_cast<char*>(call.modifiers[j].value));
@@ -1464,6 +1468,125 @@ extern "C" void yardstick_free_aggregate_list(YardstickAggregateCallList* list) 
     delete[] list->calls;
     free(const_cast<char*>(list->error));
     delete list;
+}
+
+extern "C" char* yardstick_decorate_measure(
+    const char* expression, const char* call_sql, const char* const* dimension_names,
+    const char* const* dimension_expressions, size_t dimension_count,
+    const char* const* qualifiers, size_t qualifier_count,
+    const char* const* binding_ctes, size_t binding_cte_count, char** error) {
+    if (error) *error = nullptr;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    try {
+        vector<pair<string, string>> dimensions;
+        for (size_t i = 0; i < dimension_count; i++) {
+            dimensions.emplace_back(dimension_names[i], dimension_expressions[i]);
+        }
+        vector<string> local_qualifiers;
+        for (size_t i = 0; i < qualifier_count; i++) local_qualifiers.emplace_back(qualifiers[i]);
+        auto options = YardstickParserOptions();
+        vector<string> cte_queries;
+        for (size_t i = 0; i < binding_cte_count; i++) cte_queries.emplace_back(binding_ctes[i]);
+        NativeYardstickCteBindScope binding_scope(cte_queries, options);
+        auto calls = Parser::ParseExpressionList(call_sql, options);
+        if (calls.size() != 1) throw ParserException("Expected one AGGREGATE call");
+        // Window FILTER selects input rows in the lineage stage. DISTINCT and
+        // argument ordering apply to the aggregate leaves being recomputed.
+        const bool is_window = calls[0]->GetExpressionClass() == ExpressionClass::WINDOW;
+        if (is_window) {
+            auto &window = calls[0]->Cast<WindowExpression>();
+            vector<unique_ptr<ParsedExpression>> arguments;
+            for (auto &argument : window.GetArguments()) arguments.push_back(argument.GetExpression().Copy());
+            auto orders = make_uniq<OrderModifier>();
+            for (auto &order : window.ArgOrders()) {
+                orders->orders.emplace_back(order.type, order.null_order, order.expression->Copy());
+            }
+            calls[0] = make_uniq<FunctionExpression>(Identifier("aggregate"), std::move(arguments),
+                nullptr, std::move(orders), window.Distinct());
+        }
+        return safe_strdup(DecorateYardstickMeasureExpression(
+            expression, calls[0]->ToString(), dimensions, local_qualifiers, options, is_window));
+    } catch (const std::exception &exception) {
+        if (error) *error = safe_strdup(exception.what());
+    }
+#endif
+    return nullptr;
+}
+
+extern "C" char* yardstick_window_marker(const char* call_sql, const char* marker_name, char** error) {
+    if (error) *error = nullptr;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    try {
+        auto expressions = Parser::ParseExpressionList(call_sql, YardstickParserOptions());
+        if (expressions.size() != 1 || expressions[0]->GetExpressionClass() != ExpressionClass::WINDOW) {
+            throw ParserException("Expected one windowed AGGREGATE call");
+        }
+        auto &window = expressions[0]->Cast<WindowExpression>();
+        window.SetFunctionName(marker_name);
+        window.GetArgumentsMutable().clear();
+        window.GetArgumentsMutable().emplace_back(ConstantExpression::FromValue(Value::INTEGER(0)));
+        window.DistinctMutable() = false;
+        return safe_strdup(window.ToString());
+    } catch (const std::exception &exception) {
+        if (error) *error = safe_strdup(exception.what());
+    }
+#endif
+    return nullptr;
+}
+
+extern "C" char* yardstick_rewrite_measure_windows(
+    const char* sql, const YardstickWindowSource* sources, size_t source_count,
+    const YardstickWindowCall* calls, size_t call_count,
+    const char* const* visible_ctes, size_t visible_cte_count,
+    const char* const* binding_ctes, size_t binding_cte_count, char** error) {
+    if (error) *error = nullptr;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    try {
+        vector<MeasureWindowSource> source_info;
+        for (size_t i = 0; i < source_count; i++) {
+            auto &source = sources[i];
+            MeasureWindowSource info {source.key, source.relation_name, source.alias, source.clean_select_sql,
+                                      source.grouped, {}};
+            for (size_t j = 0; j < source.dimension_count; j++) {
+                info.dimensions.emplace_back(source.dimension_names[j], source.dimension_expressions[j]);
+            }
+            source_info.push_back(std::move(info));
+        }
+        vector<MeasureWindowCall> call_info;
+        for (size_t i = 0; i < call_count; i++) {
+            auto &call = calls[i];
+            MeasureWindowCall info {call.marker_name, call.source_key, call.expression_sql, {}};
+            for (size_t j = 0; j < call.modifier_count; j++) {
+                auto &modifier = call.modifiers[j];
+                WindowContextType type;
+                switch (modifier.type) {
+                case YARDSTICK_AT_ALL_GLOBAL: type = WindowContextType::ALL_GLOBAL; break;
+                case YARDSTICK_AT_ALL_DIM: type = WindowContextType::ALL; break;
+                case YARDSTICK_AT_SET: type = WindowContextType::SET; break;
+                case YARDSTICK_AT_WHERE: type = WindowContextType::WHERE; break;
+                case YARDSTICK_AT_VISIBLE: type = WindowContextType::VISIBLE; break;
+                default: continue;
+                }
+                info.modifiers.push_back({type, modifier.dimension ? modifier.dimension : "",
+                                         modifier.value ? modifier.value : ""});
+            }
+            call_info.push_back(std::move(info));
+        }
+        vector<string> cte_names;
+        for (size_t i = 0; i < visible_cte_count; i++) {
+            cte_names.push_back(visible_ctes[i]);
+        }
+        vector<string> cte_queries;
+        for (size_t i = 0; i < binding_cte_count; i++) {
+            cte_queries.push_back(binding_ctes[i]);
+        }
+        return safe_strdup(RewriteNativeMeasureWindows(sql, source_info, call_info, cte_names,
+                                                      cte_queries, YardstickParserOptions()));
+    } catch (const std::exception &exception) {
+        if (error) *error = safe_strdup(exception.what());
+    }
+#endif
+    return nullptr;
 }
 
 //=============================================================================
@@ -1493,7 +1616,9 @@ static void NativeRelationQualifiers(TableRef &ref, std::unordered_set<string> &
     }
 }
 
-static vector<string> NativeSubqueryDimensions(ParsedExpression &projection, SelectNode &outer) {
+static vector<string> NativeSubqueryDimensions(
+    ParsedExpression &projection, SelectNode &outer,
+    const std::function<void(ColumnRefExpression &)> &rewrite = {}) {
     struct Scope {
         bool unqualified_outer = true;
         bool nested = false;
@@ -1519,6 +1644,9 @@ static vector<string> NativeSubqueryDimensions(ParsedExpression &projection, Sel
                 auto sql = expr.ToString();
                 if (std::find(dimensions.begin(), dimensions.end(), sql) == dimensions.end()) {
                     dimensions.push_back(std::move(sql));
+                }
+                if (rewrite) {
+                    rewrite(expr.Cast<ColumnRefExpression>());
                 }
             }
         } else if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
@@ -1789,6 +1917,7 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
 #endif
 
             item.is_aggregate = ExpressionContainsAggregate(expr.get());
+            item.contains_window = expr->IsWindow();
             item.is_star = expr->GetExpressionClass() == ExpressionClass::STAR;
             item.is_measure_ref = ExpressionContainsMeasureRef(expr.get());
 
@@ -2579,10 +2708,44 @@ extern "C" char* yardstick_replace_range(
     return safe_strdup(result);
 }
 
-extern "C" char* yardstick_qualify_expression(const char* expr_str, const char* qualifier) {
+extern "C" char* yardstick_qualify_expression(const char* expr_str, const char* qualifier,
+                                             const char* dimension) {
     if (!expr_str || !qualifier) return nullptr;
 
     try {
+        if (dimension) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+            if (!CurrentNativeYardstickParserOptions()) return nullptr;
+            auto options = YardstickParserOptions();
+            auto dimensions = Parser::ParseExpressionList(dimension, options);
+            if (dimensions.size() != 1 || dimensions[0]->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+                return nullptr;
+            }
+            auto column = dimensions[0]->Cast<ColumnRefExpression>().GetColumnName();
+            auto qualified = Parser::ParseExpressionList(string(qualifier) + "." + dimension, options);
+            if (qualified.size() != 1 || qualified[0]->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+                return nullptr;
+            }
+            auto qualified_names = qualified[0]->Cast<ColumnRefExpression>().ColumnNames();
+            Parser parser(options);
+            parser.ParseQuery(string("SELECT ") + expr_str + " FROM " + qualifier);
+            if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+                return nullptr;
+            }
+            auto &query = parser.statements[0]->Cast<SelectStatement>().node;
+            if (query->type != QueryNodeType::SELECT_NODE) return nullptr;
+            auto &select = query->Cast<SelectNode>();
+            if (select.select_list.size() != 1) return nullptr;
+            NativeSubqueryDimensions(*select.select_list[0], select, [&](ColumnRefExpression &reference) {
+                if (!reference.IsQualified() && reference.GetColumnName() == column) {
+                    reference.ColumnNamesMutable() = qualified_names;
+                }
+            });
+            return safe_strdup(select.select_list[0]->ToString());
+#else
+            return nullptr;
+#endif
+        }
         auto expressions = Parser::ParseExpressionList(expr_str, YardstickParserOptions());
         if (expressions.empty()) {
             return safe_strdup(expr_str);

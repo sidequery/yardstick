@@ -49,6 +49,9 @@ typedef struct {
     /* AT modifier chain (supports multiple: AGGREGATE(x) AT (...) AT (...)) */
     YardstickAtModifier* modifiers;
     size_t modifier_count;
+    const char* call_sql;       /* Native call AST, without enclosing AT suffixes */
+    bool is_window;
+    bool has_decorations;
 } YardstickAggregateCall;
 
 /* List of all AGGREGATE() calls found in SQL */
@@ -58,6 +61,38 @@ typedef struct {
     const char* error;          /* NULL if success */
     bool native_parsed;        /* Complete grammar-validated source spans */
 } YardstickAggregateCallList;
+
+/* Complete source definitions used for query-local window lineage. */
+typedef struct {
+    const char* key;
+    const char* relation_name;
+    const char* alias;
+    const char* clean_select_sql;
+    bool grouped;
+    const char* const* dimension_names;
+    const char* const* dimension_expressions;
+    size_t dimension_count;
+} YardstickWindowSource;
+
+typedef struct {
+    const char* marker_name;
+    const char* source_key;
+    const char* expression_sql;
+    const YardstickAtModifier* modifiers;
+    size_t modifier_count;
+} YardstickWindowCall;
+
+char* yardstick_decorate_measure(
+    const char* expression, const char* call_sql,
+    const char* const* dimension_names, const char* const* dimension_expressions, size_t dimension_count,
+    const char* const* qualifiers, size_t qualifier_count,
+    const char* const* binding_ctes, size_t binding_cte_count, char** error);
+char* yardstick_window_marker(const char* call_sql, const char* marker_name, char** error);
+char* yardstick_rewrite_measure_windows(
+    const char* sql, const YardstickWindowSource* sources, size_t source_count,
+    const YardstickWindowCall* calls, size_t call_count,
+    const char* const* visible_ctes, size_t visible_cte_count,
+    const char* const* binding_ctes, size_t binding_cte_count, char** error);
 
 /* Grammar-owned CURRENT references, relative to the supplied expression. */
 typedef struct {
@@ -90,8 +125,15 @@ char* yardstick_rewrite_visible_filter(const char* expression, const char* local
 typedef struct {
     uint32_t start_pos;
     uint32_t end_pos;
+    bool recursive;
+} YardstickCteDefinition;
+
+typedef struct {
+    uint32_t start_pos;
+    uint32_t end_pos;
     const char** visible_ctes;
     size_t visible_cte_count;
+    YardstickCteDefinition* cte_definitions;
 } YardstickQueryScope;
 
 typedef struct {
@@ -116,6 +158,7 @@ typedef struct {
     bool is_star;               /* True if SELECT * or table.* */
     bool is_measure_ref;        /* True if references AGGREGATE() */
     bool contains_subquery;     /* Group outer dependencies instead of the subquery expression */
+    bool contains_window;       /* Window expressions are not implicit grouping keys */
     const char* reference_column; /* Native direct column reference, decoded */
     const char* reference_qualifier; /* Native direct qualifier, decoded or NULL */
     const char** subquery_dimensions; /* Outer column references required by this projection */
@@ -327,7 +370,8 @@ char* yardstick_replace_range(
     const char* replacement
 );
 
-char* yardstick_qualify_expression(const char* expr, const char* qualifier);
+/* A non-NULL dimension selects only outer references to that dimension. */
+char* yardstick_qualify_expression(const char* expr, const char* qualifier, const char* dimension);
 
 /**
  * Free a string allocated by yardstick functions.

@@ -149,6 +149,9 @@ set(EXTENSION_SOURCES
     src/yardstick_extension.cpp
     src/yardstick_parser_ffi.cpp
     src/frontend_peg.cpp
+    src/aggregate_decorations.cpp
+    src/aggregate_state.cpp
+    src/measure_windows.cpp
 )
 
 if(NOT COMMAND build_static_extension)

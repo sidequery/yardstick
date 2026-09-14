@@ -1,0 +1,239 @@
+# name: test/sql/native_aggregate_decorations.test
+# description: Call decorations recompute base and derived measures over their base rows.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE decoration_sales(region VARCHAR, amount INTEGER, weight INTEGER, label VARCHAR, priority INTEGER);
+
+statement ok
+INSERT INTO decoration_sales VALUES
+    ('a', 10, 1, 'first', 2), ('a', 10, 3, 'second', 1),
+    ('a', 20, 2, 'third', NULL), ('b', 40, 4, 'fourth', 1),
+    ('b', NULL, 5, NULL, NULL);
+
+statement ok
+CREATE VIEW decoration_v AS
+SELECT region AS area, amount * 2 AS doubled, priority AS ranking,
+       SUM(amount) AS MEASURE revenue,
+       AVG(amount) AS MEASURE average_amount,
+       SUM(amount * weight)::DOUBLE / SUM(weight) AS MEASURE weighted,
+       SUM(amount)::DOUBLE / COUNT(amount) AS MEASURE ratio,
+       COUNT(*) AS MEASURE row_count,
+       SUM(amount) FILTER (WHERE amount >= 20) AS MEASURE large_revenue,
+       STRING_AGG(label, ',' ORDER BY label) AS MEASURE labels,
+       LIST(amount) AS MEASURE amounts
+FROM decoration_sales;
+
+statement ok
+CREATE TABLE decoration_scope_rows(id INTEGER, g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO decoration_scope_rows VALUES (1, 1, 10), (2, 1, 20), (3, 2, 10), (4, 2, 30);
+
+statement ok
+CREATE VIEW decoration_scope_v AS
+SELECT id, g AS area, x, SUM(x) AS MEASURE total FROM decoration_scope_rows;
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+query RRR
+SELECT AGGREGATE(DISTINCT revenue), AGGREGATE(DISTINCT average_amount), AGGREGATE(DISTINCT ratio)
+FROM decoration_v;
+----
+70.0	23.333333333333332	23.333333333333332
+
+# FILTER is inside every aggregate leaf, including both sides of ratios.
+# Unequal source row counts distinguish this from averaging grouped averages.
+query RRR
+SELECT AGGREGATE(average_amount) FILTER (WHERE area = 'a'),
+       AGGREGATE(weighted) FILTER (WHERE area = 'a'),
+       AGGREGATE(ratio) FILTER (WHERE area = 'a')
+FROM decoration_v;
+----
+13.333333333333334	13.333333333333334	13.333333333333334
+
+# Resolve exposed aliases and computed dimensions before base-row filtering.
+query RR
+SELECT AGGREGATE(revenue) FILTER (WHERE v.doubled >= 40),
+       AGGREGATE(large_revenue) FILTER (WHERE v.area = 'a')
+FROM decoration_v v;
+----
+60.0	20.0
+
+query RR
+SELECT AGGREGATE(revenue) FILTER (WHERE FALSE),
+       AGGREGATE(ratio) FILTER (WHERE FALSE)
+FROM decoration_v;
+----
+NULL	NULL
+
+# Caller ordering is primary; the declaration's label order breaks ties.
+query TT
+SELECT AGGREGATE(labels ORDER BY ranking ASC NULLS FIRST),
+       AGGREGATE(amounts ORDER BY ranking DESC NULLS LAST, doubled DESC)
+FROM decoration_v;
+----
+third,fourth,second,first	[10, 40, 10, 20, NULL]
+
+query T
+SELECT AGGREGATE(labels ORDER BY v.ranking DESC NULLS LAST) FILTER (WHERE v.area = 'a')
+FROM decoration_v v;
+----
+first,second,third
+
+# Correlated references resolve to the outer view; nested aliases retain ownership.
+query R
+SELECT AGGREGATE(revenue) FILTER (WHERE EXISTS (
+    SELECT 1 FROM (VALUES ('a')) allowed(area) WHERE allowed.area = v.area
+)) FROM decoration_v v;
+----
+40.0
+
+query R
+SELECT AGGREGATE(revenue) FILTER (WHERE EXISTS (
+    SELECT 1 FROM (VALUES ('a')) v(area) WHERE v.area = 'a'
+)) FROM decoration_v v;
+----
+80.0
+
+query R
+SELECT AGGREGATE(revenue) FILTER (WHERE list_contains(list_transform(['a'], lambda area: area), v.area))
+FROM decoration_v v;
+----
+40.0
+
+# An unrelated nested FROM column does not hide an unqualified outer dimension.
+# The alias differs from its base expression, exposing accidental view-row binding.
+query R
+SELECT AGGREGATE(total) FILTER (WHERE EXISTS (
+    SELECT 1 FROM range(1) a(i) WHERE area = 1
+)) FROM decoration_scope_v;
+----
+30.0
+
+query R
+SELECT DISTINCT AGGREGATE(total) FILTER (WHERE EXISTS (
+    SELECT 1 FROM range(1) a(i) WHERE area = 1
+)) OVER () FROM decoration_scope_v;
+----
+30.0
+
+query R
+SELECT AGGREGATE(total) FILTER (WHERE EXISTS (
+    WITH permitted AS (SELECT i FROM range(1) r(i))
+    SELECT 1 FROM permitted WHERE area = 1
+)) FROM decoration_scope_v;
+----
+30.0
+
+query R
+SELECT AGGREGATE(total) FILTER (WHERE EXISTS (
+    SELECT 1 FROM decoration_scope_rows a WHERE area = 1 AND a.id = 1
+)) FROM decoration_scope_v;
+----
+30.0
+
+query R
+SELECT AGGREGATE(total) FILTER (WHERE EXISTS (
+    SELECT 1 FROM range(1) a(i) JOIN range(1) b(j) ON area = 1
+)) FROM decoration_scope_v;
+----
+30.0
+
+query R
+SELECT AGGREGATE(total) FILTER (WHERE EXISTS (
+    SELECT 1 FROM (SELECT area AS permitted_area) a WHERE permitted_area = 1
+)) FROM decoration_scope_v;
+----
+30.0
+
+# An actual local column of the same name must still shadow the view dimension.
+query R
+SELECT AGGREGATE(total) FILTER (WHERE EXISTS (
+    SELECT 1 FROM range(1) a(area) WHERE area = 0
+)) FROM decoration_scope_v;
+----
+70.0
+
+query R
+SELECT AGGREGATE(total) FILTER (WHERE EXISTS (
+    SELECT 1 FROM (VALUES (0)) a(area) WHERE EXISTS (
+        SELECT 1 FROM range(1) b(i) WHERE area = 0
+    )
+)) FROM decoration_scope_v;
+----
+70.0
+
+query R
+SELECT AGGREGATE(total) FILTER (WHERE EXISTS (
+    WITH permitted(area) AS (SELECT i FROM range(1) r(i))
+    SELECT 1 FROM permitted WHERE area = 0
+)) FROM decoration_scope_v;
+----
+70.0
+
+# Native state export and composite formula states both round-trip.
+query R
+SELECT finalize(state) FROM (SELECT AGGREGATE(revenue) EXPORT_STATE AS state FROM decoration_v);
+----
+80.0
+
+query R
+SELECT yardstick_finalize(state)
+FROM (SELECT AGGREGATE(ratio) EXPORT_STATE AS state FROM decoration_v);
+----
+20.0
+
+# The explicit query function uses the same catalog-aware decoration lowering.
+query R
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) FILTER (WHERE area = ''a'') FROM decoration_v');
+----
+40.0
+
+query R
+SELECT * FROM yardstick('SELECT DISTINCT AGGREGATE(revenue) OVER () AS total FROM decoration_v');
+----
+80.0
+
+query I
+SELECT AGGREGATE(row_count) FILTER (WHERE FALSE) FROM decoration_v;
+----
+0
+
+query I
+SELECT AGGREGATE(row_count) FILTER (WHERE TRUE) FROM decoration_v WHERE FALSE;
+----
+0
+
+query I
+SELECT yardstick_finalize(state)
+FROM (SELECT AGGREGATE(row_count) FILTER (WHERE TRUE) EXPORT_STATE AS state
+      FROM decoration_v WHERE FALSE);
+----
+0
+
+query I
+SELECT AGGREGATE(row_count) FILTER (WHERE TRUE) AT (ALL) FROM decoration_v WHERE FALSE;
+----
+5
+
+# Native DISTINCT states combine their already accumulated statistics; they do
+# not retain a set of values for deduplication between independent shards.
+query R
+WITH states AS (
+    SELECT area, AGGREGATE(DISTINCT revenue) EXPORT_STATE AS state
+    FROM decoration_v GROUP BY area
+)
+SELECT yardstick_finalize(yardstick_combine(a.state, b.state))
+FROM states a, states b WHERE a.area = 'a' AND b.area = 'b';
+----
+70.0
+
+endloop

@@ -3,6 +3,7 @@
 #include "yardstick_extension.hpp"
 #include "yardstick_parser_extension.hpp"
 #include "frontend_peg.hpp"
+#include "aggregate_state.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
@@ -38,7 +39,7 @@ extern "C" {
     void yardstick_free_create_view_info(YardstickCreateViewInfo* info);
     char* yardstick_replace_range(const char* sql, uint32_t start, uint32_t end, const char* replacement);
     char* yardstick_apply_replacements(const char* sql, const YardstickReplacement* replacements, size_t count);
-    char* yardstick_qualify_expression(const char* expr, const char* qualifier);
+    char* yardstick_qualify_expression(const char* expr, const char* qualifier, const char* dimension);
     void yardstick_free_string(char* ptr);
     char* yardstick_expand_aggregate_call(
         const char* measure_name,
@@ -89,7 +90,7 @@ extern "C" {
         void (*free_create_view_info)(YardstickCreateViewInfo*),
         char* (*replace_range)(const char*, uint32_t, uint32_t, const char*),
         char* (*apply_replacements)(const char*, const YardstickReplacement*, size_t),
-        char* (*qualify_expression)(const char*, const char*),
+        char* (*qualify_expression)(const char*, const char*, const char*),
         char* (*inline_order_by_subquery_aliases)(const char*),
         void (*free_string)(char*),
         char* (*expand_aggregate_call)(const char*, const char*, const YardstickAtModifier*, size_t, const char*, const char*, const char*, const char* const*, size_t),
@@ -99,7 +100,13 @@ extern "C" {
         int32_t (*expressions_equal)(const char*, const char*),
         YardstickQueryScopeList* (*find_query_scopes)(const char*),
         void (*free_query_scopes)(YardstickQueryScopeList*),
-        char* (*rewrite_visible_filter)(const char*, const char*, const char* const*, const char* const*, size_t, char**)
+        char* (*rewrite_visible_filter)(const char*, const char*, const char* const*, const char* const*, size_t, char**),
+        char* (*decorate_measure)(const char*, const char*, const char* const*, const char* const*, size_t,
+                                  const char* const*, size_t, const char* const*, size_t, char**),
+        char* (*window_marker)(const char*, const char*, char**),
+        char* (*rewrite_measure_windows)(const char*, const YardstickWindowSource*, size_t,
+                                         const YardstickWindowCall*, size_t, const char* const*, size_t,
+                                         const char* const*, size_t, char**)
     );
 }
 
@@ -145,12 +152,23 @@ struct YardstickQueryData : public TableFunctionData {
     bool done = false;
 };
 
+#if YARDSTICK_GRAMMAR_EXTENSION
+struct DeferredMeasureFunctionInfo : public TableFunctionInfo {
+    explicit DeferredMeasureFunctionInfo(shared_ptr<ParserExtensionInfo> parser_info_p)
+        : parser_info(std::move(parser_info_p)) {
+    }
+    shared_ptr<ParserExtensionInfo> parser_info;
+};
+#endif
+
 static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
                                                      TableFunctionBindInput &input,
                                                      vector<LogicalType> &return_types,
                                                      vector<YardstickColumnName> &names) {
 #if YARDSTICK_GRAMMAR_EXTENSION
-    NativeYardstickParseScope native_scope(nullptr, context.GetParserOptions());
+    NativeYardstickBindScope bind_scope(context);
+    auto &info = input.info->Cast<DeferredMeasureFunctionInfo>();
+    NativeYardstickParseScope native_scope(info.parser_info.get(), context.GetParserOptions());
 #endif
     auto data = make_uniq<YardstickQueryData>();
     data->original_sql = input.inputs[0].GetValue<string>();
@@ -1795,6 +1813,32 @@ static vector<unique_ptr<SQLStatement>> DeferMeasureColumnListBatch(const string
         if (StartsWithSemantic(sql, semantic_stripped)) {
             sql = std::move(semantic_stripped);
         }
+        auto inspect_calls = [&](const string &scope_sql) {
+            bool inspect_nested_scopes = false;
+            if (auto *calls = FindNativeYardstickAggregates(scope_sql.c_str())) {
+                for (size_t index = 0; index < calls->count; index++) {
+                    // Decorations need the originating catalog for aggregate
+                    // classification and star expansion before adding lineage.
+                    requires_binding |= calls->calls[index].has_decorations;
+                    inspect_nested_scopes |= calls->calls[index].modifier_count != 0;
+                }
+                yardstick_free_aggregate_list(calls);
+            } else {
+                inspect_nested_scopes = true;
+            }
+            return inspect_nested_scopes;
+        };
+        if (inspect_calls(sql) && !requires_binding) {
+            // AT modifier expressions can own nested queries that are absent
+            // from the enclosing call's marker AST. Inspect their native spans.
+            if (auto *scopes = FindNativeYardstickQueryScopes(sql.c_str())) {
+                for (size_t index = 0; index < scopes->count && !requires_binding; index++) {
+                    auto &scope = scopes->scopes[index];
+                    inspect_calls(sql.substr(scope.start_pos, scope.end_pos - scope.start_pos));
+                }
+                yardstick_free_query_scopes(scopes);
+            }
+        }
         if (!StartsWithCreateViewStatement(sql)) {
             continue;
         }
@@ -2236,13 +2280,6 @@ static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binde
     }
 }
 
-struct DeferredMeasureFunctionInfo : public TableFunctionInfo {
-    explicit DeferredMeasureFunctionInfo(shared_ptr<ParserExtensionInfo> parser_info_p)
-        : parser_info(std::move(parser_info_p)) {
-    }
-    shared_ptr<ParserExtensionInfo> parser_info;
-};
-
 static unique_ptr<TableRef> DeferredMeasureSelectBindReplace(ClientContext &context, TableFunctionBindInput &input) {
     auto &info = input.info->Cast<DeferredMeasureFunctionInfo>();
     NativeYardstickBindScope bind_scope(context);
@@ -2360,7 +2397,8 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
 //=============================================================================
 
 static void LoadInternal(ExtensionLoader &loader) {
-    // Initialize parser FFI function pointers in Rust (must be done first)
+    RegisterYardstickAggregateStateFunctions(loader);
+    // Initialize parser FFI function pointers before registering query entry points.
     yardstick_init_parser_ffi(
         yardstick_find_aggregates,
         yardstick_free_aggregate_list,
@@ -2382,7 +2420,10 @@ static void LoadInternal(ExtensionLoader &loader) {
         yardstick_expressions_equal,
         yardstick_find_query_scopes,
         yardstick_free_query_scopes,
-        yardstick_rewrite_visible_filter
+        yardstick_rewrite_visible_filter,
+        yardstick_decorate_measure,
+        yardstick_window_marker,
+        yardstick_rewrite_measure_windows
     );
 
     auto &db = loader.GetDatabaseInstance();
@@ -2413,9 +2454,15 @@ static void LoadInternal(ExtensionLoader &loader) {
     // Register table function for AGGREGATE() expansion
     TableFunction query_func("yardstick", {LogicalType::VARCHAR},
                              YardstickQueryFunction, YardstickQueryBind);
+#if YARDSTICK_GRAMMAR_EXTENSION
+    query_func.function_info = make_shared_ptr<DeferredMeasureFunctionInfo>(parser.parser_info);
+#endif
     loader.RegisterFunction(query_func);
     TableFunction query_func_with_warnings("yardstick", {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                            YardstickQueryFunction, YardstickQueryBind);
+#if YARDSTICK_GRAMMAR_EXTENSION
+    query_func_with_warnings.function_info = make_shared_ptr<DeferredMeasureFunctionInfo>(parser.parser_info);
+#endif
     loader.RegisterFunction(query_func_with_warnings);
 
 #if YARDSTICK_GRAMMAR_EXTENSION
