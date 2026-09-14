@@ -1,0 +1,104 @@
+# name: test/sql/native_aggregate_statements.test
+# description: Native aggregate discovery traverses statement query wrappers.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE native_statement_sales(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO native_statement_sales VALUES (2023, 10), (2023, 20), (2024, 50);
+
+statement ok
+CREATE VIEW native_statement_v AS
+SELECT year, SUM(amount) AS MEASURE revenue FROM native_statement_sales;
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+statement ok
+CREATE OR REPLACE TABLE native_statement_output AS
+SELECT year, AGGREGATE(revenue) AT (ALL) AS total FROM native_statement_v GROUP BY year;
+
+query IR rowsort
+SELECT * FROM native_statement_output;
+----
+2023	80.0
+2024	80.0
+
+statement ok
+CREATE OR REPLACE VIEW native_statement_totals AS
+SELECT year, AGGREGATE(revenue) AS total FROM native_statement_v GROUP BY year;
+
+query IR rowsort
+SELECT * FROM native_statement_totals;
+----
+2023	30.0
+2024	50.0
+
+statement ok
+DELETE FROM native_statement_output;
+
+statement ok
+WITH totals AS (
+    SELECT year, AGGREGATE(revenue) AS total FROM native_statement_v GROUP BY year
+)
+INSERT INTO native_statement_output SELECT * FROM totals;
+
+query IR rowsort
+SELECT * FROM native_statement_output;
+----
+2023	30.0
+2024	50.0
+
+# UPDATE traverses both its SET expression and condition subquery.
+statement ok
+UPDATE native_statement_output
+SET total = (SELECT AGGREGATE(revenue) AT (ALL) FROM native_statement_v)
+WHERE total < (SELECT AGGREGATE(revenue) FROM native_statement_v WHERE year = 2024);
+
+query IR rowsort
+SELECT * FROM native_statement_output;
+----
+2023	80.0
+2024	50.0
+
+# DELETE visits scalar subqueries inside the predicate.
+statement ok
+DELETE FROM native_statement_output
+WHERE total = (SELECT AGGREGATE(revenue) AT (ALL) FROM native_statement_v);
+
+query IR
+SELECT * FROM native_statement_output;
+----
+2024	50.0
+
+statement ok
+EXPLAIN SELECT AGGREGATE(revenue) AT (ALL) FROM native_statement_v;
+
+# EXPLAIN ANALYZE executes its wrapped INSERT, making its rewrite observable.
+statement ok
+EXPLAIN ANALYZE INSERT INTO native_statement_output
+SELECT 2025, AGGREGATE(revenue) AT (ALL) FROM native_statement_v;
+
+query IR rowsort
+SELECT * FROM native_statement_output;
+----
+2024	50.0
+2025	80.0
+
+statement ok
+COPY (SELECT AGGREGATE(revenue) AT (ALL) AS total FROM native_statement_v)
+TO '__TEST_DIR__/native_statement_totals.csv' (FORMAT CSV, HEADER);
+
+query R
+SELECT total FROM read_csv('__TEST_DIR__/native_statement_totals.csv');
+----
+80.0
+
+endloop

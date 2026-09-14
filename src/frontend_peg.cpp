@@ -1,6 +1,7 @@
 #include "frontend_peg.hpp"
 
 #if YARDSTICK_GRAMMAR_EXTENSION
+#include "native_statement_traversal.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -57,6 +58,7 @@ struct SyntaxCapture {
     bool has_measure = false;
     const string *source = nullptr;
     vector<NativeAtClause> clauses;
+    vector<unique_ptr<ParsedExpression>> modifier_expressions;
     struct Measure {
         string expression;
         string name;
@@ -208,7 +210,12 @@ ParseResult &UnwrapModifier(ParseResult &result) {
 
 string RenderExpression(PEGTransformer &transformer, ParseResult &result) {
     // Resolve syntax supplied by every active grammar before shared lowering.
-    return transformer.Transform<unique_ptr<ParsedExpression>>(result)->ToString();
+    auto expression = transformer.Transform<unique_ptr<ParsedExpression>>(result);
+    auto sql = expression->ToString();
+    // AT markers retain only their operand in the main AST. Keep modifier
+    // expressions alive for validation before rendering loses their structure.
+    active_capture->modifier_expressions.push_back(std::move(expression));
+    return sql;
 }
 
 string DimensionSource(ParseResult &result) {
@@ -964,6 +971,7 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
     if (!sql_p || !active_parse_scope || !active_parse_scope->available) {
         return nullptr;
     }
+    string semantic_error;
     try {
         string sql(sql_p);
         if (sql.size() > std::numeric_limits<uint32_t>::max() || Parser::NormalizeSQLString(sql) != sql) {
@@ -977,6 +985,41 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
         parser.ParseQuery(sql);
         if (capture.has_measure) {
             return nullptr;
+        }
+
+        // Validate every expression before source-span adaptation can choose
+        // compatibility lowering for a different operand in the same query.
+        std::function<void(unique_ptr<ParsedExpression> &)> validate_expression;
+        validate_expression = [&](unique_ptr<ParsedExpression> &expression) {
+            bool unsupported = false;
+            if (expression->GetExpressionClass() == ExpressionClass::WINDOW) {
+                auto &window = expression->Cast<WindowExpression>();
+                unsupported = StringUtil::CIEquals(window.FunctionName().GetIdentifierName(), "aggregate") &&
+                              window.GetArguments().size() == 1;
+            } else if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+                auto &function = expression->Cast<FunctionExpression>();
+                unsupported = StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate") &&
+                              function.GetArguments().size() == 1 &&
+                              (function.Distinct() || function.Filter() || function.ExportState() ||
+                               (function.OrderBy() && !function.OrderBy()->orders.empty()));
+            }
+            if (unsupported) {
+                semantic_error = "Yardstick AGGREGATE does not support DISTINCT, FILTER, ORDER BY, OVER, or EXPORT_STATE; "
+                                 "define aggregation behavior in AS MEASURE or use AT modifiers";
+                throw ParserException(semantic_error);
+            }
+            if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+                auto &subquery = expression->Cast<SubqueryExpression>();
+                ParsedExpressionIterator::EnumerateQueryNodeChildren(*subquery.SubqueryMutable()->node,
+                                                                     validate_expression);
+            }
+            ParsedExpressionIterator::EnumerateChildren(*expression, validate_expression);
+        };
+        for (auto &statement : parser.statements) {
+            EnumerateNativeStatementExpressions(*statement, validate_expression);
+        }
+        for (auto &expression : capture.modifier_expressions) {
+            validate_expression(expression);
         }
 
         struct Aggregate {
@@ -995,18 +1038,28 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             }
             return location;
         };
-        auto only_trivia = [&](idx_t start, idx_t end) {
-            // Parentheses are erased from the operand AST, while the marker's
-            // own location covers only AT (...). Validate that extending the
-            // function span does not consume an unmatched closing parenthesis.
-            // Tokens validate this source gap only; AST nodes discover calls.
-            auto gap = sql.substr(start, end - start);
-            vector<MatcherToken> tokens;
-            TokenizerBehavior behavior(gap, tokens);
-            active_parse_scope->ParserConfig().compiled_grammar->GetTokenizer().TokenizeInput(behavior);
-            return std::all_of(tokens.begin(), tokens.end(), [](const MatcherToken &token) {
-                return token.type == TokenType::COMMENT || token.type == TokenType::END_OF_INPUT;
-            });
+        vector<MatcherToken> source_tokens;
+        TokenizerBehavior token_behavior(sql, source_tokens);
+        active_parse_scope->ParserConfig().compiled_grammar->GetTokenizer().TokenizeInput(token_behavior);
+        source_tokens.erase(std::remove_if(source_tokens.begin(), source_tokens.end(), [](const MatcherToken &token) {
+            return token.type == TokenType::COMMENT || token.type == TokenType::END_OF_INPUT;
+        }), source_tokens.end());
+        auto extend_operand = [&](idx_t &start, idx_t end, idx_t suffix_start) {
+            // The AST erases grouping parentheses. Consume a closing parenthesis
+            // before AT only with its immediately enclosing opening parenthesis.
+            // Calls and suffix parentage still come exclusively from the AST.
+            auto first = std::lower_bound(source_tokens.begin(), source_tokens.end(), start,
+                [](const MatcherToken &token, idx_t offset) { return token.offset < offset; });
+            auto next = std::lower_bound(source_tokens.begin(), source_tokens.end(), end,
+                [](const MatcherToken &token, idx_t offset) { return token.offset < offset; });
+            while (next != source_tokens.end() && next->offset < suffix_start) {
+                if (next->text != ")" || first == source_tokens.begin() || (first - 1)->text != "(") {
+                    return false;
+                }
+                start = (--first)->offset;
+                ++next;
+            }
+            return next != source_tokens.end() && next->offset == suffix_start;
         };
         std::function<void(unique_ptr<ParsedExpression> &)> visit_expression;
         visit_expression = [&](unique_ptr<ParsedExpression> &expression) {
@@ -1032,21 +1085,11 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             }
 
             bool is_measure_call = false;
-            if (base->GetExpressionClass() == ExpressionClass::WINDOW &&
-                StringUtil::CIEquals(base->Cast<WindowExpression>().FunctionName().GetIdentifierName(), "aggregate")) {
-                throw ParserException("Windowed Yardstick aggregate requires compatibility lowering");
-            }
             if (base->GetExpressionClass() == ExpressionClass::FUNCTION) {
                 auto &function = base->Cast<FunctionExpression>();
                 is_measure_call = StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate") &&
                                   function.GetArguments().size() == 1;
                 if (is_measure_call) {
-                    if (function.Distinct() || function.Filter() || function.ExportState() ||
-                        (function.OrderBy() && !function.OrderBy()->orders.empty())) {
-                        // These decorations are not represented in this ABI.
-                        // Extending the call span must not silently discard them.
-                        throw ParserException("Decorated Yardstick aggregate requires compatibility lowering");
-                    }
                     auto call_location = source_range(function);
                     auto &argument = function.GetArguments()[0];
                     auto argument_location = source_range(argument.GetExpression());
@@ -1061,7 +1104,7 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
                     for (auto suffix = suffixes.rbegin(); suffix != suffixes.rend(); ++suffix) {
                         auto &clause = capture.clauses[*suffix];
                         if (clause.start < aggregate.end || clause.end > sql.size() ||
-                            !only_trivia(aggregate.end, clause.start)) {
+                            !extend_operand(aggregate.start, aggregate.end, clause.start)) {
                             throw ParserException("Invalid Yardstick AT source range");
                         }
                         aggregate.modifiers.insert(aggregate.modifiers.end(), clause.modifiers.begin(),
@@ -1085,13 +1128,9 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             ParsedExpressionIterator::EnumerateChildren(*base, visit_expression);
         };
         for (auto &statement : parser.statements) {
-            if (statement->type != StatementType::SELECT_STATEMENT) {
-                // Do not report a successful partial traversal of other statement
-                // kinds. Their existing compatibility path remains available.
+            if (!EnumerateNativeStatementExpressions(*statement, visit_expression)) {
                 return nullptr;
             }
-            ParsedExpressionIterator::EnumerateQueryNodeChildren(*statement->Cast<SelectStatement>().node,
-                                                                 visit_expression);
         }
         std::sort(aggregates.begin(), aggregates.end(), [](const Aggregate &left, const Aggregate &right) {
             return left.start < right.start;
@@ -1147,6 +1186,12 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
         }
         return result.release();
     } catch (const std::exception &) {
+        if (!semantic_error.empty()) {
+            auto *result = new YardstickAggregateCallList {};
+            result->native_parsed = true;
+            result->error = strdup(semantic_error.c_str());
+            return result;
+        }
         return nullptr;
     }
 }
