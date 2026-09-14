@@ -971,7 +971,7 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
     if (!sql_p || !active_parse_scope || !active_parse_scope->available) {
         return nullptr;
     }
-    string semantic_error;
+    bool found_decorated_call = false;
     try {
         string sql(sql_p);
         if (sql.size() > std::numeric_limits<uint32_t>::max() || Parser::NormalizeSQLString(sql) != sql) {
@@ -987,46 +987,14 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             return nullptr;
         }
 
-        // Validate every expression before source-span adaptation can choose
-        // compatibility lowering for a different operand in the same query.
-        std::function<void(unique_ptr<ParsedExpression> &)> validate_expression;
-        validate_expression = [&](unique_ptr<ParsedExpression> &expression) {
-            bool unsupported = false;
-            if (expression->GetExpressionClass() == ExpressionClass::WINDOW) {
-                auto &window = expression->Cast<WindowExpression>();
-                unsupported = StringUtil::CIEquals(window.FunctionName().GetIdentifierName(), "aggregate") &&
-                              window.GetArguments().size() == 1;
-            } else if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
-                auto &function = expression->Cast<FunctionExpression>();
-                unsupported = StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate") &&
-                              function.GetArguments().size() == 1 &&
-                              (function.Distinct() || function.Filter() || function.ExportState() ||
-                               (function.OrderBy() && !function.OrderBy()->orders.empty()));
-            }
-            if (unsupported) {
-                semantic_error = "Yardstick AGGREGATE does not support DISTINCT, FILTER, ORDER BY, OVER, or EXPORT_STATE; "
-                                 "define aggregation behavior in AS MEASURE or use AT modifiers";
-                throw ParserException(semantic_error);
-            }
-            if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
-                auto &subquery = expression->Cast<SubqueryExpression>();
-                ParsedExpressionIterator::EnumerateQueryNodeChildren(*subquery.SubqueryMutable()->node,
-                                                                     validate_expression);
-            }
-            ParsedExpressionIterator::EnumerateChildren(*expression, validate_expression);
-        };
-        for (auto &statement : parser.statements) {
-            EnumerateNativeStatementExpressions(*statement, validate_expression);
-        }
-        for (auto &expression : capture.modifier_expressions) {
-            validate_expression(expression);
-        }
-
         struct Aggregate {
             string measure;
             idx_t start;
             idx_t end;
             vector<NativeModifier> modifiers;
+            string call_sql;
+            bool is_window;
+            bool has_decorations;
         };
         vector<Aggregate> aggregates;
         vector<bool> used_clauses(capture.clauses.size(), false);
@@ -1084,35 +1052,50 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
                 base = arguments[0].GetExpressionMutable().get();
             }
 
-            bool is_measure_call = false;
+            const vector<FunctionArgument> *arguments = nullptr;
+            bool is_window = false;
+            bool has_decorations = false;
             if (base->GetExpressionClass() == ExpressionClass::FUNCTION) {
                 auto &function = base->Cast<FunctionExpression>();
-                is_measure_call = StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate") &&
-                                  function.GetArguments().size() == 1;
-                if (is_measure_call) {
-                    auto call_location = source_range(function);
-                    auto &argument = function.GetArguments()[0];
-                    auto argument_location = source_range(argument.GetExpression());
-                    if (argument.HasName() || argument_location.Start() < call_location.Start() ||
-                        argument_location.End() > call_location.End()) {
-                        throw ParserException("Unsupported Yardstick aggregate argument source");
-                    }
-                    Aggregate aggregate {sql.substr(argument_location.Start(), argument_location.length),
-                                         call_location.Start(), call_location.End(), {}};
-                    // AST parents run from the last suffix back to the first.
-                    // Modifier application retains the original SQL order.
-                    for (auto suffix = suffixes.rbegin(); suffix != suffixes.rend(); ++suffix) {
-                        auto &clause = capture.clauses[*suffix];
-                        if (clause.start < aggregate.end || clause.end > sql.size() ||
-                            !extend_operand(aggregate.start, aggregate.end, clause.start)) {
-                            throw ParserException("Invalid Yardstick AT source range");
-                        }
-                        aggregate.modifiers.insert(aggregate.modifiers.end(), clause.modifiers.begin(),
-                                                   clause.modifiers.end());
-                        aggregate.end = clause.end;
-                    }
-                    aggregates.push_back(std::move(aggregate));
+                if (StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate")) {
+                    arguments = &function.GetArguments();
+                    has_decorations = function.Distinct() || function.Filter() || function.ExportState() ||
+                                      (function.OrderBy() && !function.OrderBy()->orders.empty());
                 }
+            } else if (base->GetExpressionClass() == ExpressionClass::WINDOW) {
+                auto &window = base->Cast<WindowExpression>();
+                if (StringUtil::CIEquals(window.FunctionName().GetIdentifierName(), "aggregate")) {
+                    arguments = &window.GetArguments();
+                    is_window = true;
+                    has_decorations = true;
+                }
+            }
+            bool is_measure_call = arguments && arguments->size() == 1;
+            if (is_measure_call) {
+                found_decorated_call |= has_decorations;
+                auto call_location = source_range(*base);
+                auto &argument = (*arguments)[0];
+                auto argument_location = source_range(argument.GetExpression());
+                if (argument.HasName() || argument_location.Start() < call_location.Start() ||
+                    argument_location.End() > call_location.End()) {
+                    throw ParserException("Unsupported Yardstick aggregate argument source");
+                }
+                Aggregate aggregate {sql.substr(argument_location.Start(), argument_location.length),
+                                     call_location.Start(), call_location.End(), {}, base->ToString(),
+                                     is_window, has_decorations};
+                // AST parents run from the last suffix back to the first.
+                // Modifier application retains the original SQL order.
+                for (auto suffix = suffixes.rbegin(); suffix != suffixes.rend(); ++suffix) {
+                    auto &clause = capture.clauses[*suffix];
+                    if (clause.start < aggregate.end || clause.end > sql.size() ||
+                        !extend_operand(aggregate.start, aggregate.end, clause.start)) {
+                        throw ParserException("Invalid Yardstick AT source range");
+                    }
+                    aggregate.modifiers.insert(aggregate.modifiers.end(), clause.modifiers.begin(),
+                                               clause.modifiers.end());
+                    aggregate.end = clause.end;
+                }
+                aggregates.push_back(std::move(aggregate));
             }
             if (!suffixes.empty() && !is_measure_call) {
                 // Shorthand AT expressions still use compatibility lowering.
@@ -1166,6 +1149,9 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             auto &source = aggregates[i];
             auto &call = result->calls[i];
             call.measure_name = duplicate(source.measure);
+            call.call_sql = duplicate(source.call_sql);
+            call.is_window = source.is_window;
+            call.has_decorations = source.has_decorations;
             call.start_pos = static_cast<uint32_t>(source.start);
             call.end_pos = static_cast<uint32_t>(source.end);
             if (!source.modifiers.empty()) {
@@ -1185,11 +1171,11 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             }
         }
         return result.release();
-    } catch (const std::exception &) {
-        if (!semantic_error.empty()) {
+    } catch (const std::exception &error) {
+        if (found_decorated_call) {
             auto *result = new YardstickAggregateCallList {};
             result->native_parsed = true;
-            result->error = strdup(semantic_error.c_str());
+            result->error = strdup(error.what());
             return result;
         }
         return nullptr;

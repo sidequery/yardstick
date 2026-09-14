@@ -60,6 +60,9 @@ pub struct YardstickAggregateCall {
     pub end_pos: u32,
     pub modifiers: *mut YardstickAtModifier,
     pub modifier_count: usize,
+    pub call_sql: *const c_char,
+    pub is_window: bool,
+    pub has_decorations: bool,
 }
 
 /// List of AGGREGATE() calls found in SQL
@@ -70,6 +73,43 @@ pub struct YardstickAggregateCallList {
     pub count: usize,
     pub error: *const c_char,
     pub native_parsed: bool,
+}
+
+#[repr(C)]
+pub struct YardstickWindowSource {
+    key: *const c_char,
+    relation_name: *const c_char,
+    alias: *const c_char,
+    clean_select_sql: *const c_char,
+    grouped: bool,
+    dimension_names: *const *const c_char,
+    dimension_expressions: *const *const c_char,
+    dimension_count: usize,
+}
+
+#[repr(C)]
+pub struct YardstickWindowCall {
+    marker_name: *const c_char,
+    source_key: *const c_char,
+    expression_sql: *const c_char,
+    modifiers: *const YardstickAtModifier,
+    modifier_count: usize,
+}
+
+pub struct WindowSource {
+    pub key: String,
+    pub relation_name: String,
+    pub alias: String,
+    pub clean_select_sql: String,
+    pub grouped: bool,
+    pub dimensions: std::collections::HashMap<String, String>,
+}
+
+pub struct WindowCall {
+    pub marker_name: String,
+    pub source_key: String,
+    pub expression_sql: String,
+    pub modifiers: Vec<AtModifier>,
 }
 
 /// Information about a single SELECT item
@@ -84,6 +124,7 @@ pub struct YardstickSelectItem {
     pub is_star: bool,
     pub is_measure_ref: bool,
     pub contains_subquery: bool,
+    pub contains_window: bool,
     pub reference_column: *const c_char,
     pub reference_qualifier: *const c_char,
     pub subquery_dimensions: *const *const c_char,
@@ -418,9 +459,20 @@ type FnParseCreateView = unsafe extern "C" fn(*const c_char) -> *mut YardstickCr
 type FnFreeCreateViewInfo = unsafe extern "C" fn(*mut YardstickCreateViewInfo);
 type FnReplaceRange = unsafe extern "C" fn(*const c_char, u32, u32, *const c_char) -> *mut c_char;
 type FnApplyReplacements = unsafe extern "C" fn(*const c_char, *const YardstickReplacement, usize) -> *mut c_char;
-type FnQualifyExpression = unsafe extern "C" fn(*const c_char, *const c_char) -> *mut c_char;
+type FnQualifyExpression = unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> *mut c_char;
 type FnInlineOrderBySubqueryAliases = unsafe extern "C" fn(*const c_char) -> *mut c_char;
 type FnFreeString = unsafe extern "C" fn(*mut c_char);
+type FnDecorateMeasure = unsafe extern "C" fn(
+    *const c_char, *const c_char, *const *const c_char, *const *const c_char, usize,
+    *const *const c_char, usize, *mut *mut c_char,
+) -> *mut c_char;
+type FnWindowMarker = unsafe extern "C" fn(*const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
+type FnRewriteMeasureWindows = unsafe extern "C" fn(
+    *const c_char, *const YardstickWindowSource, usize, *const YardstickWindowCall, usize, *mut *mut c_char,
+) -> *mut c_char;
+static FN_DECORATE_MEASURE: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_WINDOW_MARKER: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_REWRITE_MEASURE_WINDOWS: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 type FnExpandAggregateCall = unsafe extern "C" fn(
     *const c_char, *const c_char, *const YardstickAtModifier, usize,
     *const c_char, *const c_char, *const c_char, *const *const c_char, usize
@@ -466,6 +518,9 @@ pub extern "C" fn yardstick_init_parser_ffi(
     find_query_scopes: FnFindQueryScopes,
     free_query_scopes: FnFreeQueryScopes,
     rewrite_visible_filter: FnRewriteVisibleFilter,
+    decorate_measure: FnDecorateMeasure,
+    window_marker: FnWindowMarker,
+    rewrite_measure_windows: FnRewriteMeasureWindows,
 ) {
     FN_FIND_AGGREGATES.store(find_aggregates as *mut (), Ordering::SeqCst);
     FN_FREE_AGGREGATE_LIST.store(free_aggregate_list as *mut (), Ordering::SeqCst);
@@ -488,6 +543,218 @@ pub extern "C" fn yardstick_init_parser_ffi(
     FN_FIND_QUERY_SCOPES.store(find_query_scopes as *mut (), Ordering::SeqCst);
     FN_FREE_QUERY_SCOPES.store(free_query_scopes as *mut (), Ordering::SeqCst);
     FN_REWRITE_VISIBLE_FILTER.store(rewrite_visible_filter as *mut (), Ordering::SeqCst);
+    FN_DECORATE_MEASURE.store(decorate_measure as *mut (), Ordering::SeqCst);
+    FN_WINDOW_MARKER.store(window_marker as *mut (), Ordering::SeqCst);
+    FN_REWRITE_MEASURE_WINDOWS.store(rewrite_measure_windows as *mut (), Ordering::SeqCst);
+}
+
+unsafe fn owned_rewrite_result(result: *mut c_char, error: *mut c_char) -> Result<String, String> {
+    if !error.is_null() {
+        let message = CStr::from_ptr(error).to_string_lossy().into_owned();
+        yardstick_free_string(error);
+        if !result.is_null() {
+            yardstick_free_string(result);
+        }
+        return Err(message);
+    }
+    if result.is_null() {
+        return Err("Native aggregate rewrite is unavailable".to_string());
+    }
+    let sql = CStr::from_ptr(result).to_string_lossy().into_owned();
+    yardstick_free_string(result);
+    Ok(sql)
+}
+
+pub fn decorate_measure(
+    expression: &str,
+    call_sql: &str,
+    dimensions: &std::collections::HashMap<String, String>,
+    qualifiers: &[String],
+) -> Result<String, String> {
+    let function = FN_DECORATE_MEASURE.load(Ordering::SeqCst);
+    if function.is_null() {
+        return Err("Native aggregate rewrite is unavailable".to_string());
+    }
+    let string = |value: &str| CString::new(value).map_err(|error| error.to_string());
+    let expression = string(expression)?;
+    let call_sql = string(call_sql)?;
+    let entries: Vec<_> = dimensions.iter().collect();
+    let names = entries
+        .iter()
+        .map(|(name, _)| string(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = entries
+        .iter()
+        .map(|(_, value)| string(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let qualifiers = qualifiers
+        .iter()
+        .map(|value| string(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let names: Vec<_> = names.iter().map(|value| value.as_ptr()).collect();
+    let values: Vec<_> = values.iter().map(|value| value.as_ptr()).collect();
+    let qualifier_ptrs: Vec<_> = qualifiers.iter().map(|value| value.as_ptr()).collect();
+    unsafe {
+        let function: FnDecorateMeasure = std::mem::transmute(function);
+        let mut error = ptr::null_mut();
+        let result = function(
+            expression.as_ptr(),
+            call_sql.as_ptr(),
+            names.as_ptr(),
+            values.as_ptr(),
+            names.len(),
+            qualifier_ptrs.as_ptr(),
+            qualifier_ptrs.len(),
+            &mut error,
+        );
+        owned_rewrite_result(result, error)
+    }
+}
+
+pub fn window_marker(call_sql: &str, marker: &str) -> Result<String, String> {
+    let function = FN_WINDOW_MARKER.load(Ordering::SeqCst);
+    if function.is_null() {
+        return Err("Native window rewrite is unavailable".to_string());
+    }
+    let call_sql = CString::new(call_sql).map_err(|error| error.to_string())?;
+    let marker = CString::new(marker).map_err(|error| error.to_string())?;
+    unsafe {
+        let function: FnWindowMarker = std::mem::transmute(function);
+        let mut error = ptr::null_mut();
+        let result = function(call_sql.as_ptr(), marker.as_ptr(), &mut error);
+        owned_rewrite_result(result, error)
+    }
+}
+
+pub fn rewrite_measure_windows(
+    sql: &str,
+    sources: &[WindowSource],
+    calls: &[WindowCall],
+) -> Result<String, String> {
+    let function = FN_REWRITE_MEASURE_WINDOWS.load(Ordering::SeqCst);
+    if function.is_null() {
+        return Err("Native window rewrite is unavailable".to_string());
+    }
+    let string = |value: &str| CString::new(value).map_err(|error| error.to_string());
+    let sql = string(sql)?;
+    struct SourceStrings {
+        key: CString,
+        relation: CString,
+        alias: CString,
+        query: CString,
+        names: Vec<CString>,
+        expressions: Vec<CString>,
+    }
+    let mut source_strings = Vec::new();
+    for source in sources {
+        let entries: Vec<_> = source.dimensions.iter().collect();
+        source_strings.push(SourceStrings {
+            key: string(&source.key)?,
+            relation: string(&source.relation_name)?,
+            alias: string(&source.alias)?,
+            query: string(&source.clean_select_sql)?,
+            names: entries
+                .iter()
+                .map(|(name, _)| string(name))
+                .collect::<Result<_, _>>()?,
+            expressions: entries
+                .iter()
+                .map(|(_, expression)| string(expression))
+                .collect::<Result<_, _>>()?,
+        });
+    }
+    let dimension_names: Vec<Vec<_>> = source_strings
+        .iter()
+        .map(|source| source.names.iter().map(|name| name.as_ptr()).collect())
+        .collect();
+    let dimension_expressions: Vec<Vec<_>> = source_strings
+        .iter()
+        .map(|source| {
+            source
+                .expressions
+                .iter()
+                .map(|expression| expression.as_ptr())
+                .collect()
+        })
+        .collect();
+    let source_info: Vec<_> = source_strings
+        .iter()
+        .enumerate()
+        .map(|(index, source)| YardstickWindowSource {
+            key: source.key.as_ptr(),
+            relation_name: source.relation.as_ptr(),
+            alias: source.alias.as_ptr(),
+            clean_select_sql: source.query.as_ptr(),
+            grouped: sources[index].grouped,
+            dimension_names: dimension_names[index].as_ptr(),
+            dimension_expressions: dimension_expressions[index].as_ptr(),
+            dimension_count: source.names.len(),
+        })
+        .collect();
+    struct CallStrings {
+        marker: CString,
+        source: CString,
+        expression: CString,
+        dimensions: Vec<CString>,
+        values: Vec<CString>,
+    }
+    let mut call_strings = Vec::new();
+    for call in calls {
+        call_strings.push(CallStrings {
+            marker: string(&call.marker_name)?,
+            source: string(&call.source_key)?,
+            expression: string(&call.expression_sql)?,
+            dimensions: call
+                .modifiers
+                .iter()
+                .map(|modifier| string(modifier.dimension.as_deref().unwrap_or("")))
+                .collect::<Result<_, _>>()?,
+            values: call
+                .modifiers
+                .iter()
+                .map(|modifier| string(modifier.value.as_deref().unwrap_or("")))
+                .collect::<Result<_, _>>()?,
+        });
+    }
+    let modifiers: Vec<Vec<_>> = calls
+        .iter()
+        .zip(&call_strings)
+        .map(|(call, strings)| {
+            call.modifiers
+                .iter()
+                .enumerate()
+                .map(|(index, modifier)| YardstickAtModifier {
+                    at_type: modifier.modifier_type.clone().into(),
+                    dimension: strings.dimensions[index].as_ptr(),
+                    value: strings.values[index].as_ptr(),
+                })
+                .collect()
+        })
+        .collect();
+    let call_info: Vec<_> = call_strings
+        .iter()
+        .enumerate()
+        .map(|(index, call)| YardstickWindowCall {
+            marker_name: call.marker.as_ptr(),
+            source_key: call.source.as_ptr(),
+            expression_sql: call.expression.as_ptr(),
+            modifiers: modifiers[index].as_ptr(),
+            modifier_count: modifiers[index].len(),
+        })
+        .collect();
+    unsafe {
+        let function: FnRewriteMeasureWindows = std::mem::transmute(function);
+        let mut error = ptr::null_mut();
+        let result = function(
+            sql.as_ptr(),
+            source_info.as_ptr(),
+            source_info.len(),
+            call_info.as_ptr(),
+            call_info.len(),
+            &mut error,
+        );
+        owned_rewrite_result(result, error)
+    }
 }
 
 // Helper macros to call function pointers
@@ -669,6 +936,9 @@ pub struct AggregateCall {
     pub start_pos: u32,
     pub end_pos: u32,
     pub modifiers: Vec<AtModifier>,
+    pub call_sql: Option<String>,
+    pub is_window: bool,
+    pub has_decorations: bool,
 }
 
 /// Safe wrapper for SELECT item information
@@ -682,6 +952,7 @@ pub struct SelectItem {
     pub is_star: bool,
     pub is_measure_ref: bool,
     pub contains_subquery: bool,
+    pub contains_window: bool,
     pub reference_column: Option<String>,
     pub reference_qualifier: Option<String>,
     pub subquery_dimensions: Vec<String>,
@@ -869,6 +1140,9 @@ pub(crate) fn find_aggregates_with_source(
                 start_pos: call.start_pos,
                 end_pos: call.end_pos,
                 modifiers,
+                call_sql: c_str_to_string(call.call_sql),
+                is_window: call.is_window,
+                has_decorations: call.has_decorations,
             });
         }
 
@@ -922,6 +1196,7 @@ pub fn parse_select(sql: &str) -> Result<SelectInfo, String> {
                 is_star: item.is_star,
                 is_measure_ref: item.is_measure_ref,
                 contains_subquery: item.contains_subquery,
+                contains_window: item.contains_window,
                 reference_column: c_str_to_string(item.reference_column),
                 reference_qualifier: c_str_to_string(item.reference_qualifier),
                 subquery_dimensions: (0..item.subquery_dimension_count)
@@ -1169,13 +1444,33 @@ pub fn qualify_expression(expr: &str, qualifier: &str) -> Result<String, String>
 
     unsafe {
         let f: FnQualifyExpression = std::mem::transmute(fn_ptr);
-        let result_ptr = f(expr_ptr.as_ptr(), qualifier_ptr.as_ptr());
+        let result_ptr = f(expr_ptr.as_ptr(), qualifier_ptr.as_ptr(), ptr::null());
         if result_ptr.is_null() {
             return Err("Failed to qualify expression".to_string());
         }
         let result = c_str_to_string(result_ptr).unwrap_or_default();
         yardstick_free_string(result_ptr);
         Ok(result)
+    }
+}
+
+pub fn qualify_outer_dimension(expr: &str, qualifier: &str, dimension: &str) -> Option<String> {
+    let function = FN_QUALIFY_EXPRESSION.load(Ordering::SeqCst);
+    if function.is_null() {
+        return None;
+    }
+    let expr = CString::new(expr).ok()?;
+    let qualifier = CString::new(qualifier).ok()?;
+    let dimension = CString::new(dimension).ok()?;
+    unsafe {
+        let function: FnQualifyExpression = std::mem::transmute(function);
+        let result = function(expr.as_ptr(), qualifier.as_ptr(), dimension.as_ptr());
+        if result.is_null() {
+            return None;
+        }
+        let rewritten = c_str_to_string(result);
+        yardstick_free_string(result);
+        rewritten
     }
 }
 

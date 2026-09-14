@@ -1,0 +1,580 @@
+# name: test/sql/native_aggregate_windows.test
+# description: Measure windows preserve SQL frames and original base-row identity.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE measure_window_rows(id INTEGER, yr INTEGER, region VARCHAR, amount INTEGER, units INTEGER);
+
+statement ok
+INSERT INTO measure_window_rows VALUES
+    (1, 2022, 'A', 10, 1), (2, 2022, 'A', 30, 3),
+    (3, 2023, 'A', 100, 2), (4, 2024, 'B', 200, 4),
+    (5, 2024, 'B', 200, 4), (6, 2025, NULL, 60, 2);
+
+statement ok
+CREATE TABLE measure_window_left(id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO measure_window_left VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE TABLE measure_window_right(id INTEGER);
+
+statement ok
+INSERT INTO measure_window_right VALUES (10), (20);
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+statement ok
+CREATE OR REPLACE VIEW measure_window_raw AS
+SELECT id, yr, region,
+       SUM(amount) AS MEASURE revenue,
+       AVG(amount) AS MEASURE mean_amount,
+       SUM(amount)::DOUBLE / SUM(units) AS MEASURE unit_price,
+       COUNT(*) AS MEASURE row_count,
+       LIST(amount) AS MEASURE amounts
+FROM measure_window_rows;
+
+statement ok
+CREATE OR REPLACE VIEW measure_window_grouped AS
+SELECT yr, region,
+       SUM(amount) AS MEASURE revenue,
+       AVG(amount) AS MEASURE mean_amount,
+       SUM(amount)::DOUBLE / SUM(units) AS MEASURE unit_price,
+       COUNT(DISTINCT amount) AS MEASURE distinct_amounts
+FROM measure_window_rows
+GROUP BY yr, region;
+
+# ROWS counts visible rows, while evaluation recomputes the measure over the
+# original rows selected by the frame.
+query II
+SELECT id, AGGREGATE(revenue) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS running
+FROM measure_window_raw ORDER BY id;
+----
+1	10
+2	40
+3	130
+4	300
+5	400
+6	260
+
+# GROUPS retains peers; NULL partition keys are ordinary partition values.
+query II
+SELECT id, AGGREGATE(revenue) OVER (PARTITION BY region ORDER BY yr GROUPS CURRENT ROW)
+FROM measure_window_raw ORDER BY id;
+----
+1	40
+2	40
+3	100
+4	400
+5	400
+6	60
+
+query II
+SELECT id, AGGREGATE(revenue) OVER (ORDER BY yr RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM measure_window_raw ORDER BY id;
+----
+1	40
+2	40
+3	140
+4	500
+5	500
+6	460
+
+query II
+SELECT id, AGGREGATE(revenue) OVER (ORDER BY id ROWS BETWEEN (id % 2) PRECEDING AND CURRENT ROW)
+FROM measure_window_raw ORDER BY id;
+----
+1	10
+2	30
+3	130
+4	200
+5	400
+6	60
+
+query II
+SELECT id, AGGREGATE(revenue) OVER (ORDER BY yr GROUPS CURRENT ROW EXCLUDE TIES)
+FROM measure_window_raw ORDER BY id;
+----
+1	10
+2	30
+3	100
+4	200
+5	200
+6	60
+
+# Empty frames use the defining aggregate's empty-input behavior.
+query III
+SELECT id,
+       AGGREGATE(row_count) OVER (ORDER BY id ROWS CURRENT ROW EXCLUDE CURRENT ROW),
+       AGGREGATE(revenue) OVER (ORDER BY id ROWS CURRENT ROW EXCLUDE CURRENT ROW)
+FROM measure_window_raw ORDER BY id;
+----
+1	0	NULL
+2	0	NULL
+3	0	NULL
+4	0	NULL
+5	0	NULL
+6	0	NULL
+
+# Original identical values remain two independent rows.
+query I
+SELECT AGGREGATE(revenue) OVER () AS total
+FROM measure_window_raw LIMIT 1;
+----
+600
+
+# DISTINCT belongs to the defining aggregate leaves, separately from identity
+# deduplication used to make measures immune to join fanout.
+query I
+SELECT AGGREGATE(DISTINCT revenue) OVER () AS total
+FROM measure_window_raw LIMIT 1;
+----
+400
+
+query I
+SELECT AGGREGATE(revenue) FILTER (WHERE region = 'A') OVER () AS total
+FROM measure_window_raw LIMIT 1;
+----
+140
+
+# A window call FILTER selects input rows before measure evaluation. It may
+# reference an outer joined relation, and leaves output row count unchanged.
+query III
+SELECT v.id, j.copy,
+       AGGREGATE(v.revenue) FILTER (WHERE j.copy = 1)
+           OVER (ORDER BY v.id, j.copy ROWS UNBOUNDED PRECEDING)
+FROM measure_window_raw v CROSS JOIN range(2) j(copy)
+WHERE v.id <= 2 ORDER BY v.id, j.copy;
+----
+1	0	NULL
+1	1	10
+2	0	10
+2	1	40
+
+query II
+SELECT AGGREGATE(row_count) FILTER (WHERE false) OVER (),
+       AGGREGATE(revenue) FILTER (WHERE false) OVER ()
+FROM measure_window_raw LIMIT 1;
+----
+0	NULL
+
+query I
+SELECT AGGREGATE(revenue) FILTER (WHERE false) OVER () AT (ALL)
+FROM measure_window_raw LIMIT 1;
+----
+600
+
+# A lambda parameter belongs to its lambda, even when a source dimension has
+# the same name. Nested relations likewise retain their own local columns.
+query I
+SELECT AGGREGATE(revenue) FILTER (
+    WHERE list_contains(list_transform([1], lambda yr: yr), 1)
+) OVER () FROM measure_window_raw LIMIT 1;
+----
+600
+
+query I
+SELECT AGGREGATE(revenue) FILTER (
+    WHERE EXISTS (SELECT 1 FROM (VALUES ('A')) a(region) WHERE a.region = measure_window_raw.region)
+) OVER () FROM measure_window_raw LIMIT 1;
+----
+140
+
+# Unqualified names capture the outer source only when the nested relation does
+# not define that name.
+query I
+SELECT AGGREGATE(revenue) FILTER (
+    WHERE EXISTS (SELECT 1 FROM (VALUES (1)) a(dummy) WHERE yr = 2022)
+) OVER () FROM measure_window_raw LIMIT 1;
+----
+40
+
+query I
+SELECT AGGREGATE(revenue) FILTER (
+    WHERE EXISTS (SELECT 1 FROM (VALUES ('A')) a(region) WHERE region = 'A')
+) OVER () FROM measure_window_raw LIMIT 1;
+----
+600
+
+query T
+SELECT AGGREGATE(amounts ORDER BY id DESC) OVER () AS ordered_amounts
+FROM measure_window_raw LIMIT 1;
+----
+[60, 200, 200, 100, 30, 10]
+
+# Grouped view rows carry different numbers of base rows: neither averaging
+# averages nor adding derived ratios produces these results.
+query IRR
+SELECT yr,
+       AGGREGATE(mean_amount) OVER (ORDER BY yr ROWS BETWEEN 1 PRECEDING AND CURRENT ROW),
+       AGGREGATE(unit_price) OVER (ORDER BY yr ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM measure_window_grouped ORDER BY yr;
+----
+2022	20.000	10.000
+2023	46.667	23.333
+2024	166.667	50.000
+2025	153.333	46.000
+
+query II
+SELECT yr, AGGREGATE(distinct_amounts) OVER (ORDER BY yr ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM measure_window_grouped ORDER BY yr;
+----
+2022	2
+2023	3
+2024	2
+2025	2
+
+query I
+SELECT AGGREGATE(revenue) FILTER (WHERE region = 'A') OVER ()
+FROM measure_window_grouped LIMIT 1;
+----
+140
+
+query TI
+SELECT region, AGGREGATE(revenue) FILTER (WHERE count(*) > 2) OVER ()
+FROM measure_window_raw GROUP BY region ORDER BY region NULLS LAST;
+----
+A	140
+B	140
+NULL	140
+
+# A multiplying join repeats a reference to the same original rows. It changes
+# the SQL frame's row count, but does not inflate a measure's base-row set.
+query III
+SELECT v.yr, j.copy,
+       AGGREGATE(v.revenue) OVER (ORDER BY v.yr, j.copy ROWS UNBOUNDED PRECEDING)
+FROM measure_window_grouped v CROSS JOIN range(2) j(copy)
+ORDER BY v.yr, j.copy;
+----
+2022	0	40
+2022	1	40
+2023	0	140
+2023	1	140
+2024	0	540
+2024	1	540
+2025	0	600
+2025	1	600
+
+# A grouped consumer first forms its groups, then applies the SQL window.
+query TI
+SELECT region, AGGREGATE(revenue) OVER (ORDER BY region NULLS LAST ROWS UNBOUNDED PRECEDING)
+FROM measure_window_raw GROUP BY region ORDER BY region NULLS LAST;
+----
+A	140
+B	540
+NULL	600
+
+query I
+SELECT AGGREGATE(revenue) OVER () FROM measure_window_raw GROUP BY ();
+----
+600
+
+query TII
+SELECT region, COUNT(*) AS visible_rows,
+       AGGREGATE(revenue) OVER (ORDER BY region NULLS LAST ROWS UNBOUNDED PRECEDING)
+FROM measure_window_raw GROUP BY region ORDER BY region NULLS LAST;
+----
+A	3	140
+B	2	540
+NULL	1	600
+
+query TI
+SELECT region, AGGREGATE(revenue) OVER ()
+FROM measure_window_raw GROUP BY ALL ORDER BY region NULLS LAST;
+----
+A	600
+B	600
+NULL	600
+
+# Aggregate classification comes from DuckDB's catalog, including aggregates
+# beyond Yardstick's original built-in name list.
+query IR
+SELECT AGGREGATE(revenue) OVER (), product(id) FROM measure_window_raw;
+----
+600	720.000
+
+# Input names take priority inside expressions and window specifications.
+# A bare final ORDER BY alias still denotes the output column.
+query II
+SELECT -id AS id, AGGREGATE(revenue) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING)
+FROM measure_window_raw ORDER BY id;
+----
+-6	600
+-5	540
+-4	340
+-3	140
+-2	40
+-1	10
+
+# Reusing a window-result alias must happen after the window stage.
+query III
+SELECT AGGREGATE(revenue) OVER () AS total, total + 1 AS plus, plus + 1 AS again
+FROM measure_window_raw LIMIT 1;
+----
+600	601	602
+
+query II
+SELECT id, AGGREGATE(revenue) OVER () AS total
+FROM measure_window_raw ORDER BY total + id DESC LIMIT 2;
+----
+6	600
+5	600
+
+statement ok
+CREATE OR REPLACE VIEW measure_window_shadow AS
+SELECT id + 1 AS id, yr, region, SUM(amount) AS MEASURE revenue
+FROM measure_window_rows;
+
+query II
+SELECT id, AGGREGATE(revenue) OVER (ORDER BY id ROWS CURRENT ROW)
+FROM measure_window_shadow ORDER BY id;
+----
+2	10
+3	30
+4	100
+5	200
+6	200
+7	60
+
+query I
+SELECT AGGREGATE(revenue) FILTER (WHERE id >= 6) OVER () FROM measure_window_shadow LIMIT 1;
+----
+260
+
+# The defining view's final ordering chooses its output alias before LIMIT.
+# Reconstructing lineage must select the same source rows as the actual view.
+statement ok
+CREATE OR REPLACE VIEW measure_window_limited AS
+SELECT -id AS id, amount, SUM(amount) AS MEASURE revenue
+FROM measure_window_rows ORDER BY id LIMIT 2;
+
+query II
+SELECT id, AGGREGATE(revenue) OVER () FROM measure_window_limited ORDER BY id;
+----
+-6	260
+-5	260
+
+statement ok
+CREATE OR REPLACE VIEW measure_window_alias_chain AS
+SELECT id AS key_id, key_id + 1 AS shifted, SUM(amount) AS MEASURE revenue
+FROM measure_window_rows;
+
+query II
+SELECT shifted, AGGREGATE(revenue) FILTER (WHERE shifted > 5) OVER ()
+FROM measure_window_alias_chain ORDER BY shifted LIMIT 1;
+----
+2	260
+
+statement ok
+CREATE OR REPLACE VIEW measure_window_nested AS
+SELECT id, SUM((SELECT amount FROM (VALUES (1)) a(dummy))) AS MEASURE revenue
+FROM measure_window_rows;
+
+query I
+SELECT AGGREGATE(revenue) OVER () FROM measure_window_nested LIMIT 1;
+----
+600
+
+# Schema-backed star expansion happens before hidden provenance is introduced.
+query IITI
+SELECT * EXCLUDE (revenue, mean_amount, unit_price, row_count, amounts),
+       AGGREGATE(revenue) OVER () AS total
+FROM measure_window_raw ORDER BY id;
+----
+1	2022	A	600
+2	2022	A	600
+3	2023	A	600
+4	2024	B	600
+5	2024	B	600
+6	2025	NULL	600
+
+statement ok
+CREATE OR REPLACE VIEW measure_window_bonus AS
+SELECT id, SUM(amount * 2) AS MEASURE bonus FROM measure_window_rows;
+
+query III
+SELECT v.id,
+       AGGREGATE(v.revenue) OVER (ORDER BY v.id ROWS CURRENT ROW),
+       AGGREGATE(b.bonus) OVER (ORDER BY v.id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM measure_window_raw v JOIN measure_window_bonus b ON v.id = b.id
+ORDER BY v.id;
+----
+1	10	20
+2	30	80
+3	100	260
+4	200	600
+5	200	800
+6	60	520
+
+# Decorations on a view with a joined defining relation retain which input
+# owns an identically named column.
+statement ok
+CREATE OR REPLACE VIEW measure_window_joined AS
+SELECT a.id AS aid, b.id AS bid, SUM(a.amount) AS MEASURE joined_revenue,
+       LIST(a.amount) AS MEASURE joined_amounts
+FROM measure_window_left a CROSS JOIN measure_window_right b;
+
+query II
+SELECT AGGREGATE(joined_revenue) FILTER (WHERE aid = 1) OVER (),
+       AGGREGATE(joined_revenue) FILTER (WHERE bid = 10) OVER ()
+FROM measure_window_joined LIMIT 1;
+----
+20	30
+
+query T
+SELECT AGGREGATE(joined_amounts ORDER BY bid DESC, aid DESC) OVER ()
+FROM measure_window_joined LIMIT 1;
+----
+[20, 10, 20, 10]
+
+# Named windows, projection aliases, ordinary windows, QUALIFY and final LIMIT
+# keep their original SQL evaluation order.
+query III
+SELECT id AS row_id,
+       AGGREGATE(revenue) OVER w AS running,
+       row_number() OVER w AS position
+FROM measure_window_raw
+WINDOW w AS (ORDER BY id ROWS UNBOUNDED PRECEDING)
+QUALIFY running >= 140
+ORDER BY row_id DESC LIMIT 2;
+----
+6	600	6
+5	540	5
+
+query II
+SELECT yr, AGGREGATE(revenue) OVER (ORDER BY yr ROWS CURRENT ROW) AT (ALL)
+FROM measure_window_grouped ORDER BY yr;
+----
+2022	600
+2023	600
+2024	600
+2025	600
+
+query II
+SELECT yr, AGGREGATE(revenue) OVER (ORDER BY yr ROWS CURRENT ROW) AT (ALL yr)
+FROM measure_window_grouped ORDER BY yr;
+----
+2022	140
+2023	140
+2024	400
+2025	60
+
+query II
+SELECT yr, AGGREGATE(revenue) OVER (ORDER BY yr ROWS CURRENT ROW) AT (SET yr = CURRENT yr - 1)
+FROM measure_window_grouped ORDER BY yr;
+----
+2022	NULL
+2023	40
+2024	NULL
+2025	NULL
+
+query II
+SELECT yr, AGGREGATE(revenue) OVER (ORDER BY yr ROWS CURRENT ROW) AT (WHERE yr = CURRENT yr - 1)
+FROM measure_window_grouped ORDER BY yr;
+----
+2022	NULL
+2023	40
+2024	100
+2025	400
+
+# ALL may expand a frame; VISIBLE retains the enclosing query's visible set.
+query II
+SELECT yr, AGGREGATE(revenue) OVER (ORDER BY yr ROWS CURRENT ROW) AT (VISIBLE ALL yr)
+FROM measure_window_grouped WHERE yr = 2022 ORDER BY yr;
+----
+2022	40
+
+query II
+SELECT yr, AGGREGATE(revenue) OVER (ORDER BY yr ROWS CURRENT ROW) AT (ALL yr)
+FROM measure_window_grouped WHERE yr = 2022 ORDER BY yr;
+----
+2022	140
+
+# Joined-input argument ordering travels with each frame occurrence. Repeated
+# source IDs choose their first ordered occurrence before fanout is removed.
+statement ok
+CREATE OR REPLACE VIEW measure_window_ordered AS
+SELECT id, LIST(amount ORDER BY id DESC) AS MEASURE amounts FROM measure_window_rows;
+
+query T
+SELECT DISTINCT AGGREGATE(amounts ORDER BY j.copy) OVER ()
+FROM measure_window_ordered r
+JOIN (VALUES (1, 4), (1, 0), (2, 2), (3, 1)) j(id, copy) ON r.id = j.id;
+----
+[10, 100, 30]
+
+# Equal caller keys retain the declaration's order as the tie breaker.
+query T
+SELECT DISTINCT AGGREGATE(amounts ORDER BY j.copy) OVER ()
+FROM measure_window_ordered r
+JOIN (VALUES (1, 0), (1, 0), (2, 0), (3, 0)) j(id, copy) ON r.id = j.id;
+----
+[100, 30, 10]
+
+query T
+SELECT DISTINCT AGGREGATE(amounts ORDER BY j.copy, r.id DESC) OVER ()
+FROM measure_window_ordered r
+JOIN (VALUES (1, 0), (2, 0), (3, 0)) j(id, copy) ON r.id = j.id;
+----
+[100, 30, 10]
+
+query T
+SELECT DISTINCT AGGREGATE(amounts ORDER BY j.copy + amount) OVER ()
+FROM measure_window_ordered r
+JOIN (VALUES (1, 50), (2, 0), (3, -90)) j(id, copy) ON r.id = j.id;
+----
+[100, 30, 10]
+
+# AT expansion has no joined-input key for rows absent from the frame. Those
+# keys are NULL; source-owned declaration ordering still breaks their ties.
+query T
+SELECT AGGREGATE(amounts ORDER BY j.copy NULLS LAST) OVER () AT (ALL)
+FROM measure_window_ordered r JOIN (VALUES (1, 0)) j(id, copy) ON r.id = j.id;
+----
+[10, 60, 200, 200, 100, 30]
+
+query T
+SELECT DISTINCT AGGREGATE(amounts ORDER BY copy DESC) OVER ()
+FROM measure_window_ordered r
+JOIN (VALUES (1, 0), (2, 2), (3, 1)) j(id, copy) ON r.id = j.id;
+----
+[30, 100, 10]
+
+query T
+SELECT DISTINCT AGGREGATE(amounts ORDER BY SUM(j.copy) DESC) OVER ()
+FROM measure_window_ordered r
+JOIN (VALUES (1, 1), (1, 2), (2, 4), (3, 0)) j(id, copy) ON r.id = j.id
+GROUP BY r.id;
+----
+[30, 10, 100]
+
+# The consumer may reuse a defining FROM alias for an unrelated joined input.
+statement ok
+CREATE OR REPLACE VIEW measure_window_alias_order AS
+SELECT t.id, LIST(t.amount ORDER BY t.id DESC) AS MEASURE amounts FROM measure_window_rows t;
+
+query T
+SELECT DISTINCT AGGREGATE(amounts ORDER BY t.copy) OVER ()
+FROM measure_window_alias_order r
+JOIN (VALUES (1, 2), (2, 1), (3, 0)) t(id, copy) ON r.id = t.id;
+----
+[100, 30, 10]
+
+query T
+SELECT DISTINCT AGGREGATE(amounts ORDER BY t.id ASC) OVER ()
+FROM measure_window_alias_order r CROSS JOIN (VALUES (5), (2)) t(id);
+----
+[60, 200, 200, 100, 30, 10]
+
+endloop
+
+statement ok
+SET heap_based_parser=true;

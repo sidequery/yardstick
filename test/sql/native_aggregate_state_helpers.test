@@ -1,0 +1,169 @@
+# name: test/sql/native_aggregate_state_helpers.test
+# description: Composite exported states retain leaf statistics, formulas, and types.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+# Match native DISTINCT state semantics: overlap between shards is not deduplicated.
+query II
+WITH data(shard, value) AS (VALUES (1, 10), (1, 20), (2, 10), (2, 30)),
+     states AS (SELECT shard, sum(DISTINCT value) EXPORT_STATE AS state FROM data GROUP BY shard)
+SELECT yardstick_finalize(yardstick_combine(a.state, b.state)),
+       (SELECT sum(DISTINCT value) FROM data)
+FROM states a, states b WHERE a.shard = 1 AND b.shard = 2;
+----
+70	60
+
+query R
+SELECT yardstick_finalize(avg(i) EXPORT_STATE) FROM range(6) t(i);
+----
+2.5
+
+query I
+WITH a AS (SELECT sum(i) EXPORT_STATE s FROM range(2) t(i)),
+     b AS (SELECT sum(i) EXPORT_STATE s FROM range(2, 6) t(i))
+SELECT yardstick_finalize(yardstick_combine(a.s, b.s)) FROM a, b;
+----
+15
+
+# Unequal shards distinguish combining sufficient statistics from averaging finalized ratios.
+statement ok
+CREATE TABLE composite_state_shards AS
+SELECT i < 2 AS shard,
+       yardstick_state('s0 / s1', struct_pack(s0 := sum(i) EXPORT_STATE, s1 := count(i) EXPORT_STATE)) AS state
+FROM range(6) t(i) GROUP BY shard;
+
+query R
+SELECT yardstick_finalize(yardstick_combine(a.state, b.state))
+FROM composite_state_shards a, composite_state_shards b
+WHERE a.shard AND NOT b.shard;
+----
+2.5
+
+query R rowsort
+SELECT yardstick_finalize(state) FROM composite_state_shards;
+----
+0.5
+3.5
+
+statement ok
+PREPARE finalize_composite AS SELECT yardstick_finalize(state) FROM composite_state_shards ORDER BY shard;
+
+query R
+EXECUTE finalize_composite;
+----
+3.5
+0.5
+
+query I
+SELECT count(*) FROM composite_state_shards WHERE starts_with(typeof(state), 'yardstick_state_v1:');
+----
+2
+
+# Round-trip the type and alias through a persistent DuckDB table and reattach it.
+statement ok
+ATTACH '__TEST_DIR__/yardstick_composite_states.db' AS composite_state_storage;
+
+statement ok
+CREATE TABLE composite_state_storage.saved_states AS SELECT * FROM composite_state_shards;
+
+statement ok
+DETACH composite_state_storage;
+
+statement ok
+ATTACH '__TEST_DIR__/yardstick_composite_states.db' AS composite_state_storage;
+
+query R
+SELECT yardstick_finalize(yardstick_combine(a.state, b.state))
+FROM composite_state_storage.saved_states a, composite_state_storage.saved_states b
+WHERE a.shard AND NOT b.shard;
+----
+2.5
+
+statement ok
+DETACH composite_state_storage;
+
+query R rowsort
+SELECT yardstick_finalize(yardstick_combine(state, NULL)) FROM composite_state_shards;
+----
+0.5
+3.5
+
+query R rowsort
+SELECT yardstick_finalize(yardstick_combine(NULL, state)) FROM composite_state_shards;
+----
+0.5
+3.5
+
+# Typed NULLs must remain NULL rather than becoming a non-NULL struct of NULL leaves.
+query II
+WITH states AS (SELECT CASE WHEN false THEN state END AS missing, state FROM composite_state_shards)
+SELECT count(yardstick_finalize(missing)), count(yardstick_combine(missing, missing)) FROM states;
+----
+0	0
+
+query R rowsort
+WITH states AS (SELECT CASE WHEN false THEN state END AS missing, state FROM composite_state_shards)
+SELECT yardstick_finalize(yardstick_combine(missing, state)) FROM states;
+----
+0.5
+3.5
+
+query II
+SELECT yardstick_finalize(NULL), yardstick_combine(NULL, NULL);
+----
+NULL	NULL
+
+query I
+SELECT yardstick_finalize(yardstick_state('coalesce(s0, 42)', struct_pack(s0 := sum(i) EXPORT_STATE)))
+FROM range(0) t(i);
+----
+42
+
+query R
+SELECT yardstick_finalize(yardstick_state('case when s1 = 0 then NULL else round(s0::DOUBLE / s1, 1) end',
+                                         struct_pack(s0 := sum(i) EXPORT_STATE, s1 := count(i) EXPORT_STATE)))
+FROM range(6) t(i);
+----
+2.5
+
+statement error
+SELECT yardstick_combine(yardstick_state('s0 / s1', struct_pack(s0 := sum(i) EXPORT_STATE, s1 := count(i) EXPORT_STATE)),
+                         yardstick_state('s0 + s1', struct_pack(s0 := sum(i) EXPORT_STATE, s1 := count(i) EXPORT_STATE)))
+FROM range(6) t(i);
+----
+matching state formulas and aggregate types
+
+statement error
+SELECT yardstick_combine(yardstick_state('s0', struct_pack(s0 := sum(i) EXPORT_STATE)),
+                         yardstick_state('s0', struct_pack(s0 := count(i) EXPORT_STATE)))
+FROM range(6) t(i);
+----
+matching state formulas and aggregate types
+
+statement error
+SELECT yardstick_state('s1', struct_pack(s0 := sum(i) EXPORT_STATE)) FROM range(6) t(i);
+----
+unknown state field
+
+statement error
+SELECT yardstick_state('s0', struct_pack(s0 := 42));
+----
+native aggregate states named s0, s1
+
+statement error
+SELECT yardstick_state('s0', struct_pack(total := sum(i) EXPORT_STATE)) FROM range(6) t(i);
+----
+native aggregate states named s0, s1
+
+statement error
+SELECT yardstick_finalize(struct_pack(s0 := sum(i) EXPORT_STATE)) FROM range(6) t(i);
+----
+requires a native aggregate state or yardstick_state
+
+statement error
+SELECT yardstick_state('(select 42)', struct_pack(s0 := sum(i) EXPORT_STATE)) FROM range(6) t(i);
+----
+cannot contain subqueries
