@@ -6,6 +6,8 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/grammar_extension.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -41,6 +43,7 @@ struct NativeAtClause {
     idx_t start;
     idx_t end;
     vector<NativeModifier> modifiers;
+    const ParsedExpression *marker;
 };
 
 struct SyntaxCapture {
@@ -286,18 +289,19 @@ void ReadModifier(PEGTransformer &transformer, ParseResult &result, vector<Nativ
 
 unique_ptr<TransformResultValue> TransformAt(PEGTransformer &transformer, ParseResult &result) {
     CaptureSpan(result, result);
+    // BaseExpression inserts the left operand into this marker. Keep its
+    // identity so aggregate traversal associates suffixes through AST parents.
+    unique_ptr<ParsedExpression> expression =
+        make_uniq<FunctionExpression>("__yardstick_at", vector<unique_ptr<ParsedExpression>> {});
     if (active_capture->source) {
-        NativeAtClause clause {result.offset.GetIndex(), result.offset.GetIndex() + result.length.GetIndex(), {}};
+        NativeAtClause clause {result.offset.GetIndex(), result.offset.GetIndex() + result.length.GetIndex(), {},
+                               expression.get()};
         auto &list = result.Cast<ListParseResult>();
         for (auto &child : list.Child<RepeatParseResult>(2).GetChildren()) {
             ReadModifier(transformer, child.get(), clause.modifiers);
         }
         active_capture->clauses.push_back(std::move(clause));
     }
-    // BaseExpression inserts the left operand into this marker. The adapter
-    // consumes source spans before binding; semantic lowering stays in Rust.
-    unique_ptr<ParsedExpression> expression =
-        make_uniq<FunctionExpression>("__yardstick_at", vector<unique_ptr<ParsedExpression>> {});
     return make_uniq<TypedTransformResult<unique_ptr<ParsedExpression>>>(std::move(expression));
 }
 
@@ -732,6 +736,185 @@ YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql_p) {
     }
 }
 
+namespace {
+vector<reference<ParseResult>> QuerySyntaxChildren(ParseResult &result) {
+    switch (result.type) {
+    case ParseResultType::LIST:
+        return result.Cast<ListParseResult>().GetChildren();
+    case ParseResultType::REPEAT:
+        return result.Cast<RepeatParseResult>().GetChildren();
+    case ParseResultType::CHOICE:
+        return {result.Cast<ChoiceParseResult>().GetResult()};
+    case ParseResultType::OPTIONAL:
+        if (result.Cast<OptionalParseResult>().HasResult()) {
+            return {result.Cast<OptionalParseResult>().GetResult()};
+        }
+        return {};
+    default:
+        return {};
+    }
+}
+
+struct NativeQueryScope {
+    idx_t start;
+    idx_t end;
+    vector<string> visible_ctes;
+};
+
+// QueryNode does not retain a complete source location. The native parse tree
+// owns query boundaries, while subsequent AST parsing owns expression semantics.
+// Walk the tree without changing core grammar rules or rendering caller SQL.
+bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
+                              vector<NativeQueryScope> &scopes) {
+    struct Work {
+        ParseResult *node;
+        vector<string> visible_ctes;
+        QueryLocation main_query;
+        idx_t modifier_end = 0;
+    };
+    vector<Work> pending {{&root, {}, {}, 0}};
+    while (!pending.empty()) {
+        auto work = std::move(pending.back());
+        pending.pop_back();
+        auto &node = *work.node;
+        if (node.name == "YardstickMeasureAlias") {
+            return false; // Declaration registration owns this statement.
+        }
+        auto children = QuerySyntaxChildren(node);
+        if (node.type == ParseResultType::LIST && node.name == "SimpleSelect") {
+            auto location = node.GetLocation();
+            if (!location.IsValid() || location.Start() == location.End()) {
+                return false;
+            }
+            idx_t end = location.End();
+            if (work.main_query.IsValid() && location.Start() == work.main_query.Start() &&
+                end == work.main_query.End()) {
+                end = MaxValue(end, work.modifier_end);
+            }
+            scopes.push_back({location.Start(), end, work.visible_ctes});
+        }
+        // WITH is the first optional child of SELECT/INSERT/UPDATE/DELETE.
+        // Handle its declarations in order: a non-recursive body sees earlier
+        // CTEs, while a recursive body also sees its own name.
+        idx_t first_child = 0;
+        if (node.type == ParseResultType::LIST && !children.empty() &&
+            children[0].get().type == ParseResultType::OPTIONAL) {
+            auto &optional_with = children[0].get().Cast<OptionalParseResult>();
+            if (optional_with.HasResult() && optional_with.GetResult().name == "WithClause") {
+                auto &with = optional_with.GetResult().Cast<ListParseResult>();
+                bool recursive = with.Child<OptionalParseResult>(1).HasResult();
+                vector<ParseResult *> declarations;
+                vector<ParseResult *> search {&with.GetChild(2)};
+                while (!search.empty()) {
+                    auto *candidate = search.back();
+                    search.pop_back();
+                    if (candidate->type == ParseResultType::LIST && candidate->name == "WithStatement") {
+                        declarations.push_back(candidate);
+                        continue;
+                    }
+                    auto descendants = QuerySyntaxChildren(*candidate);
+                    for (auto child = descendants.rbegin(); child != descendants.rend(); ++child) {
+                        search.push_back(&child->get());
+                    }
+                }
+                for (auto *declaration : declarations) {
+                    auto &list = declaration->Cast<ListParseResult>();
+                    auto name = transformer.Transform<Identifier>(list.GetChild(0)).GetIdentifierName();
+                    auto visible = work.visible_ctes;
+                    if (recursive) {
+                        visible.push_back(name);
+                    }
+                    // Visiting the declaration also finds CTE bodies nested in
+                    // DML; it never infers a query from parentheses or text.
+                    pending.push_back({declaration, std::move(visible), {}, 0});
+                    work.visible_ctes.push_back(std::move(name));
+                }
+                first_child = 1;
+            }
+        }
+        if (node.type == ParseResultType::LIST && node.name == "SelectStatementInternal") {
+            work.main_query = node.Cast<ListParseResult>().GetChild(1).GetLocation();
+            work.modifier_end = node.GetLocation().End();
+        }
+        for (idx_t i = first_child; i < children.size(); i++) {
+            pending.push_back({&children[i].get(), work.visible_ctes, work.main_query, work.modifier_end});
+        }
+    }
+    return true;
+}
+} // namespace
+
+YardstickQueryScopeList *FindNativeYardstickQueryScopes(const char *sql_p) {
+    if (!sql_p || !active_parse_scope || !active_parse_scope->available) {
+        return nullptr;
+    }
+    try {
+        string sql(sql_p);
+        if (sql.size() > std::numeric_limits<uint32_t>::max() || Parser::NormalizeSQLString(sql) != sql) {
+            return nullptr;
+        }
+        auto options = active_parse_scope->ParserConfig();
+        auto &grammar = *options.compiled_grammar;
+        vector<MatcherToken> tokens;
+        TokenizerBehavior behavior(sql, tokens);
+        grammar.GetTokenizer().TokenizeInput(behavior);
+        TokenIterator iterator(tokens);
+        vector<NativeQueryScope> scopes;
+        while (iterator.HasMoreStatements()) {
+            vector<MatcherSuggestion> suggestions;
+            ParseResultAllocator results;
+            ParserPackratCache packrat;
+            idx_t max_token = iterator.Position();
+            ArenaAllocator process_allocator(Allocator::DefaultAllocator());
+            MatchContext context(suggestions, results, process_allocator, max_token, MatchMode::BUILD_PARSE_RESULT,
+                                 options.identifier_case_mode, options.heap_based_parser, &packrat);
+            MatchState state(iterator, context);
+            auto match = grammar.TopLevelStatementMatcher().MatchParseResult(state);
+            if (!match.IsSuccess() || !match.HasParseResult() || state.token_iterator.Position() <= iterator.Position()) {
+                return nullptr;
+            }
+            iterator.SetPosition(state.token_iterator);
+            ArenaAllocator transform_allocator(Allocator::DefaultAllocator());
+            PEGTransformer transformer(transform_allocator, iterator, options, grammar);
+            if (!CollectNativeQueryScopes(*match.GetParseResult(), transformer, scopes)) {
+                return nullptr;
+            }
+        }
+        std::sort(scopes.begin(), scopes.end(), [](const NativeQueryScope &left, const NativeQueryScope &right) {
+            return left.start != right.start ? left.start < right.start : left.end > right.end;
+        });
+        scopes.erase(std::unique(scopes.begin(), scopes.end(), [](const NativeQueryScope &left,
+                                                                const NativeQueryScope &right) {
+            return left.start == right.start && left.end == right.end;
+        }), scopes.end());
+        std::unique_ptr<YardstickQueryScopeList, decltype(&yardstick_free_query_scopes)> output(
+            new YardstickQueryScopeList {}, yardstick_free_query_scopes);
+        if (!scopes.empty()) {
+            output->scopes = new YardstickQueryScope[scopes.size()] {};
+            output->count = scopes.size();
+        }
+        for (idx_t i = 0; i < scopes.size(); i++) {
+            auto &source = scopes[i];
+            auto &scope = output->scopes[i];
+            scope.start_pos = static_cast<uint32_t>(source.start);
+            scope.end_pos = static_cast<uint32_t>(source.end);
+            if (!source.visible_ctes.empty()) {
+                scope.visible_ctes = new const char *[source.visible_ctes.size()] {};
+                scope.visible_cte_count = source.visible_ctes.size();
+                for (idx_t j = 0; j < source.visible_ctes.size(); j++) {
+                    scope.visible_ctes[j] = strdup(source.visible_ctes[j].c_str());
+                    if (!scope.visible_ctes[j]) {
+                        throw std::bad_alloc();
+                    }
+                }
+            }
+        }
+        return output.release();
+    } catch (const std::exception &) {
+        return nullptr;
+    }
+}
+
 YardstickCurrentReferenceList *FindNativeYardstickCurrentReferences(const char *expression) {
     if (!expression || !active_parse_scope || !active_parse_scope->available) {
         return nullptr;
@@ -796,20 +979,6 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             return nullptr;
         }
 
-        vector<MatcherToken> tokens;
-        TokenizerBehavior behavior(sql, tokens);
-        active_parse_scope->ParserConfig().compiled_grammar->GetTokenizer().TokenizeInput(behavior);
-        vector<const MatcherToken *> significant;
-        for (auto &token : tokens) {
-            if (token.type != TokenType::COMMENT && token.type != TokenType::END_OF_INPUT) {
-                significant.push_back(&token);
-            }
-        }
-        std::sort(capture.clauses.begin(), capture.clauses.end(), [](const NativeAtClause &left,
-                                                                  const NativeAtClause &right) {
-            return left.start < right.start;
-        });
-        vector<bool> used_clauses(capture.clauses.size(), false);
         struct Aggregate {
             string measure;
             idx_t start;
@@ -817,79 +986,125 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
             vector<NativeModifier> modifiers;
         };
         vector<Aggregate> aggregates;
-        for (idx_t i = 0; i + 1 < significant.size(); i++) {
-            auto &name = *significant[i];
-            if ((!StringUtil::CIEquals(name.text, "AGGREGATE") &&
-                 !StringUtil::CIEquals(name.text, "\"AGGREGATE\"")) || significant[i + 1]->text != "(") {
-                continue;
+        vector<bool> used_clauses(capture.clauses.size(), false);
+        auto source_range = [&](const ParsedExpression &expression) {
+            auto location = expression.GetQueryLocation();
+            if (!location.IsValid() || !location.length || location.offset > sql.size() ||
+                location.length > sql.size() - location.offset) {
+                throw ParserException("Yardstick aggregate source location is unavailable");
             }
-            // The PEG parse establishes SQL validity. Token positions are used
-            // only to associate function ranges with its already-parsed AT
-            // suffixes; modifier contents come entirely from ParseResult nodes.
-            idx_t depth = 1;
-            idx_t close = i + 2;
-            bool multiple_arguments = false;
-            for (; close < significant.size(); close++) {
-                auto &text = significant[close]->text;
-                if (text == "(" || text == "[" || text == "{") {
-                    depth++;
-                } else if (text == ")" || text == "]" || text == "}") {
-                    if (--depth == 0) {
-                        break;
-                    }
-                } else if (text == "," && depth == 1) {
-                    // DuckDB's list aggregate(list, function) is not a measure.
-                    multiple_arguments = true;
-                }
-            }
-            if (close >= significant.size() || close == i + 2) {
-                return nullptr;
-            }
-            if (multiple_arguments) {
-                // Keep scanning for measure calls elsewhere, including inside
-                // the list arguments. Only this function belongs to DuckDB.
-                continue;
-            }
-            idx_t name_start = i;
-            while (name_start >= 2 && significant[name_start - 1]->text == "." &&
-                   (significant[name_start - 2]->type == TokenType::IDENTIFIER ||
-                    significant[name_start - 2]->type == TokenType::KEYWORD)) {
-                name_start -= 2;
-            }
-            auto argument_start = significant[i + 2]->offset;
-            auto argument_end = significant[close - 1]->offset + significant[close - 1]->length;
-            Aggregate aggregate {sql.substr(argument_start, argument_end - argument_start),
-                                 significant[name_start]->offset,
-                                 significant[close]->offset + significant[close]->length,
-                                 {}};
-            idx_t after = close + 1;
-            while (after < significant.size() && StringUtil::CIEquals(significant[after]->text, "AT")) {
-                auto clause = std::find_if(capture.clauses.begin(), capture.clauses.end(), [&](const NativeAtClause &item) {
-                    return item.start == significant[after]->offset;
-                });
+            return location;
+        };
+        auto only_trivia = [&](idx_t start, idx_t end) {
+            // Parentheses are erased from the operand AST, while the marker's
+            // own location covers only AT (...). Validate that extending the
+            // function span does not consume an unmatched closing parenthesis.
+            // Tokens validate this source gap only; AST nodes discover calls.
+            auto gap = sql.substr(start, end - start);
+            vector<MatcherToken> tokens;
+            TokenizerBehavior behavior(gap, tokens);
+            active_parse_scope->ParserConfig().compiled_grammar->GetTokenizer().TokenizeInput(behavior);
+            return std::all_of(tokens.begin(), tokens.end(), [](const MatcherToken &token) {
+                return token.type == TokenType::COMMENT || token.type == TokenType::END_OF_INPUT;
+            });
+        };
+        std::function<void(unique_ptr<ParsedExpression> &)> visit_expression;
+        visit_expression = [&](unique_ptr<ParsedExpression> &expression) {
+            auto *base = expression.get();
+            vector<idx_t> suffixes;
+            while (true) {
+                auto clause = std::find_if(capture.clauses.begin(), capture.clauses.end(),
+                                          [&](const NativeAtClause &item) { return item.marker == base; });
                 if (clause == capture.clauses.end()) {
-                    return nullptr;
+                    break;
                 }
-                auto clause_index = static_cast<idx_t>(clause - capture.clauses.begin());
-                if (used_clauses[clause_index]) {
-                    return nullptr;
+                auto index = static_cast<idx_t>(clause - capture.clauses.begin());
+                if (used_clauses[index] || base->GetExpressionClass() != ExpressionClass::FUNCTION) {
+                    throw ParserException("Ambiguous Yardstick AT expression");
                 }
-                used_clauses[clause_index] = true;
-                aggregate.modifiers.insert(aggregate.modifiers.end(), clause->modifiers.begin(), clause->modifiers.end());
-                aggregate.end = clause->end;
-                while (after < significant.size() && significant[after]->offset < clause->end) {
-                    after++;
+                auto &arguments = base->Cast<FunctionExpression>().GetArgumentsMutable();
+                if (arguments.size() != 1) {
+                    throw ParserException("Unsupported Yardstick AT expression");
+                }
+                used_clauses[index] = true;
+                suffixes.push_back(index);
+                base = arguments[0].GetExpressionMutable().get();
+            }
+
+            bool is_measure_call = false;
+            if (base->GetExpressionClass() == ExpressionClass::WINDOW &&
+                StringUtil::CIEquals(base->Cast<WindowExpression>().FunctionName().GetIdentifierName(), "aggregate")) {
+                throw ParserException("Windowed Yardstick aggregate requires compatibility lowering");
+            }
+            if (base->GetExpressionClass() == ExpressionClass::FUNCTION) {
+                auto &function = base->Cast<FunctionExpression>();
+                is_measure_call = StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate") &&
+                                  function.GetArguments().size() == 1;
+                if (is_measure_call) {
+                    if (function.Distinct() || function.Filter() || function.ExportState() ||
+                        (function.OrderBy() && !function.OrderBy()->orders.empty())) {
+                        // These decorations are not represented in this ABI.
+                        // Extending the call span must not silently discard them.
+                        throw ParserException("Decorated Yardstick aggregate requires compatibility lowering");
+                    }
+                    auto call_location = source_range(function);
+                    auto &argument = function.GetArguments()[0];
+                    auto argument_location = source_range(argument.GetExpression());
+                    if (argument.HasName() || argument_location.Start() < call_location.Start() ||
+                        argument_location.End() > call_location.End()) {
+                        throw ParserException("Unsupported Yardstick aggregate argument source");
+                    }
+                    Aggregate aggregate {sql.substr(argument_location.Start(), argument_location.length),
+                                         call_location.Start(), call_location.End(), {}};
+                    // AST parents run from the last suffix back to the first.
+                    // Modifier application retains the original SQL order.
+                    for (auto suffix = suffixes.rbegin(); suffix != suffixes.rend(); ++suffix) {
+                        auto &clause = capture.clauses[*suffix];
+                        if (clause.start < aggregate.end || clause.end > sql.size() ||
+                            !only_trivia(aggregate.end, clause.start)) {
+                            throw ParserException("Invalid Yardstick AT source range");
+                        }
+                        aggregate.modifiers.insert(aggregate.modifiers.end(), clause.modifiers.begin(),
+                                                   clause.modifiers.end());
+                        aggregate.end = clause.end;
+                    }
+                    aggregates.push_back(std::move(aggregate));
                 }
             }
-            if (!aggregates.empty() && aggregate.start < aggregates.back().end) {
-                // Nested replacement ranges need a separate lowering step.
+            if (!suffixes.empty() && !is_measure_call) {
+                // Shorthand AT expressions still use compatibility lowering.
+                throw ParserException("Yardstick AT operand is not an aggregate call");
+            }
+            if (base->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+                auto &subquery = base->Cast<SubqueryExpression>();
+                ParsedExpressionIterator::EnumerateQueryNodeChildren(*subquery.SubqueryMutable()->node,
+                                                                     visit_expression);
+            }
+            // Includes arguments of DuckDB's multiargument aggregate(list, name)
+            // so nested measure calls remain visible without claiming that call.
+            ParsedExpressionIterator::EnumerateChildren(*base, visit_expression);
+        };
+        for (auto &statement : parser.statements) {
+            if (statement->type != StatementType::SELECT_STATEMENT) {
+                // Do not report a successful partial traversal of other statement
+                // kinds. Their existing compatibility path remains available.
                 return nullptr;
             }
-            aggregates.push_back(std::move(aggregate));
+            ParsedExpressionIterator::EnumerateQueryNodeChildren(*statement->Cast<SelectStatement>().node,
+                                                                 visit_expression);
+        }
+        std::sort(aggregates.begin(), aggregates.end(), [](const Aggregate &left, const Aggregate &right) {
+            return left.start < right.start;
+        });
+        for (idx_t i = 1; i < aggregates.size(); i++) {
+            if (aggregates[i].start < aggregates[i - 1].end) {
+                // Overlapping measure replacements require another lowering step.
+                return nullptr;
+            }
         }
         if (std::find(used_clauses.begin(), used_clauses.end(), false) != used_clauses.end()) {
-            // A suffix on a shorthand expression or nested inside another AT
-            // clause must not be silently omitted from the structured result.
+            // Captured modifier expressions may contain syntax outside the AST
+            // marker operand. Never silently omit those references.
             return nullptr;
         }
 

@@ -96,7 +96,10 @@ extern "C" {
         YardstickCurrentReferenceList* (*find_current_references)(const char*),
         void (*free_current_references)(YardstickCurrentReferenceList*),
         int32_t (*current_where_is_single_valued)(const char*, const char*, const char*),
-        int32_t (*expressions_equal)(const char*, const char*)
+        int32_t (*expressions_equal)(const char*, const char*),
+        YardstickQueryScopeList* (*find_query_scopes)(const char*),
+        void (*free_query_scopes)(YardstickQueryScopeList*),
+        char* (*rewrite_visible_filter)(const char*, const char*, const char* const*, const char* const*, size_t, char**)
     );
 }
 
@@ -1904,6 +1907,18 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
         YardstickAggregateResult result = yardstick_expand_aggregate(sql_to_check.c_str());
 
         if (result.error) {
+            if (native_parsed && result.had_aggregate) {
+                // Native discovery distinguishes measure calls from DuckDB's
+                // list aggregate. Retrying a failed semantic rewrite through
+                // compatibility lowering can silently lose query correlations.
+                string error_msg(result.error);
+                yardstick_free_aggregate_result(result);
+                RestoreMeasureViewSnapshots(permanent_snapshots);
+                // DISPLAY_EXTENSION_ERROR is ignored in DuckDB's fallback
+                // override mode. This is a recognized semantic failure, so it
+                // must propagate instead of inviting another parser attempt.
+                throw ParserException(error_msg);
+            }
             // Expansion failed: this might not be a yardstick AGGREGATE() call
             // (e.g. DuckDB's built-in list aggregate function). Fall through to
             // the native parser in case it can handle the query.
@@ -2364,7 +2379,10 @@ static void LoadInternal(ExtensionLoader &loader) {
         yardstick_find_current_references,
         yardstick_free_current_reference_list,
         yardstick_current_where_is_single_valued,
-        yardstick_expressions_equal
+        yardstick_expressions_equal,
+        yardstick_find_query_scopes,
+        yardstick_free_query_scopes,
+        yardstick_rewrite_visible_filter
     );
 
     auto &db = loader.GetDatabaseInstance();

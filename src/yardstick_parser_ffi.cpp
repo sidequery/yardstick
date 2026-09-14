@@ -13,6 +13,12 @@
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/tableref/list.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
 #endif
 
 #include "duckdb/parser/parser.hpp"
@@ -41,6 +47,7 @@
 #include "duckdb/common/string_util.hpp"
 
 #include <cctype>
+#include <algorithm>
 #include <cstring>
 #include <vector>
 #include <string>
@@ -951,11 +958,12 @@ static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableR
     switch (ref->type) {
         case TableReferenceType::BASE_TABLE: {
             auto* base = static_cast<BaseTableRef*>(ref);
-            YardstickTableRef t;
+            YardstickTableRef t {};
             t.table_name = safe_strdup(YsBaseTableName(*base));
             t.alias = base->alias.empty() ? nullptr : safe_strdup(YsName(base->alias));
             t.is_subquery = false;
 #if YARDSTICK_GRAMMAR_EXTENSION
+            t.schema_qualified = !base->GetQualifiedName().Schema().empty();
             if (cte_names && base->GetQualifiedName().Schema().empty() &&
                 cte_names->count(StringUtil::Lower(YsBaseTableName(*base)))) {
                 // A local CTE shadows the catalog view with the same name.
@@ -975,7 +983,7 @@ static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableR
 
         case TableReferenceType::SUBQUERY: {
             auto* subq = static_cast<SubqueryRef*>(ref);
-            YardstickTableRef t;
+            YardstickTableRef t {};
             t.table_name = subq->alias.empty() ? safe_strdup("(subquery)") : safe_strdup(YsName(subq->alias));
             t.alias = subq->alias.empty() ? nullptr : safe_strdup(YsName(subq->alias));
             t.is_subquery = true;
@@ -1310,6 +1318,28 @@ extern "C" YardstickCurrentReferenceList* yardstick_find_current_references(cons
 #endif
 }
 
+extern "C" YardstickQueryScopeList* yardstick_find_query_scopes(const char* sql) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    return FindNativeYardstickQueryScopes(sql);
+#else
+    return nullptr;
+#endif
+}
+
+extern "C" void yardstick_free_query_scopes(YardstickQueryScopeList* list) {
+    if (!list) {
+        return;
+    }
+    for (size_t i = 0; i < list->count; i++) {
+        for (size_t j = 0; j < list->scopes[i].visible_cte_count; j++) {
+            free(const_cast<char*>(list->scopes[i].visible_ctes[j]));
+        }
+        delete[] list->scopes[i].visible_ctes;
+    }
+    delete[] list->scopes;
+    delete list;
+}
+
 extern "C" void yardstick_free_current_reference_list(YardstickCurrentReferenceList* list) {
     if (!list) {
         return;
@@ -1441,6 +1471,134 @@ extern "C" void yardstick_free_aggregate_list(YardstickAggregateCallList* list) 
 //=============================================================================
 
 #if YARDSTICK_GRAMMAR_EXTENSION
+// Resolve only lexical ownership here. An unqualified column below a sourced
+// query needs schema binding; do not guess that it belongs to the outer query.
+static void NativeRelationQualifiers(TableRef &ref, std::unordered_set<string> &qualifiers) {
+    if (!ref.alias.empty()) {
+        qualifiers.insert(StringUtil::Lower(YsName(ref.alias)));
+    } else if (ref.type == TableReferenceType::BASE_TABLE) {
+        qualifiers.insert(StringUtil::Lower(YsBaseTableName(ref.Cast<BaseTableRef>())));
+    } else if (ref.type == TableReferenceType::TABLE_FUNCTION) {
+        auto &function = ref.Cast<TableFunctionRef>().function;
+        if (function && function->GetExpressionClass() == ExpressionClass::FUNCTION) {
+            qualifiers.insert(StringUtil::Lower(YsFuncName(function->Cast<FunctionExpression>())));
+        }
+    }
+    if (ref.type == TableReferenceType::JOIN) {
+        auto &join = ref.Cast<JoinRef>();
+        NativeRelationQualifiers(*join.left, qualifiers);
+        NativeRelationQualifiers(*join.right, qualifiers);
+    } else if (ref.type == TableReferenceType::PIVOT) {
+        NativeRelationQualifiers(*ref.Cast<PivotRef>().source, qualifiers);
+    }
+}
+
+static vector<string> NativeSubqueryDimensions(ParsedExpression &projection, SelectNode &outer) {
+    struct Scope {
+        bool unqualified_outer = true;
+        bool nested = false;
+        std::unordered_set<string> shadowed;
+        std::unordered_set<string> aliases;
+    };
+    std::unordered_set<string> outer_qualifiers;
+    NativeRelationQualifiers(*outer.from_table, outer_qualifiers);
+    vector<string> dimensions;
+    std::function<void(ParsedExpression &, const Scope &)> expression;
+    std::function<void(QueryNode &, Scope)> query;
+    std::function<void(TableRef &, const Scope &)> table;
+    expression = [&](ParsedExpression &expr, const Scope &scope) {
+        if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+            auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+            bool belongs_to_outer = scope.unqualified_outer && !scope.aliases.count(StringUtil::Lower(YsName(names.back())));
+            if (names.size() > 1 && scope.nested) {
+                // Catalog/schema prefixes precede the relation component.
+                auto qualifier = StringUtil::Lower(YsName(names[names.size() - 2]));
+                belongs_to_outer = outer_qualifiers.count(qualifier) && !scope.shadowed.count(qualifier);
+            }
+            if (belongs_to_outer) {
+                auto sql = expr.ToString();
+                if (std::find(dimensions.begin(), dimensions.end(), sql) == dimensions.end()) {
+                    dimensions.push_back(std::move(sql));
+                }
+            }
+        } else if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+            query(*expr.Cast<SubqueryExpression>().SubqueryMutable()->node, scope);
+        }
+        ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) { expression(child, scope); });
+    };
+    table = [&](TableRef &ref, const Scope &scope) {
+        if (ref.type == TableReferenceType::SUBQUERY) {
+            query(*ref.Cast<SubqueryRef>().subquery->node, scope);
+        } else if (ref.type == TableReferenceType::JOIN) {
+            auto &join = ref.Cast<JoinRef>();
+            table(*join.left, scope);
+            table(*join.right, scope);
+            if (join.condition) {
+                expression(*join.condition, scope);
+            }
+        } else if (ref.type == TableReferenceType::PIVOT) {
+            auto &pivot = ref.Cast<PivotRef>();
+            table(*pivot.source, scope);
+            for (auto &aggregate : pivot.aggregates) {
+                expression(*aggregate, scope);
+            }
+        } else {
+            ParsedExpressionIterator::EnumerateTableRefChildren(ref,
+                [&](unique_ptr<ParsedExpression> &expr) { expression(*expr, scope); });
+            if (ref.type == TableReferenceType::TABLE_FUNCTION) {
+                auto &subquery = ref.Cast<TableFunctionRef>().subquery;
+                if (subquery) {
+                    query(*subquery->node, scope);
+                }
+            }
+        }
+    };
+    query = [&](QueryNode &node, Scope scope) {
+        scope.nested = true;
+        for (auto &cte : node.cte_map.map) {
+            if (cte.second->query_node) {
+                query(*cte.second->query_node, scope);
+            }
+        }
+        if (node.type == QueryNodeType::SELECT_NODE) {
+            auto &select = node.Cast<SelectNode>();
+            if (select.from_table->type != TableReferenceType::EMPTY_FROM) {
+                scope.unqualified_outer = false;
+                NativeRelationQualifiers(*select.from_table, scope.shadowed);
+            }
+            for (auto &expr : select.select_list) {
+                expression(*expr, scope);
+                if (expr->HasAlias()) {
+                    scope.aliases.insert(StringUtil::Lower(YsName(expr->GetAlias())));
+                }
+            }
+            for (auto &expr : select.groups.group_expressions) {
+                expression(*expr, scope);
+            }
+            for (auto *expr : {select.where_clause.get(), select.having.get(), select.qualify.get()}) {
+                if (expr) {
+                    expression(*expr, scope);
+                }
+            }
+            table(*select.from_table, scope);
+        } else if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+            for (auto &child : node.Cast<SetOperationNode>().children) {
+                query(*child, scope);
+            }
+        } else if (node.type == QueryNodeType::RECURSIVE_CTE_NODE) {
+            auto &recursive = node.Cast<RecursiveCTENode>();
+            query(*recursive.left, scope);
+            query(*recursive.right, scope);
+        } else {
+            throw ParserException("Unsupported subquery grouping scope");
+        }
+        ParsedExpressionIterator::EnumerateQueryNodeModifiers(node,
+            [&](unique_ptr<ParsedExpression> &expr) { expression(*expr, scope); });
+    };
+    expression(projection, Scope {});
+    return dimensions;
+}
+
 static void CollectNativeAtReferences(ParsedExpression &expression,
                                       vector<YardstickMeasureReference> &references) {
     if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
@@ -1606,6 +1764,18 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
                 auto location = expr->GetQueryLocation();
                 item.start_pos = location.IsValid() ? location.Start() : 0;
                 item.end_pos = location.IsValid() ? location.End() : 0;
+                ParsedExpressionIterator::VisitExpressionClass(*expr, ExpressionClass::SUBQUERY,
+                    [&](const ParsedExpression &) { item.contains_subquery = true; });
+                if (item.contains_subquery) {
+                    auto dimensions = NativeSubqueryDimensions(*expr, *select_node);
+                    item.subquery_dimension_count = dimensions.size();
+                    if (!dimensions.empty()) {
+                        item.subquery_dimensions = new const char *[dimensions.size()] {};
+                        for (idx_t i = 0; i < dimensions.size(); i++) {
+                            item.subquery_dimensions[i] = safe_strdup(dimensions[i]);
+                        }
+                    }
+                }
                 if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
                     auto &names = expr->Cast<ColumnRefExpression>().ColumnNames();
                     if (names.size() == 1 || names.size() == 2) {
@@ -1706,6 +1876,10 @@ extern "C" void yardstick_free_select_info(YardstickSelectInfo* info) {
         free(const_cast<char*>(info->items[i].alias));
         free(const_cast<char*>(info->items[i].reference_column));
         free(const_cast<char*>(info->items[i].reference_qualifier));
+        for (size_t j = 0; j < info->items[i].subquery_dimension_count; j++) {
+            free(const_cast<char*>(info->items[i].subquery_dimensions[j]));
+        }
+        delete[] info->items[i].subquery_dimensions;
     }
     delete[] info->items;
 
@@ -2020,6 +2194,232 @@ extern "C" int32_t yardstick_expressions_equal(const char* left, const char* rig
     } catch (const std::exception &) {
         return 0;
     }
+}
+
+#if YARDSTICK_GRAMMAR_EXTENSION
+namespace {
+struct VisibleFilterScope {
+    bool unqualified_is_local = true;
+    bool alias_is_local = true;
+    bool inner_alias_shadowed = false;
+    TableQualifierSet aliases;
+    TableQualifierSet lambda_parameters;
+};
+
+class VisibleFilterRewriter {
+public:
+    VisibleFilterRewriter(string local_alias, const ParserOptions &options)
+        : local_alias(std::move(local_alias)), options(options) {
+    }
+
+    std::unordered_map<string, unique_ptr<ParsedExpression>> dimensions;
+
+    void Expression(unique_ptr<ParsedExpression> &expression, VisibleFilterScope scope) {
+        if (!expression) {
+            return;
+        }
+        if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+            auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
+            if (scope.lambda_parameters.count(StringUtil::Lower(names[0].GetIdentifierName()))) {
+                return;
+            }
+            bool local = names.size() == 1 ? scope.unqualified_is_local &&
+                    !scope.aliases.count(StringUtil::Lower(names[0].GetIdentifierName()))
+                : names.size() >= 2 && scope.alias_is_local && !local_alias.empty() &&
+                  names[names.size() - 2] == Identifier(local_alias);
+            if (local) {
+                if (scope.inner_alias_shadowed) {
+                    throw ParserException("Conflicting recomputation alias in visible filter");
+                }
+                auto alias = expression->GetAlias();
+                auto entry = dimensions.find(StringUtil::Lower(names.back().GetIdentifierName()));
+                if (entry == dimensions.end()) {
+                    expression = make_uniq<ColumnRefExpression>(names.back(), Identifier("_inner"));
+                } else {
+                    expression = entry->second->Copy();
+                }
+                expression->SetAlias(std::move(alias));
+            }
+            return;
+        }
+        if (expression->GetExpressionClass() == ExpressionClass::LAMBDA) {
+            auto &lambda = expression->Cast<LambdaExpression>();
+            if (lambda.GetLambdaSyntaxType() == LambdaSyntaxType::LAMBDA_KEYWORD) {
+                string error;
+                auto parameters = lambda.ExtractColumnRefExpressions(error);
+                if (!error.empty()) throw ParserException(error);
+                for (auto &parameter : parameters) {
+                    auto &names = parameter.get().Cast<ColumnRefExpression>().ColumnNames();
+                    if (names.size() != 1) throw ParserException("Invalid lambda parameter in visible filter");
+                    scope.lambda_parameters.insert(StringUtil::Lower(names[0].GetIdentifierName()));
+                }
+                Expression(lambda.RightMutable(), scope);
+                return;
+            }
+            // Arrow expressions also represent JSON access. Only explicit
+            // lambda syntax establishes parameter bindings before binding.
+        }
+        if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+            auto &subquery = expression->Cast<SubqueryExpression>();
+            // IN/ANY's left operand belongs to the containing expression scope.
+            Expression(subquery.GetChildMutable(), scope);
+            Query(*subquery.SubqueryMutable()->node, scope);
+            return;
+        }
+        ParsedExpressionIterator::EnumerateChildren(*expression,
+            [&](unique_ptr<ParsedExpression> &child) { Expression(child, scope); });
+    }
+
+    void AddDimension(const char *name, const char *sql) {
+        auto expressions = Parser::ParseExpressionList(sql, options);
+        if (expressions.size() != 1 || expressions[0]->HasSubquery()) {
+            throw ParserException("Unsupported dimension in visible filter");
+        }
+        ParsedExpressionIterator::VisitExpressionClassMutable(*expressions[0], ExpressionClass::COLUMN_REF,
+            [](ParsedExpression &expression) {
+                auto &names = expression.Cast<ColumnRefExpression>().ColumnNamesMutable();
+                auto column = names.back();
+                names = {Identifier("_inner"), std::move(column)};
+            });
+        dimensions.emplace(StringUtil::Lower(name), std::move(expressions[0]));
+    }
+
+private:
+    string local_alias;
+    const ParserOptions &options;
+
+    void Qualifiers(const TableRef &table, TableQualifierSet &qualifiers) {
+        CollectTableQualifiers(&table, qualifiers);
+        if (table.type == TableReferenceType::JOIN) {
+            auto &join = table.Cast<JoinRef>();
+            Qualifiers(*join.left, qualifiers);
+            Qualifiers(*join.right, qualifiers);
+        } else if (table.type == TableReferenceType::TABLE_FUNCTION && table.alias.empty()) {
+            auto &function = table.Cast<TableFunctionRef>();
+            if (function.function->GetExpressionClass() == ExpressionClass::FUNCTION) {
+                AddTableQualifier(qualifiers, YsFuncName(function.function->Cast<FunctionExpression>()));
+            }
+        }
+    }
+
+    VisibleFilterScope WithBindings(const TableRef &table, VisibleFilterScope scope) {
+        if (table.type == TableReferenceType::EMPTY_FROM) return scope;
+        scope.unqualified_is_local = false;
+        TableQualifierSet qualifiers;
+        Qualifiers(table, qualifiers);
+        scope.alias_is_local = scope.alias_is_local &&
+            !qualifiers.count(NormalizeAliasName(local_alias));
+        scope.inner_alias_shadowed = scope.inner_alias_shadowed || qualifiers.count("_inner");
+        return scope;
+    }
+
+    void Query(QueryNode &query, VisibleFilterScope outer) {
+        // CTE bodies cannot see the containing SELECT's FROM bindings.
+        for (auto &entry : query.cte_map.map) {
+            if (!entry.second->query_node) {
+                throw ParserException("Unsupported CTE in visible filter");
+            }
+            Query(*entry.second->query_node, outer);
+        }
+        auto scope = outer;
+        switch (query.type) {
+        case QueryNodeType::SELECT_NODE: {
+            auto &select = query.Cast<SelectNode>();
+            if (select.from_table && select.from_table->type != TableReferenceType::EMPTY_FROM) {
+                scope = WithBindings(*select.from_table, outer);
+                // A derived table's own alias is not visible inside its body.
+                Table(*select.from_table, outer);
+            }
+            for (auto &item : select.select_list) {
+                Expression(item, scope);
+                if (item->HasAlias()) {
+                    scope.aliases.insert(StringUtil::Lower(YsName(item->GetAlias())));
+                }
+            }
+            for (auto &group : select.groups.group_expressions) Expression(group, scope);
+            Expression(select.where_clause, scope);
+            Expression(select.having, scope);
+            Expression(select.qualify, scope);
+            break;
+        }
+        case QueryNodeType::SET_OPERATION_NODE:
+            for (auto &child : query.Cast<SetOperationNode>().children) Query(*child, outer);
+            // Set result modifiers reference output columns, not base rows.
+            scope.unqualified_is_local = false;
+            break;
+        case QueryNodeType::RECURSIVE_CTE_NODE: {
+            auto &cte = query.Cast<RecursiveCTENode>();
+            Query(*cte.left, outer);
+            Query(*cte.right, outer);
+            scope.unqualified_is_local = false;
+            for (auto &key : cte.key_targets) Expression(key, scope);
+            break;
+        }
+        default:
+            throw ParserException("Unsupported query in visible filter");
+        }
+        ParsedExpressionIterator::EnumerateQueryNodeModifiers(query,
+            [&](unique_ptr<ParsedExpression> &expression) { Expression(expression, scope); });
+    }
+
+    void Table(TableRef &table, VisibleFilterScope scope) {
+        switch (table.type) {
+        case TableReferenceType::JOIN: {
+            auto &join = table.Cast<JoinRef>();
+            Table(*join.left, scope);
+            Table(*join.right, WithBindings(*join.left, scope));
+            Expression(join.condition, WithBindings(table, scope));
+            break;
+        }
+        case TableReferenceType::SUBQUERY:
+            Query(*table.Cast<SubqueryRef>().subquery->node, scope);
+            break;
+        case TableReferenceType::EXPRESSION_LIST:
+            for (auto &row : table.Cast<ExpressionListRef>().values)
+                for (auto &expression : row) Expression(expression, scope);
+            break;
+        case TableReferenceType::TABLE_FUNCTION: {
+            auto &function = table.Cast<TableFunctionRef>();
+            Expression(function.function, scope);
+            if (function.subquery) Query(*function.subquery->node, scope);
+            break;
+        }
+        case TableReferenceType::BASE_TABLE:
+        case TableReferenceType::EMPTY_FROM:
+            break;
+        default:
+            throw ParserException("Unsupported table in visible filter");
+        }
+    }
+};
+} // namespace
+#endif
+
+extern "C" char* yardstick_rewrite_visible_filter(const char* expression, const char* local_alias,
+                                                  const char* const* dimension_names,
+                                                  const char* const* dimension_expressions,
+                                                  size_t dimension_count, char** error) {
+    if (error) *error = nullptr;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    auto *options = CurrentNativeYardstickParserOptions();
+    if (!options || !expression) return nullptr;
+    try {
+        auto expressions = Parser::ParseExpressionList(expression, *options);
+        if (expressions.size() != 1) {
+            throw ParserException("Expected one expression in visible filter");
+        }
+        VisibleFilterRewriter rewriter(local_alias ? local_alias : "", *options);
+        for (size_t i = 0; i < dimension_count; i++) {
+            rewriter.AddDimension(dimension_names[i], dimension_expressions[i]);
+        }
+        rewriter.Expression(expressions[0], {});
+        return safe_strdup(expressions[0]->ToString());
+    } catch (const std::exception &exception) {
+        if (error) *error = safe_strdup(exception.what());
+        return nullptr;
+    }
+#endif
+    return nullptr;
 }
 
 //=============================================================================

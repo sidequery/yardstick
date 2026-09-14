@@ -129,11 +129,11 @@ SELECT missing.revenue AT (ALL) FROM native_implicit_v v;
 ----
 <REGEX>:.*(Parser Error|Catalog Error|Binder Error).*
 
-# A scalar subquery's source is not a root relation for shorthand lookup.
-statement error
+# A scalar subquery lowers its shorthand in its own relation scope.
+query R
 SELECT (SELECT revenue AT (ALL) FROM native_implicit_v);
 ----
-<REGEX>:.*(Parser Error|Catalog Error|Binder Error).*
+375.0
 
 # Standard aggregate expressions must not become implicit grouping dimensions.
 query RR
