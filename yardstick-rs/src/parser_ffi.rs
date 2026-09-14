@@ -795,28 +795,51 @@ unsafe fn c_str_to_string(ptr: *const c_char) -> Option<String> {
 /// assert_eq!(calls[0].measure_name, "revenue");
 /// ```
 pub fn find_aggregates(sql: &str) -> Result<Vec<AggregateCall>, String> {
-    find_aggregates_with_source(sql).map(|(calls, _)| calls)
+    find_aggregates_with_source(sql)
+        .map(|(calls, _)| calls)
+        .map_err(|error| error.message)
 }
 
-pub(crate) fn find_aggregates_with_source(sql: &str) -> Result<(Vec<AggregateCall>, bool), String> {
-    if FN_FIND_AGGREGATES.load(Ordering::SeqCst).is_null() {
-        return Err("Parser FFI not initialized".to_string());
+#[derive(Debug)]
+pub(crate) struct AggregateParseError {
+    pub message: String,
+    pub native_parsed: bool,
+}
+
+impl AggregateParseError {
+    fn compatibility(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            native_parsed: false,
+        }
     }
-    let c_sql = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
+}
+
+pub(crate) fn find_aggregates_with_source(
+    sql: &str,
+) -> Result<(Vec<AggregateCall>, bool), AggregateParseError> {
+    if FN_FIND_AGGREGATES.load(Ordering::SeqCst).is_null() {
+        return Err(AggregateParseError::compatibility("Parser FFI not initialized"));
+    }
+    let c_sql = CString::new(sql)
+        .map_err(|e| AggregateParseError::compatibility(format!("Invalid SQL string: {e}")))?;
 
     unsafe {
         let list_ptr = yardstick_find_aggregates(c_sql.as_ptr());
         if list_ptr.is_null() {
-            return Err("Failed to parse SQL".to_string());
+            return Err(AggregateParseError::compatibility("Failed to parse SQL"));
         }
 
         let list = &*list_ptr;
 
         // Check for error
         if !list.error.is_null() {
-            let error_msg = c_str_to_string(list.error).unwrap_or_else(|| "Unknown error".to_string());
+            let error = AggregateParseError {
+                message: c_str_to_string(list.error).unwrap_or_else(|| "Unknown error".to_string()),
+                native_parsed: list.native_parsed,
+            };
             yardstick_free_aggregate_list(list_ptr);
-            return Err(error_msg);
+            return Err(error);
         }
 
         // Convert calls to Rust types

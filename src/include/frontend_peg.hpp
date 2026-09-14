@@ -50,8 +50,9 @@ ClientContext *CurrentNativeYardstickClientContext();
 // Parse through the active grammar while retaining Yardstick syntax capture.
 bool ParseNativeYardstickQuery(const string &sql, Parser &parser);
 
-// Returns a complete native result, freed with yardstick_free_aggregate_list,
-// or nullptr when no native scope is available or the syntax is unsupported.
+// Returns a complete native result or recognized semantic error, freed with
+// yardstick_free_aggregate_list. nullptr retains compatibility for unavailable
+// native grammar or source forms outside the native adapter.
 YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql);
 
 // Source-preserving measure declarations. nullptr retains the legacy parser.

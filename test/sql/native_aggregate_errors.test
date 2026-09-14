@@ -1,0 +1,171 @@
+# name: test/sql/native_aggregate_errors.test
+# description: Unsupported measure-call decorations fail instead of losing semantics in compatibility lowering.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE aggregate_error_sales(region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO aggregate_error_sales VALUES ('a', 10), ('a', 10), ('b', 30);
+
+statement ok
+CREATE VIEW aggregate_error_v AS
+SELECT region, amount, SUM(amount) AS MEASURE revenue,
+       SUM(amount) FILTER (WHERE amount > 10) AS MEASURE large_revenue
+FROM aggregate_error_sales;
+
+statement ok
+CREATE TABLE aggregate_error_results(total INTEGER);
+
+foreach parser_mode true false
+
+statement ok
+SET heap_based_parser=${parser_mode};
+
+statement error
+SELECT AGGREGATE(DISTINCT revenue) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue ORDER BY amount) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue) FILTER (WHERE amount > 10) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue) OVER () FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue) OVER (PARTITION BY region) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue) EXPORT_STATE FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+# Trivia, nested scopes, built-in calls, and AT must not hide the error.
+statement error
+SELECT "AGGREGATE"/* comment */(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT aggregate([1, 2], 'sum'), AGGREGATE(revenue),
+       AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT revenue AT (ALL), AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue) FILTER (WHERE FALSE), revenue AT (ALL) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT (SELECT AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v);
+----
+Yardstick AGGREGATE does not support
+
+statement error
+WITH totals AS (SELECT AGGREGATE(revenue) OVER (PARTITION BY region) AS total FROM aggregate_error_v)
+SELECT * FROM totals;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v
+UNION ALL SELECT AGGREGATE(revenue) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(DISTINCT revenue) AT (ALL) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue ORDER BY amount) AT (ALL) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue) FILTER (WHERE FALSE) AT (ALL) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue) OVER () AT (ALL) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+INSERT INTO aggregate_error_results
+SELECT AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+# Modifier subqueries retain their own expression validation.
+statement error
+SELECT AGGREGATE(revenue) AT (WHERE amount = (
+    SELECT AGGREGATE(revenue) FILTER (WHERE FALSE) FROM aggregate_error_v
+)) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+statement error
+SELECT AGGREGATE(revenue) AT (SET amount = (
+    SELECT AGGREGATE(revenue) OVER () FROM aggregate_error_v LIMIT 1
+)) FROM aggregate_error_v;
+----
+Yardstick AGGREGATE does not support
+
+# Ordinary aggregate decorations in a measure definition remain valid.
+query RR
+SELECT AGGREGATE(revenue), AGGREGATE(large_revenue) FROM aggregate_error_v;
+----
+50.0	30.0
+
+query IR
+SELECT aggregate([1, 2], 'sum'), AGGREGATE(revenue) FROM aggregate_error_v;
+----
+3	50.0
+
+query R
+SELECT AGGREGATE(revenue) AS export_state FROM aggregate_error_v;
+----
+50.0
+
+# DuckDB retains ownership of invalid decorations on its multiargument scalar.
+statement error
+SELECT aggregate(DISTINCT [1, 2], 'sum');
+----
+Scalar Function
+
+statement error
+SELECT aggregate([1, 2], 'sum') OVER ();
+----
+aggregate is not an aggregate function
+
+endloop
+
+query I
+SELECT COUNT(*) FROM aggregate_error_results;
+----
+0

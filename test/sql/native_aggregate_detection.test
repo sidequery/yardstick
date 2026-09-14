@@ -41,7 +41,25 @@ FROM aggregate_detection_v;
 ----
 30.0
 
-# CTEs, FROM subqueries and expression subqueries all contain query nodes.
+# Grouping parentheses belong to the AT operand, including chained modifiers.
+query TR
+SELECT '東京', ((/* before */ AGGREGATE(revenue) /* after */)) AT (WHERE year = 2023)
+FROM aggregate_detection_v;
+----
+東京	30.0
+
+query RR
+SELECT (AGGREGATE(revenue) AT (WHERE year = 2023)) AT (ALL),
+       2 * ((AGGREGATE(revenue))) AT (WHERE year = 2024)
+FROM aggregate_detection_v;
+----
+70.0	80.0
+
+query R
+SELECT aggregate([1, ((AGGREGATE(revenue))) AT (ALL)], 'sum') FROM aggregate_detection_v;
+----
+71.0
+
 query R
 WITH totals AS (SELECT AGGREGATE(revenue) AS total FROM aggregate_detection_v)
 SELECT total FROM totals;

@@ -284,8 +284,12 @@ pub fn has_as_measure(sql: &str) -> bool {
 
 /// Check if SQL contains AGGREGATE( function
 pub fn has_aggregate_function(sql: &str) -> bool {
-    if let Ok((calls, true)) = parser_ffi::find_aggregates_with_source(sql) {
-        return !calls.is_empty();
+    match parser_ffi::find_aggregates_with_source(sql) {
+        Ok((calls, true)) => return !calls.is_empty(),
+        // Recognized native syntax errors must reach expansion, which reports
+        // them before compatibility scanning can discard call decorations.
+        Err(error) if error.native_parsed => return true,
+        _ => {}
     }
     let chars: Vec<char> = sql.chars().collect();
     let len = chars.len();
@@ -7462,6 +7466,18 @@ fn warning_for_at_all_ungrouped_where_with_qualifiers(
 
 /// Expand AGGREGATE() with AT modifiers in SQL
 pub fn expand_aggregate_with_at(sql: &str) -> AggregateExpandResult {
+    // Validate the complete statement before rewriting individual query scopes.
+    // This also covers calls in statement wrappers and nested expressions.
+    if let Err(error) = parser_ffi::find_aggregates_with_source(sql) {
+        if error.native_parsed {
+            return AggregateExpandResult {
+                had_aggregate: true,
+                expanded_sql: sql.to_string(),
+                error: Some(error.message),
+                warnings: Vec::new(),
+            };
+        }
+    }
     if let Some(scopes) = parser_ffi::find_query_scopes(sql) {
         return expand_native_query_scopes(sql, &scopes);
     }
