@@ -8046,9 +8046,9 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
                 if decorated_call.is_some() {
                     wrap_decorated_scalar_recomputation(&eval_sql)
                 } else {
-                    // Collapse repeated copies of one scalar context value without
-                    // MAX's comparison binding (which fails for LIST subqueries on 2.0).
-                    format!("ANY_VALUE({eval_sql})")
+                    // Correlated contexts can produce different values. Retain
+                    // MAX semantics without 2.0's broken MAX(LIST subquery) binding.
+                    format!("LIST_MAX(LIST({eval_sql}))")
                 }
             } else {
                 eval_sql
@@ -8070,7 +8070,7 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
                 if decorated_call.is_some() {
                     wrap_decorated_scalar_recomputation(&eval_sql)
                 } else {
-                    format!("ANY_VALUE({eval_sql})")
+                    format!("LIST_MAX(LIST({eval_sql}))")
                 }
             } else {
                 eval_sql
@@ -8226,7 +8226,7 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
                 if decorated_call.is_some() {
                     wrap_decorated_scalar_recomputation(&eval_sql)
                 } else {
-                    format!("ANY_VALUE({eval_sql})")
+                    format!("LIST_MAX(LIST({eval_sql}))")
                 }
             } else {
                 eval_sql

@@ -2,6 +2,9 @@
 
 #include "yardstick_extension.hpp"
 #include "yardstick_parser_compat.hpp"
+#if YARDSTICK_PARSER_INSTANCE_API
+#include "duckdb/main/settings.hpp"
+#endif
 #include "yardstick_parser_extension.hpp"
 #include "frontend_peg.hpp"
 #include "aggregate_state.hpp"
@@ -205,6 +208,13 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
     auto &execution_config = ClientConfig::GetConfig(*con.context);
     execution_config.active_grammar_extensions = source_config.active_grammar_extensions;
     execution_config.cached_grammar = source_config.cached_grammar;
+#if YARDSTICK_PARSER_INSTANCE_API
+    // This is a binder setting, not a ParserOptions field. The private
+    // execution connection must allow the same ORDER BY syntax as its caller.
+    Settings::Set<OrderByNonIntegerLiteralSetting>(
+        *con.context, SetScope::SESSION,
+        Value::BOOLEAN(Settings::Get<OrderByNonIntegerLiteralSetting>(context)));
+#endif
 #endif
     auto query_result = con.Query(data->rewritten_sql);
 

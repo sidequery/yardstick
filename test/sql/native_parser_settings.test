@@ -52,3 +52,26 @@ NULL
 
 statement ok
 RESET regex_match_operator_semantics;
+
+# ORDER BY literal acceptance is a binder setting. Preserve it on the
+# wrapper's execution connection, while deferred SELECTs bind on the caller.
+statement ok
+SET order_by_non_integer_literal=true;
+
+query I
+SELECT AGGREGATE(revenue) FROM parser_settings_v ORDER BY 'ignored';
+----
+325
+
+query I
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) FROM parser_settings_v ORDER BY ''ignored''');
+----
+325
+
+statement ok
+SET order_by_non_integer_literal=false;
+
+statement error
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) FROM parser_settings_v ORDER BY ''ignored''');
+----
+ORDER BY non-integer literal
