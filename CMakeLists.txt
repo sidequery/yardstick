@@ -30,6 +30,7 @@ function(yardstick_detect_apis)
     unset(YARDSTICK_NEW_EXPR_API CACHE)
     unset(YARDSTICK_RESULT_ACCESSORS CACHE)
     unset(YARDSTICK_GRAMMAR_EXTENSION CACHE)
+    unset(YARDSTICK_PARSER_INSTANCE_API CACHE)
     check_cxx_source_compiles("
         #include <duckdb/parser/parser_extension.hpp>
         #include <type_traits>
@@ -45,6 +46,13 @@ function(yardstick_detect_apis)
         #include <duckdb/main/query_result.hpp>
         void probe(duckdb::QueryResult &result) { result.GetTypes(); }
     " YARDSTICK_RESULT_ACCESSORS)
+    check_cxx_source_compiles("
+        #include <duckdb/parser/parser.hpp>
+        void probe() {
+            duckdb::Parser parser(duckdb::ParserOptions::Builtin());
+            parser.ParseExpressionList(\"1\");
+        }
+    " YARDSTICK_PARSER_INSTANCE_API)
     check_cxx_source_compiles("
         #include <duckdb/parser/grammar_extension.hpp>
         #include <duckdb/parser/peg/compiled_grammar.hpp>

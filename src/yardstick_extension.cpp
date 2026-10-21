@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "yardstick_extension.hpp"
+#include "yardstick_parser_compat.hpp"
 #include "yardstick_parser_extension.hpp"
 #include "frontend_peg.hpp"
 #include "aggregate_state.hpp"
@@ -120,7 +121,7 @@ static ParserOptions YardstickParserOptions() {
         return *options;
     }
 #endif
-    return ParserOptions();
+    return YardstickBuiltinParserOptions();
 }
 
 static std::string RewritePercentileWithinGroup(const std::string &sql) {
@@ -168,7 +169,7 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
 #if YARDSTICK_GRAMMAR_EXTENSION
     NativeYardstickBindScope bind_scope(context);
     auto &info = input.info->Cast<DeferredMeasureFunctionInfo>();
-    NativeYardstickParseScope native_scope(info.parser_info.get(), context.GetParserOptions());
+    NativeYardstickParseScope native_scope(info.parser_info.get(), YardstickContextParserOptions(context));
 #endif
     auto data = make_uniq<YardstickQueryData>();
     data->original_sql = input.inputs[0].GetValue<string>();
@@ -2283,7 +2284,7 @@ static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binde
 static unique_ptr<TableRef> DeferredMeasureSelectBindReplace(ClientContext &context, TableFunctionBindInput &input) {
     auto &info = input.info->Cast<DeferredMeasureFunctionInfo>();
     NativeYardstickBindScope bind_scope(context);
-    NativeYardstickParseScope parse_scope(info.parser_info.get(), context.GetParserOptions());
+    NativeYardstickParseScope parse_scope(info.parser_info.get(), YardstickContextParserOptions(context));
     auto state = context.registered_state->GetOrCreate<DeferredMeasureCatalogState>("yardstick_deferred_catalog");
     DeferredTemporaryMeasureScope temporary_scope(*state);
     string sql = input.inputs[0].GetValue<string>();

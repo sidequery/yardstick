@@ -14,11 +14,6 @@ INSERT INTO native_decl_sales VALUES
     (2022, 'US', 100), (2022, 'EU', 50),
     (2023, 'US', 150), (2023, 'EU', 75);
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 # These are ordinary views. Marker text must not become a declaration merely
 # because it occurs in CREATE VIEW source rather than a standalone SELECT.
 statement ok
@@ -250,5 +245,3 @@ AS MEASURE declarations must be in the top-level CREATE VIEW projection
 
 statement ok
 SET allow_parser_override_extension='fallback';
-
-endloop

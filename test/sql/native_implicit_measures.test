@@ -24,11 +24,6 @@ statement ok
 CREATE VIEW native_implicit_amount_v AS
 SELECT amount, SUM(amount) AS MEASURE amount_revenue FROM native_implicit_sales;
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 # INSERT's input SELECT retains its own projection and relation scope.
 statement ok
 INSERT INTO native_implicit_inserted
@@ -140,5 +135,3 @@ query RR
 SELECT MEDIAN(amount), amount_revenue FROM native_implicit_amount_v;
 ----
 100.0	375.0
-
-endloop

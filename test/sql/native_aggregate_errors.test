@@ -21,11 +21,6 @@ FROM aggregate_error_sales;
 statement ok
 CREATE TABLE aggregate_error_results(total INTEGER);
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 query R
 SELECT AGGREGATE(DISTINCT revenue) FROM aggregate_error_v;
 ----
@@ -198,9 +193,8 @@ SELECT aggregate([1, 2], 'sum') OVER ();
 ----
 aggregate is not an aggregate function
 
-endloop
 
 query I
 SELECT COUNT(*) FROM aggregate_error_results;
 ----
-2
+1

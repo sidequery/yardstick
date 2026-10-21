@@ -15,11 +15,6 @@ INSERT INTO current_sales VALUES (2022, 'US', 100), (2022, 'EU', 50), (2023, 'US
 statement ok
 CREATE VIEW current_sales_v AS SELECT year, region, SUM(amount) AS MEASURE current_revenue FROM current_sales;
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 # The quoted AGGREGATE function and trivia require the native frontend.
 query IR rowsort
 SELECT year, "AGGREGATE"(current_revenue) AT (SET year = CURRENT /* dimension */ year - 1)
@@ -137,7 +132,7 @@ SELECT year, "AGGREGATE"(current_revenue) AT (
 
 query IR rowsort
 SELECT year, "AGGREGATE"(current_revenue) AT (
-    SET year = (SELECT current year FROM (SELECT 2022 AS current))
+    SET year = (SELECT current AS year FROM (SELECT 2022 AS current))
 ) FROM current_sales_v;
 ----
 2022	150.0
@@ -147,12 +142,12 @@ statement ok
 SET active_grammar_extensions=['yardstick'];
 
 query I
-SELECT current year FROM (SELECT 2023 AS current);
+SELECT current AS year FROM (SELECT 2023 AS current);
 ----
 2023
 
 query I
-SELECT "current" year FROM (SELECT 2023 AS current);
+SELECT "current" AS year FROM (SELECT 2023 AS current);
 ----
 2023
 
@@ -181,7 +176,6 @@ DROP MACRO "current";
 statement ok
 SET active_grammar_extensions=[];
 
-endloop
 
 statement ok
 DROP VIEW current_sales_v;

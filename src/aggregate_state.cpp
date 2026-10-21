@@ -1,4 +1,5 @@
 #include "aggregate_state.hpp"
+#include "yardstick_parser_compat.hpp"
 
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "duckdb/common/exception.hpp"
@@ -102,7 +103,7 @@ private:
 };
 
 unique_ptr<ParsedExpression> ParseFormula(const string &formula) {
-	auto expressions = Parser::ParseExpressionList(formula);
+	auto expressions = YardstickParseExpressionList(formula);
 	if (expressions.size() != 1 || !expressions[0]->GetAlias().empty()) {
 		throw BinderException("yardstick_state requires exactly one scalar finalization expression");
 	}

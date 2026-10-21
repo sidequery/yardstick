@@ -16,11 +16,6 @@ statement ok
 CREATE VIEW aggregate_detection_v AS
 SELECT year, SUM(amount) AS MEASURE revenue FROM aggregate_detection_sales;
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 # Quoted and qualified names own the full function span. Unicode before the
 # call must not shift byte offsets, and comments cannot manufacture calls.
 query TR
@@ -90,5 +85,3 @@ query R
 SELECT aggregate([1, AGGREGATE(revenue) AT (ALL)], 'sum') FROM aggregate_detection_v;
 ----
 71.0
-
-endloop

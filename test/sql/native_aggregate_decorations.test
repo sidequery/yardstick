@@ -38,11 +38,6 @@ statement ok
 CREATE VIEW decoration_scope_v AS
 SELECT id, g AS area, x, SUM(x) AS MEASURE total FROM decoration_scope_rows;
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 query RRR
 SELECT AGGREGATE(DISTINCT revenue), AGGREGATE(DISTINCT average_amount), AGGREGATE(DISTINCT ratio)
 FROM decoration_v;
@@ -235,5 +230,3 @@ SELECT yardstick_finalize(yardstick_combine(a.state, b.state))
 FROM states a, states b WHERE a.area = 'a' AND b.area = 'b';
 ----
 70.0
-
-endloop

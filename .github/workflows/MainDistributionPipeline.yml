@@ -1,6 +1,6 @@
 #
 # Build and test the extension using the DuckDB reusable CI workflow.
-# Require the stable release and the upcoming release branch to build and test.
+# Require the legacy release and the pinned DuckDB 2.0 release to build and test.
 # DuckDB main is checked separately by the scheduled canary workflow.
 #
 name: Main Extension Distribution Pipeline
@@ -26,13 +26,16 @@ jobs:
       extra_toolchains: rust
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;linux_amd64_gcc4;windows_amd64_rtools;windows_amd64_mingw"
 
-  duckdb-next-build:
-    name: Build DuckDB v2.0-cyanoptera release branch extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+  duckdb-release-build:
+    name: Build DuckDB v2.0.0 extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@fe955ed3a046b0324cac2c691e73d8d776a7d5cc
     with:
-      duckdb_version: v2.0-cyanoptera
-      ci_tools_version: main
+      duckdb_version: v2.0.0
+      duckdb_commit: d54cbbe3df17e8e5ce68312f483b4155836112aa
+      ci_tools_version: fe955ed3a046b0324cac2c691e73d8d776a7d5cc
       test_config: '{"test_env_variables":{"YARDSTICK_NATIVE_PEG":"1"}}'
       extension_name: yardstick
       extra_toolchains: rust
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;linux_amd64_gcc4;windows_amd64_rtools;windows_amd64_mingw"
+      opt_in_archs: osx_amd64
+      reduced_ci_mode: disabled

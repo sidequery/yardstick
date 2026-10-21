@@ -2544,6 +2544,21 @@ JOIN fanout_orders o ON c.cust_id = o.cust_id;
 ----
 [25, 30, 35, 40]
 
+# Global AT recomputation also collapses repeated LIST values without an
+# ordering aggregate around the scalar subquery (DuckDB 2.0 cannot bind MAX).
+query T
+SEMANTIC SELECT AGGREGATE(age_list) AT (ALL)
+FROM fanout_customers_list_v c
+JOIN fanout_orders o ON c.cust_id = o.cust_id;
+----
+[25, 30, 35, 40]
+
+query T
+SEMANTIC SELECT AGGREGATE(age_list)
+FROM fanout_customers_list_v WHERE false;
+----
+NULL
+
 # -- Test 20: BOOL_AND / BOOL_OR measures immune to fan-out --
 # Dave (cust_id=4) has no orders, so the join excludes him.
 # He is the only non-premium and the only trial user. Without fan-out

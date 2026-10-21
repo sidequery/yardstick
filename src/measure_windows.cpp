@@ -1,4 +1,5 @@
 #include "measure_windows.hpp"
+#include "yardstick_parser_compat.hpp"
 
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "frontend_peg.hpp"
@@ -46,7 +47,7 @@ string Quote(const string &text) {
 }
 
 unique_ptr<ParsedExpression> Expression(const string &sql, const ParserOptions &options) {
-    auto expressions = Parser::ParseExpressionList(sql, options);
+    auto expressions = YardstickParseExpressionList(sql, options);
     if (expressions.size() != 1) {
         throw ParserException("Expected one expression while rewriting a measure window");
     }

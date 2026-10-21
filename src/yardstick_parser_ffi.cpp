@@ -8,6 +8,7 @@
  */
 
 #include "yardstick_ffi.h"
+#include "yardstick_parser_compat.hpp"
 #include "yardstick_compat.hpp"
 #include "frontend_peg.hpp"
 #include "aggregate_decorations.hpp"
@@ -80,7 +81,7 @@ static ParserOptions YardstickParserOptions() {
         return *options;
     }
 #endif
-    return ParserOptions();
+    return YardstickBuiltinParserOptions();
 }
 
 // Identifier/string -> raw string (case preserved). The Identifier overload only
@@ -1296,8 +1297,8 @@ extern "C" int32_t yardstick_current_where_is_single_valued(const char* predicat
         return -1;
     }
     try {
-        auto predicates = Parser::ParseExpressionList(predicate, *options);
-        auto dimensions = Parser::ParseExpressionList(dimension, *options);
+        auto predicates = YardstickParseExpressionList(predicate, *options);
+        auto dimensions = YardstickParseExpressionList(dimension, *options);
         if (predicates.size() != 1 || dimensions.size() != 1 ||
             dimensions[0]->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
             return 0;
@@ -1488,7 +1489,7 @@ extern "C" char* yardstick_decorate_measure(
         vector<string> cte_queries;
         for (size_t i = 0; i < binding_cte_count; i++) cte_queries.emplace_back(binding_ctes[i]);
         NativeYardstickCteBindScope binding_scope(cte_queries, options);
-        auto calls = Parser::ParseExpressionList(call_sql, options);
+        auto calls = YardstickParseExpressionList(call_sql, options);
         if (calls.size() != 1) throw ParserException("Expected one AGGREGATE call");
         // Window FILTER selects input rows in the lineage stage. DISTINCT and
         // argument ordering apply to the aggregate leaves being recomputed.
@@ -1517,7 +1518,7 @@ extern "C" char* yardstick_window_marker(const char* call_sql, const char* marke
     if (error) *error = nullptr;
 #if YARDSTICK_GRAMMAR_EXTENSION
     try {
-        auto expressions = Parser::ParseExpressionList(call_sql, YardstickParserOptions());
+        auto expressions = YardstickParseExpressionList(call_sql, YardstickParserOptions());
         if (expressions.size() != 1 || expressions[0]->GetExpressionClass() != ExpressionClass::WINDOW) {
             throw ParserException("Expected one windowed AGGREGATE call");
         }
@@ -2275,7 +2276,7 @@ extern "C" YardstickExpressionInfo* yardstick_parse_expression(const char* expr_
     }
 
     try {
-        auto expressions = Parser::ParseExpressionList(expr_str, YardstickParserOptions());
+        auto expressions = YardstickParseExpressionList(expr_str, YardstickParserOptions());
 
         if (expressions.empty()) {
             result->error = safe_strdup("No expressions parsed");
@@ -2314,8 +2315,8 @@ extern "C" int32_t yardstick_expressions_equal(const char* left, const char* rig
     }
     try {
         auto options = YardstickParserOptions();
-        auto left_expressions = Parser::ParseExpressionList(left, options);
-        auto right_expressions = Parser::ParseExpressionList(right, options);
+        auto left_expressions = YardstickParseExpressionList(left, options);
+        auto right_expressions = YardstickParseExpressionList(right, options);
         if (left_expressions.size() != 1 || right_expressions.size() != 1) {
             return 0;
         }
@@ -2400,7 +2401,7 @@ public:
     }
 
     void AddDimension(const char *name, const char *sql) {
-        auto expressions = Parser::ParseExpressionList(sql, options);
+        auto expressions = YardstickParseExpressionList(sql, options);
         if (expressions.size() != 1 || expressions[0]->HasSubquery()) {
             throw ParserException("Unsupported dimension in visible filter");
         }
@@ -2533,7 +2534,7 @@ extern "C" char* yardstick_rewrite_visible_filter(const char* expression, const 
     auto *options = CurrentNativeYardstickParserOptions();
     if (!options || !expression) return nullptr;
     try {
-        auto expressions = Parser::ParseExpressionList(expression, *options);
+        auto expressions = YardstickParseExpressionList(expression, *options);
         if (expressions.size() != 1) {
             throw ParserException("Expected one expression in visible filter");
         }
@@ -2717,12 +2718,12 @@ extern "C" char* yardstick_qualify_expression(const char* expr_str, const char* 
 #if YARDSTICK_GRAMMAR_EXTENSION
             if (!CurrentNativeYardstickParserOptions()) return nullptr;
             auto options = YardstickParserOptions();
-            auto dimensions = Parser::ParseExpressionList(dimension, options);
+            auto dimensions = YardstickParseExpressionList(dimension, options);
             if (dimensions.size() != 1 || dimensions[0]->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
                 return nullptr;
             }
             auto column = dimensions[0]->Cast<ColumnRefExpression>().GetColumnName();
-            auto qualified = Parser::ParseExpressionList(string(qualifier) + "." + dimension, options);
+            auto qualified = YardstickParseExpressionList(string(qualifier) + "." + dimension, options);
             if (qualified.size() != 1 || qualified[0]->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
                 return nullptr;
             }
@@ -2746,7 +2747,7 @@ extern "C" char* yardstick_qualify_expression(const char* expr_str, const char* 
             return nullptr;
 #endif
         }
-        auto expressions = Parser::ParseExpressionList(expr_str, YardstickParserOptions());
+        auto expressions = YardstickParseExpressionList(expr_str, YardstickParserOptions());
         if (expressions.empty()) {
             return safe_strdup(expr_str);
         }
