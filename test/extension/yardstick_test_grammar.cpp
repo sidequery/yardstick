@@ -8,16 +8,16 @@ using namespace duckdb;
 
 namespace {
 
-unique_ptr<TransformResultValue> TransformTestYear(PEGTransformer &, ParseResult &) {
+arena_ptr<TransformResultValue> TransformTestYear(PEGTransformer &transformer, ParseResult &) {
     // Keep this an expression when the lowerer emits it in GROUP BY; a bare
     // integer literal would be interpreted as a select-list ordinal.
     unique_ptr<ParsedExpression> expression =
         make_uniq<CastExpression>(LogicalType::INTEGER, ConstantExpression::Integer(2023));
-    return make_uniq<TypedTransformResult<unique_ptr<ParsedExpression>>>(std::move(expression));
+    return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(expression));
 }
 
-unique_ptr<TransformProcess> StartTestYear(PEGTransformer &transformer, ParseResult &result) {
-    return make_uniq<FinalizeTransformProcess>(transformer, result, TransformTestYear);
+arena_ptr<TransformProcess> StartTestYear(PEGTransformer &transformer, ParseResult &result) {
+    return transformer.MakeProcess<FinalizeTransformProcess>(transformer, result, TransformTestYear);
 }
 
 class TestGrammar final : public GrammarExtension {

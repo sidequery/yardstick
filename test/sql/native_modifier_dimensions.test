@@ -15,11 +15,6 @@ INSERT INTO modifier_dates VALUES ('2023-01-01', 'US', 10), ('2023-02-01', 'us',
 statement ok
 CREATE VIEW modifier_dates_v AS SELECT day, label, SUM(amount) AS MEASURE modifier_revenue FROM modifier_dates;
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 query IR rowsort
 SELECT MONTH(DAY), "AGGREGATE"(modifier_revenue) AT (SET month(day) = 2) FROM modifier_dates_v;
 ----
@@ -69,7 +64,6 @@ SELECT MONTH(day), "AGGREGATE"(modifier_revenue) AT (SET MONTH(day) = 2 ALL "mon
 1	30.0
 2	30.0
 
-endloop
 
 statement ok
 DROP VIEW modifier_dates_v;

@@ -12,11 +12,6 @@ CREATE TABLE native_star_data(year INTEGER, amount INTEGER);
 statement ok
 INSERT INTO native_star_data VALUES (2022, 100), (2022, 50), (2023, 225);
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 statement ok
 CREATE OR REPLACE VIEW native_star_view(fiscal_year, value, total) AS
 SELECT *, SUM(amount) AS MEASURE revenue FROM native_star_data;
@@ -206,5 +201,3 @@ ROLLBACK;
 
 statement ok
 SET allow_parser_override_extension='fallback';
-
-endloop

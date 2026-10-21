@@ -194,7 +194,7 @@ This is a staged frontend migration: forms the native grammar cannot parse retai
 
 For the combined-grammar regression suite, configure with `-DYARDSTICK_BUILD_GRAMMAR_TEST_EXTENSION=ON`, build `yardstick_test_grammar_loadable_extension`, and run the SQL tests with `YARDSTICK_NATIVE_PEG=1` and `YARDSTICK_GRAMMAR_TEST_EXTENSION` set to the fixture extension's absolute path. The fixture is excluded from normal builds.
 
-Supported build targets are DuckDB **v1.5.5** and the upcoming **v2.0-cyanoptera release branch**. The latter is a moving branch, not a released version. CI requires both targets to build and pass tests; DuckDB `main` runs separately as a scheduled, advisory canary.
+Supported build targets are DuckDB **v2.0.0** (pinned to `d54cbbe3df17e8e5ce68312f483b4155836112aa`) and legacy **v1.5.5**. The submodule and release CI use that exact 2.0 engine commit. CI requires both targets to build and pass tests; DuckDB `main` runs separately as a scheduled, advisory canary.
 
 Prerequisites:
 - CMake 3.12+

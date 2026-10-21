@@ -1,6 +1,10 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "yardstick_extension.hpp"
+#include "yardstick_parser_compat.hpp"
+#if YARDSTICK_PARSER_INSTANCE_API
+#include "duckdb/main/settings.hpp"
+#endif
 #include "yardstick_parser_extension.hpp"
 #include "frontend_peg.hpp"
 #include "aggregate_state.hpp"
@@ -120,7 +124,7 @@ static ParserOptions YardstickParserOptions() {
         return *options;
     }
 #endif
-    return ParserOptions();
+    return YardstickBuiltinParserOptions();
 }
 
 static std::string RewritePercentileWithinGroup(const std::string &sql) {
@@ -168,7 +172,7 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
 #if YARDSTICK_GRAMMAR_EXTENSION
     NativeYardstickBindScope bind_scope(context);
     auto &info = input.info->Cast<DeferredMeasureFunctionInfo>();
-    NativeYardstickParseScope native_scope(info.parser_info.get(), context.GetParserOptions());
+    NativeYardstickParseScope native_scope(info.parser_info.get(), YardstickContextParserOptions(context));
 #endif
     auto data = make_uniq<YardstickQueryData>();
     data->original_sql = input.inputs[0].GetValue<string>();
@@ -204,6 +208,13 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
     auto &execution_config = ClientConfig::GetConfig(*con.context);
     execution_config.active_grammar_extensions = source_config.active_grammar_extensions;
     execution_config.cached_grammar = source_config.cached_grammar;
+#if YARDSTICK_PARSER_INSTANCE_API
+    // This is a binder setting, not a ParserOptions field. The private
+    // execution connection must allow the same ORDER BY syntax as its caller.
+    Settings::Set<OrderByNonIntegerLiteralSetting>(
+        *con.context, SetScope::SESSION,
+        Value::BOOLEAN(Settings::Get<OrderByNonIntegerLiteralSetting>(context)));
+#endif
 #endif
     auto query_result = con.Query(data->rewritten_sql);
 
@@ -2283,7 +2294,7 @@ static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binde
 static unique_ptr<TableRef> DeferredMeasureSelectBindReplace(ClientContext &context, TableFunctionBindInput &input) {
     auto &info = input.info->Cast<DeferredMeasureFunctionInfo>();
     NativeYardstickBindScope bind_scope(context);
-    NativeYardstickParseScope parse_scope(info.parser_info.get(), context.GetParserOptions());
+    NativeYardstickParseScope parse_scope(info.parser_info.get(), YardstickContextParserOptions(context));
     auto state = context.registered_state->GetOrCreate<DeferredMeasureCatalogState>("yardstick_deferred_catalog");
     DeferredTemporaryMeasureScope temporary_scope(*state);
     string sql = input.inputs[0].GetValue<string>();

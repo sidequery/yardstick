@@ -12,6 +12,7 @@ class Parser;
 
 #if YARDSTICK_GRAMMAR_EXTENSION
 shared_ptr<ParserExtensionInfo> RegisterYardstickGrammar(DatabaseInstance &db);
+ParserOptions YardstickContextParserOptions(ClientContext &context);
 
 // Keep native parsing scoped to the override's database, active grammar, and
 // parser settings. Nested overrides restore the previous scope on return.

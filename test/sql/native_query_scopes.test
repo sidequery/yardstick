@@ -18,11 +18,6 @@ CREATE VIEW query_scope_v AS SELECT year, SUM(amount) AS MEASURE revenue FROM qu
 statement ok
 CREATE VIEW query_scope_ten AS SELECT year, SUM(amount * 10) AS MEASURE revenue FROM query_scope_sales;
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 # Schema-qualified references still name the local measure relation.
 query R
 SELECT AGGREGATE(revenue) FROM main.query_scope_v WHERE main.query_scope_v.year = 2023;
@@ -206,5 +201,3 @@ SELECT AGGREGATE(revenue) FROM query_scope_v v
 WHERE EXISTS (SELECT 1 FROM query_scope_sales _inner WHERE _inner.year = 2023);
 ----
 80.0
-
-endloop

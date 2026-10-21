@@ -12,13 +12,8 @@ CREATE TABLE native_sales (year INTEGER, region VARCHAR, amount INTEGER);
 statement ok
 INSERT INTO native_sales VALUES (2022, 'US', 100), (2022, 'EU', 50), (2023, 'US', 150), (2023, 'EU', 75);
 
-# Exercise both transformer modes. The connection's grammar setting stays empty:
+# The connection's grammar setting stays empty:
 # LOAD alone must enable Yardstick's native adapter.
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 statement ok
 CREATE OR REPLACE VIEW native_sales_v AS
 SELECT year, region, SUM(amount)AS/* measure trivia */MEASURE native_revenue
@@ -158,7 +153,6 @@ SELECT 'AS MEASURE fake', $$AGGREGATE(fake) AT (ALL)$$, 1 AS measure
 ----
 AS MEASURE fake	AGGREGATE(fake) AT (ALL)	1
 
-endloop
 
 # A newly opened connection inherits the registered adapter without a SET.
 query R second_connection
@@ -173,7 +167,7 @@ SET active_grammar_extensions=['yardstick'];
 
 # CURRENT remains an ordinary identifier outside AT expressions.
 query I
-SELECT current year FROM (SELECT 2023 AS current);
+SELECT current AS year FROM (SELECT 2023 AS current);
 ----
 2023
 

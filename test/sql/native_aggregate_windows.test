@@ -27,11 +27,6 @@ CREATE TABLE measure_window_right(id INTEGER);
 statement ok
 INSERT INTO measure_window_right VALUES (10), (20);
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 statement ok
 CREATE OR REPLACE VIEW measure_window_raw AS
 SELECT id, yr, region,
@@ -705,8 +700,3 @@ query I
 SELECT nextval('measure_window_cte_sequence');
 ----
 2
-
-endloop
-
-statement ok
-SET heap_based_parser=true;

@@ -1,0 +1,77 @@
+# name: test/sql/native_parser_settings.test
+# description: Session parser settings survive deferred binding and expression reparsing.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE parser_settings_sales(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO parser_settings_sales VALUES (2022, 100), (2023, 225);
+
+# A column list exercises deferred view binding; the wrapper reparses its SQL
+# under the originating session before executing on its private connection.
+statement ok
+CREATE VIEW parser_settings_v(fiscal_year, revenue) AS
+SELECT year, SUM(amount) AS MEASURE total FROM parser_settings_sales;
+
+statement ok
+SET integer_division=true;
+
+query I
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) AT (WHERE fiscal_year = 4045 / 2) FROM parser_settings_v');
+----
+100
+
+statement ok
+SET integer_division=false;
+
+query I
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) AT (WHERE fiscal_year = 4045 / 2) FROM parser_settings_v');
+----
+NULL
+
+statement ok
+SET regex_match_operator_semantics='partial';
+
+query I
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) AT (WHERE ''x2022y'' ~ ''2022'') FROM parser_settings_v');
+----
+325
+
+statement ok
+SET regex_match_operator_semantics='full';
+
+query I
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) AT (WHERE ''x2022y'' ~ ''2022'') FROM parser_settings_v');
+----
+NULL
+
+statement ok
+RESET regex_match_operator_semantics;
+
+# ORDER BY literal acceptance is a binder setting. Preserve it on the
+# wrapper's execution connection, while deferred SELECTs bind on the caller.
+statement ok
+SET order_by_non_integer_literal=true;
+
+query I
+SELECT AGGREGATE(revenue) FROM parser_settings_v ORDER BY 'ignored';
+----
+325
+
+query I
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) FROM parser_settings_v ORDER BY ''ignored''');
+----
+325
+
+statement ok
+SET order_by_non_integer_literal=false;
+
+statement error
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) FROM parser_settings_v ORDER BY ''ignored''');
+----
+ORDER BY non-integer literal

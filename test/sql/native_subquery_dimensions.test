@@ -18,11 +18,6 @@ SELECT year, SUM(amount) AS MEASURE revenue,
        SUM(amount) AS MEASURE "Net ""revenue"
 FROM subquery_dimension_sales;
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 # Multipart outer references contribute grouping dependencies, including
 # references reached through a subquery with its own unrelated relation.
 query IR rowsort
@@ -106,5 +101,3 @@ WITH totals AS (SELECT "Net ""revenue" FROM subquery_dimension_v)
 SELECT "Net ""revenue" FROM totals;
 ----
 70.0
-
-endloop

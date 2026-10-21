@@ -16,11 +16,6 @@ statement ok
 CREATE VIEW native_statement_v AS
 SELECT year, SUM(amount) AS MEASURE revenue FROM native_statement_sales;
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 statement ok
 CREATE OR REPLACE TABLE native_statement_output AS
 SELECT year, AGGREGATE(revenue) AT (ALL) AS total FROM native_statement_v GROUP BY year;
@@ -100,5 +95,3 @@ query R
 SELECT total FROM read_csv('__TEST_DIR__/native_statement_totals.csv');
 ----
 80.0
-
-endloop

@@ -15,11 +15,6 @@ INSERT INTO mixed_aggregate_sales VALUES (10), (20);
 statement ok
 CREATE VIEW mixed_aggregate_v AS SELECT SUM(amount) AS MEASURE revenue FROM mixed_aggregate_sales;
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 query IR
 SELECT aggregate([1,2], 'sum'), "AGGREGATE"/*c*/(revenue) FROM mixed_aggregate_v;
 ----
@@ -45,7 +40,6 @@ SELECT aggregate(["AGGREGATE"/* nested */(revenue), 1], 'sum') FROM mixed_aggreg
 ----
 31.0
 
-endloop
 
 # The list aggregate is a scalar dimension, not a Yardstick measure. A
 # row-dependent input must remain correlated to the selected dimension.

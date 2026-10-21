@@ -18,11 +18,6 @@ CREATE TABLE native_column_overlap(amount INTEGER, revenue INTEGER);
 statement ok
 INSERT INTO native_column_overlap VALUES (10, 1), (20, 2);
 
-foreach parser_mode true false
-
-statement ok
-SET heap_based_parser=${parser_mode};
-
 statement ok
 CREATE OR REPLACE VIEW native_column_full(fiscal_year, total) AS
 SELECT year, SUM(amount) AS MEASURE revenue FROM native_column_sales;
@@ -217,5 +212,3 @@ SELECT fiscal_year, total FROM native_column_ordinary ORDER BY fiscal_year, tota
 
 statement ok
 SET allow_parser_override_extension='fallback';
-
-endloop

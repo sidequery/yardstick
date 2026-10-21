@@ -1,4 +1,5 @@
 #include "aggregate_decorations.hpp"
+#include "yardstick_parser_compat.hpp"
 
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "duckdb/catalog/catalog.hpp"
@@ -32,7 +33,7 @@ namespace {
 using Names = std::unordered_set<string>;
 
 unique_ptr<ParsedExpression> ParseOne(const string &sql, const ParserOptions &options) {
-    auto expressions = Parser::ParseExpressionList(sql, options);
+    auto expressions = YardstickParseExpressionList(sql, options);
     if (expressions.size() != 1) {
         throw ParserException("Expected one expression in decorated AGGREGATE");
     }

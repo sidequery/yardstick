@@ -1,9 +1,11 @@
 #include "frontend_peg.hpp"
+#include "yardstick_parser_compat.hpp"
 
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "native_statement_traversal.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -296,7 +298,7 @@ void ReadModifier(PEGTransformer &transformer, ParseResult &result, vector<Nativ
     }
 }
 
-unique_ptr<TransformResultValue> TransformAt(PEGTransformer &transformer, ParseResult &result) {
+arena_ptr<TransformResultValue> TransformAt(PEGTransformer &transformer, ParseResult &result) {
     CaptureSpan(result, result);
     // BaseExpression inserts the left operand into this marker. Keep its
     // identity so aggregate traversal associates suffixes through AST parents.
@@ -311,10 +313,10 @@ unique_ptr<TransformResultValue> TransformAt(PEGTransformer &transformer, ParseR
         }
         active_capture->clauses.push_back(std::move(clause));
     }
-    return make_uniq<TypedTransformResult<unique_ptr<ParsedExpression>>>(std::move(expression));
+    return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(expression));
 }
 
-unique_ptr<TransformResultValue> TransformMeasure(PEGTransformer &transformer, ParseResult &result) {
+arena_ptr<TransformResultValue> TransformMeasure(PEGTransformer &transformer, ParseResult &result) {
     auto &list = result.Cast<ListParseResult>();
     vector<unique_ptr<ParsedExpression>> children;
     children.push_back(transformer.Transform<unique_ptr<ParsedExpression>>(list.GetChild(0)));
@@ -333,14 +335,14 @@ unique_ptr<TransformResultValue> TransformMeasure(PEGTransformer &transformer, P
                                                expression.get()});
         }
     }
-    return make_uniq<TypedTransformResult<unique_ptr<ParsedExpression>>>(std::move(expression));
+    return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(expression));
 }
 
-unique_ptr<TransformProcess> StartAt(PEGTransformer &transformer, ParseResult &result) {
-    return make_uniq<FinalizeTransformProcess>(transformer, result, TransformAt);
+arena_ptr<TransformProcess> StartAt(PEGTransformer &transformer, ParseResult &result) {
+    return transformer.MakeProcess<FinalizeTransformProcess>(transformer, result, TransformAt);
 }
 
-unique_ptr<TransformResultValue> TransformCurrentDimension(PEGTransformer &transformer, ParseResult &result,
+arena_ptr<TransformResultValue> TransformCurrentDimension(PEGTransformer &transformer, ParseResult &result,
                                                          idx_t dimension_index) {
     auto &list = result.Cast<ListParseResult>();
     vector<unique_ptr<ParsedExpression>> children;
@@ -350,25 +352,25 @@ unique_ptr<TransformResultValue> TransformCurrentDimension(PEGTransformer &trans
                                                       result.offset.GetIndex() + result.length.GetIndex()});
     }
     unique_ptr<ParsedExpression> expression = make_uniq<FunctionExpression>("current", std::move(children));
-    return make_uniq<TypedTransformResult<unique_ptr<ParsedExpression>>>(std::move(expression));
+    return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(expression));
 }
 
-unique_ptr<TransformProcess> StartCurrentReference(PEGTransformer &transformer, ParseResult &result) {
-    return make_uniq<FinalizeTransformProcess>(transformer, result,
+arena_ptr<TransformProcess> StartCurrentReference(PEGTransformer &transformer, ParseResult &result) {
+    return transformer.MakeProcess<FinalizeTransformProcess>(transformer, result,
         [](PEGTransformer &transformer, ParseResult &result) {
             return TransformCurrentDimension(transformer, result, 1);
         });
 }
 
-unique_ptr<TransformProcess> StartCurrentCall(PEGTransformer &transformer, ParseResult &result) {
-    return make_uniq<FinalizeTransformProcess>(transformer, result,
+arena_ptr<TransformProcess> StartCurrentCall(PEGTransformer &transformer, ParseResult &result) {
+    return transformer.MakeProcess<FinalizeTransformProcess>(transformer, result,
         [](PEGTransformer &transformer, ParseResult &result) {
             return TransformCurrentDimension(transformer, result, 2);
         });
 }
 
-unique_ptr<TransformProcess> StartMeasure(PEGTransformer &transformer, ParseResult &result) {
-    return make_uniq<FinalizeTransformProcess>(transformer, result, TransformMeasure);
+arena_ptr<TransformProcess> StartMeasure(PEGTransformer &transformer, ParseResult &result) {
+    return transformer.MakeProcess<FinalizeTransformProcess>(transformer, result, TransformMeasure);
 }
 
 bool ExpandDeclarationReferences(unique_ptr<ParsedExpression> &expression,
@@ -494,6 +496,24 @@ NativeYardstickParseScope::NativeYardstickParseScope(ParserExtensionInfo *info, 
 
 NativeYardstickParseScope::~NativeYardstickParseScope() {
     active_parse_scope = previous;
+}
+
+ParserOptions YardstickContextParserOptions(ClientContext &context) {
+#if YARDSTICK_PARSER_INSTANCE_API
+    // GetParserOptions is private in 2.0. Snapshot the same public settings for
+    // deferred binding; NativeYardstickParseScope disables override recursion.
+    auto options = ParserOptions::Builtin();
+    options.identifier_case_mode = Settings::Get<PreserveIdentifierCaseSetting>(context);
+    options.integer_division = Settings::Get<IntegerDivisionSetting>(context);
+    options.regex_match_operator_semantics = Settings::Get<RegexMatchOperatorSemanticsSetting>(context);
+    options.max_expression_depth = Settings::Get<MaxExpressionDepthSetting>(context);
+    options.parser_override_setting = Settings::Get<AllowParserOverrideExtensionSetting>(context);
+    options.compiled_grammar = CompiledGrammar::Get(context);
+    options.context = context;
+    return options;
+#else
+    return context.GetParserOptions();
+#endif
 }
 
 const ParserOptions *CurrentNativeYardstickParserOptions() {
@@ -821,10 +841,20 @@ YardstickCreateViewInfo *FindNativeYardstickMeasures(const char *sql_p) {
 namespace {
 vector<reference<ParseResult>> QuerySyntaxChildren(ParseResult &result) {
     switch (result.type) {
-    case ParseResultType::LIST:
-        return result.Cast<ListParseResult>().GetChildren();
-    case ParseResultType::REPEAT:
-        return result.Cast<RepeatParseResult>().GetChildren();
+    case ParseResultType::LIST: {
+        vector<reference<ParseResult>> children;
+        for (auto &child : result.Cast<ListParseResult>().GetChildren()) {
+            children.push_back(child);
+        }
+        return children;
+    }
+    case ParseResultType::REPEAT: {
+        vector<reference<ParseResult>> children;
+        for (auto &child : result.Cast<RepeatParseResult>().GetChildren()) {
+            children.push_back(child);
+        }
+        return children;
+    }
     case ParseResultType::CHOICE:
         return {result.Cast<ChoiceParseResult>().GetResult()};
     case ParseResultType::OPTIONAL:
@@ -861,11 +891,11 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
         auto work = std::move(pending.back());
         pending.pop_back();
         auto &node = *work.node;
-        if (node.name == "YardstickMeasureAlias") {
+        if (node.Name() == "YardstickMeasureAlias") {
             return false; // Declaration registration owns this statement.
         }
         auto children = QuerySyntaxChildren(node);
-        if (node.type == ParseResultType::LIST && node.name == "SimpleSelect") {
+        if (node.type == ParseResultType::LIST && node.Name() == "SimpleSelect") {
             auto location = node.GetLocation();
             if (!location.IsValid() || location.Start() == location.End()) {
                 return false;
@@ -884,7 +914,7 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
         if (node.type == ParseResultType::LIST && !children.empty() &&
             children[0].get().type == ParseResultType::OPTIONAL) {
             auto &optional_with = children[0].get().Cast<OptionalParseResult>();
-            if (optional_with.HasResult() && optional_with.GetResult().name == "WithClause") {
+            if (optional_with.HasResult() && optional_with.GetResult().Name() == "WithClause") {
                 auto &with = optional_with.GetResult().Cast<ListParseResult>();
                 bool recursive = with.Child<OptionalParseResult>(1).HasResult();
                 vector<ParseResult *> declarations;
@@ -892,7 +922,7 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
                 while (!search.empty()) {
                     auto *candidate = search.back();
                     search.pop_back();
-                    if (candidate->type == ParseResultType::LIST && candidate->name == "WithStatement") {
+                    if (candidate->type == ParseResultType::LIST && candidate->Name() == "WithStatement") {
                         declarations.push_back(candidate);
                         continue;
                     }
@@ -922,7 +952,7 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
                 first_child = 1;
             }
         }
-        if (node.type == ParseResultType::LIST && node.name == "SelectStatementInternal") {
+        if (node.type == ParseResultType::LIST && node.Name() == "SelectStatementInternal") {
             work.main_query = node.Cast<ListParseResult>().GetChild(1).GetLocation();
             work.modifier_end = node.GetLocation().End();
         }
@@ -954,11 +984,14 @@ YardstickQueryScopeList *FindNativeYardstickQueryScopes(const char *sql_p) {
         while (iterator.HasMoreStatements()) {
             vector<MatcherSuggestion> suggestions;
             ParseResultAllocator results;
-            ParserPackratCache packrat;
             idx_t max_token = iterator.Position();
             ArenaAllocator process_allocator(Allocator::DefaultAllocator());
+            // Match processes rewind their arena. Cached parse results must
+            // outlive those frames, as in DuckDB's own top-level matcher.
+            ArenaAllocator packrat_allocator(Allocator::DefaultAllocator());
+            ParserPackratCache packrat(packrat_allocator);
             MatchContext context(suggestions, results, process_allocator, max_token, MatchMode::BUILD_PARSE_RESULT,
-                                 options.identifier_case_mode, options.heap_based_parser, &packrat);
+                                 options.identifier_case_mode, &packrat);
             MatchState state(iterator, context);
             auto match = grammar.TopLevelStatementMatcher().MatchParseResult(state);
             if (!match.IsSuccess() || !match.HasParseResult() || state.token_iterator.Position() <= iterator.Position()) {

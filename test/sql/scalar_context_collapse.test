@@ -1,0 +1,62 @@
+# name: test/sql/scalar_context_collapse.test
+# description: Ungrouped correlated contexts retain deterministic maximum semantics.
+# group: [yardstick]
+
+require yardstick
+
+statement ok
+CREATE TABLE collapse_sales(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO collapse_sales VALUES (2020, 10), (2021, 30), (2022, 20);
+
+statement ok
+CREATE VIEW collapse_v AS
+SELECT year, year - 1 AS prior_year, SUM(amount) AS MEASURE revenue,
+       LIST(amount ORDER BY amount) AS MEASURE amounts
+FROM collapse_sales;
+
+# Direct self-reference already requires grouping; preserve that validation.
+statement error
+SELECT AGGREGATE(revenue) AT (SET year = year - 1) FROM collapse_v;
+----
+does not group by year
+
+# A different exposed dimension can supply a correlated SET value. Prior-year
+# values differ by source row: NULL, 10, 30. Preserve the maximum, including LISTs.
+query IT
+SELECT AGGREGATE(revenue) AT (SET year = v.prior_year),
+       AGGREGATE(amounts) AT (SET year = v.prior_year)
+FROM collapse_v v;
+----
+30	[30]
+
+statement ok
+CREATE TABLE collapse_reversed AS SELECT * FROM collapse_sales ORDER BY year DESC;
+
+statement ok
+CREATE VIEW collapse_reversed_v AS
+SELECT year, year - 1 AS prior_year, SUM(amount) AS MEASURE revenue,
+       LIST(amount ORDER BY amount) AS MEASURE amounts
+FROM collapse_reversed;
+
+query IT
+SELECT AGGREGATE(revenue) AT (SET year = v.prior_year),
+       AGGREGATE(amounts) AT (SET year = v.prior_year)
+FROM collapse_reversed_v v;
+----
+30	[30]
+
+query IT
+SELECT AGGREGATE(revenue) AT (SET year = v.prior_year),
+       AGGREGATE(amounts) AT (SET year = v.prior_year)
+FROM collapse_v v WHERE false;
+----
+NULL	NULL
+
+query IT
+SELECT AGGREGATE(revenue) AT (SET year = 1900),
+       AGGREGATE(amounts) AT (SET year = 1900)
+FROM collapse_v;
+----
+NULL	NULL
