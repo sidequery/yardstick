@@ -10,6 +10,7 @@
 #include "aggregate_state.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
@@ -1374,9 +1375,42 @@ static idx_t FindParenthesizedQueryBodyAfter(const string &sql, idx_t start) {
     return std::string::npos;
 }
 
-static bool TryWarningWrappedNonSelectSql(const string &expanded_sql,
+static bool TryWarningWrappedStatementSql(const string &expanded_sql,
                                           const string &warnings,
                                           string &rewritten_sql) {
+    Parser parser(YardstickParserOptions());
+    bool parsed = true;
+    try {
+        parser.ParseQuery(expanded_sql);
+    } catch (...) {
+        parsed = false;
+    }
+    if (parsed && parser.statements.size() == 1 &&
+        parser.statements[0]->type == StatementType::EXPLAIN_STATEMENT) {
+        auto &explain = parser.statements[0]->Cast<ExplainStatement>();
+        auto query_sql = explain.stmt->ToString();
+        string warning_wrapped_sql;
+        if (ParsesAsSingleSelect(query_sql)) {
+            warning_wrapped_sql = WarningWrappedSelectSql(query_sql, warnings);
+        } else if (!TryWarningWrappedStatementSql(query_sql, warnings, warning_wrapped_sql)) {
+            return false;
+        }
+
+        Parser query_parser(YardstickParserOptions());
+        try {
+            query_parser.ParseQuery(warning_wrapped_sql);
+        } catch (...) {
+            return false;
+        }
+        if (query_parser.statements.size() != 1) {
+            return false;
+        }
+
+        explain.stmt = std::move(query_parser.statements[0]);
+        rewritten_sql = explain.ToString();
+        return true;
+    }
+
     string trimmed = expanded_sql;
     StringUtil::LTrim(trimmed);
     string upper = StringUtil::Upper(trimmed);
@@ -1663,7 +1697,7 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
             } else {
                 if (!warnings.empty()) {
                     string warning_sql;
-                    if (TryWarningWrappedNonSelectSql(expanded_sql, warnings, warning_sql)) {
+                    if (TryWarningWrappedStatementSql(expanded_sql, warnings, warning_sql)) {
                         rewritten_statements.push_back(warning_sql);
                     } else {
                         rewritten_statements.push_back(WarningStatementSql(warnings) + ";\n" + expanded_sql);
@@ -2015,7 +2049,7 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
 
             if (!warnings.empty()) {
                 string warning_sql;
-                if (TryWarningWrappedNonSelectSql(expanded_sql, warnings, warning_sql)) {
+                if (TryWarningWrappedStatementSql(expanded_sql, warnings, warning_sql)) {
                     Parser parser(YardstickParserOptions());
                     parser.ParseQuery(warning_sql);
                     RestoreMeasureViewSnapshots(permanent_snapshots);

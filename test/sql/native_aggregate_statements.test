@@ -76,6 +76,25 @@ SELECT * FROM native_statement_output;
 statement ok
 EXPLAIN SELECT AGGREGATE(revenue) AT (ALL) FROM native_statement_v;
 
+statement ok
+CREATE TABLE native_explain_warning_sales(year INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO native_explain_warning_sales VALUES
+    (2023, 'East', 10), (2023, 'West', 20), (2024, 'East', 30);
+
+statement ok
+CREATE VIEW native_explain_warning_v AS
+SELECT year, region, SUM(amount) AS MEASURE revenue FROM native_explain_warning_sales;
+
+# EXPLAIN must keep warning diagnostics out of its result set.
+statement ok
+EXPLAIN (FORMAT JSON)
+SELECT year, AGGREGATE(revenue) AS a
+FROM native_explain_warning_v
+WHERE region = 'East'
+HAVING a < AGGREGATE(revenue) AT (ALL);
+
 # EXPLAIN ANALYZE executes its wrapped INSERT, making its rewrite observable.
 statement ok
 EXPLAIN ANALYZE INSERT INTO native_statement_output
