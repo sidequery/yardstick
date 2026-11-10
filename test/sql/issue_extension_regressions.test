@@ -1,0 +1,143 @@
+# name: test/sql/issue_extension_regressions.test
+# description: Function metadata, session settings, and EXPLAIN warning regressions (#51, #62, #66).
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name LIKE 'yardstick%'
+  AND (description IS NULL OR len(examples) = 0 OR len(parameters) != len(parameter_types)
+       OR list_contains(parameters, 'col0') OR list_contains(parameters, 'col1'));
+----
+0
+
+query TT rowsort
+SELECT function_name, array_to_string(parameters, ',') FROM duckdb_functions()
+WHERE function_name LIKE 'yardstick%';
+----
+yardstick	sql
+yardstick	sql,warnings
+yardstick_combine	left_state,right_state
+yardstick_finalize	state
+yardstick_scoped	sql
+yardstick_state	formula,states
+yardstick_warning	message
+
+query I
+SELECT * FROM yardstick('SELECT 1 AS value');
+----
+1
+
+query I
+SELECT * FROM yardstick('SELECT 1 AS value', '');
+----
+1
+
+query I
+SELECT * FROM yardstick_scoped('SELECT 1 AS value');
+----
+1
+
+query I
+SELECT yardstick_warning('');
+----
+true
+
+# Execute the catalog examples, consuming the composite state through its
+# public finalizer so the asserted result is stable across state formats.
+query I
+SELECT yardstick_finalize(yardstick_state('s0', struct_pack(s0 := sum(i) EXPORT_STATE)))
+FROM range(3) t(i);
+----
+3
+
+query R
+SELECT yardstick_finalize(avg(i) EXPORT_STATE) FROM range(6) t(i);
+----
+2.5
+
+query I
+WITH s AS (SELECT sum(i) EXPORT_STATE AS state FROM range(3) t(i))
+SELECT yardstick_finalize(yardstick_combine(state, state)) FROM s;
+----
+6
+
+statement ok
+CREATE TABLE issue_extension_sales(year INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO issue_extension_sales VALUES (2023, 'East', 25), (2023, 'West', 19), (2024, 'East', 62);
+
+statement ok
+CREATE VIEW issue_extension_v AS SELECT year, region, SUM(amount) AS MEASURE revenue FROM issue_extension_sales;
+
+statement ok
+SET ieee_floating_point_ops=false;
+
+statement ok
+SET error_on_division_by_zero=false;
+
+query I
+SELECT AGGREGATE(revenue) / 0 IS NULL FROM issue_extension_v;
+----
+true
+
+query I
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) / 0 IS NULL FROM issue_extension_v');
+----
+true
+
+statement ok
+SET error_on_division_by_zero=true;
+
+statement error
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) / 0 FROM issue_extension_v');
+----
+Division by zero
+
+statement ok
+SET ieee_floating_point_ops=true;
+
+query I
+SELECT * FROM yardstick('SELECT isinf(AGGREGATE(revenue) / 0) FROM issue_extension_v');
+----
+true
+
+statement ok
+RESET ieee_floating_point_ops;
+
+statement ok
+RESET error_on_division_by_zero;
+
+statement ok
+SET VARIABLE issue_extension_divisor=2;
+
+query R
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) / getvariable(''issue_extension_divisor'') FROM issue_extension_v');
+----
+53
+
+# A nonexecuting EXPLAIN must neither emit a warning nor produce an extra
+# warning SELECT result. warnings_as_errors detects accidental execution.
+statement ok
+SET enable_logging=true;
+
+statement ok
+SET warnings_as_errors=true;
+
+statement ok
+EXPLAIN (FORMAT JSON) SELECT year, AGGREGATE(revenue) AS a FROM issue_extension_v
+WHERE region='East' HAVING a < AGGREGATE(revenue) AT (ALL);
+
+# The executing form must still report the warning.
+statement error
+EXPLAIN ANALYZE SELECT year, AGGREGATE(revenue) AS a FROM issue_extension_v
+WHERE region='East' HAVING a < AGGREGATE(revenue) AT (ALL);
+----
+does not preserve outer WHERE
+
+statement ok
+SET warnings_as_errors=false;

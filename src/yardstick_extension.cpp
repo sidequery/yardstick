@@ -2,19 +2,21 @@
 
 #include "yardstick_extension.hpp"
 #include "yardstick_parser_compat.hpp"
-#if YARDSTICK_PARSER_INSTANCE_API
-#include "duckdb/main/settings.hpp"
-#endif
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
 #include "yardstick_parser_extension.hpp"
 #include "frontend_peg.hpp"
 #include "aggregate_state.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
 #if YARDSTICK_GRAMMAR_EXTENSION
-#include "duckdb/main/client_config.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -201,20 +203,22 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
 
     // Execute the rewritten query to get schema
     Connection con(*context.db);
-#if YARDSTICK_GRAMMAR_EXTENSION
-    // The wrapper executes on another connection; preserve the caller's grammar
-    // there too, without changing the caller's activation settings.
+    // The private connection must evaluate expressions under the caller's
+    // session settings (including arithmetic, timezone, and user variables).
     auto &source_config = ClientConfig::GetConfig(context);
     auto &execution_config = ClientConfig::GetConfig(*con.context);
+    execution_config.user_settings = source_config.user_settings;
+    execution_config.user_variables = source_config.user_variables;
+    auto &source_data = ClientData::Get(context);
+    auto &execution_data = ClientData::Get(*con.context);
+    execution_data.catalog_search_path = make_uniq<CatalogSearchPath>(
+        *con.context, source_data.catalog_search_path->GetSetPaths());
+#if YARDSTICK_GRAMMAR_EXTENSION
+    execution_data.default_database = source_data.default_database;
+#endif
+#if YARDSTICK_GRAMMAR_EXTENSION
     execution_config.active_grammar_extensions = source_config.active_grammar_extensions;
     execution_config.cached_grammar = source_config.cached_grammar;
-#if YARDSTICK_PARSER_INSTANCE_API
-    // This is a binder setting, not a ParserOptions field. The private
-    // execution connection must allow the same ORDER BY syntax as its caller.
-    Settings::Set<OrderByNonIntegerLiteralSetting>(
-        *con.context, SetScope::SESSION,
-        Value::BOOLEAN(Settings::Get<OrderByNonIntegerLiteralSetting>(context)));
-#endif
 #endif
     auto query_result = con.Query(data->rewritten_sql);
 
@@ -1377,6 +1381,28 @@ static idx_t FindParenthesizedQueryBodyAfter(const string &sql, idx_t start) {
 static bool TryWarningWrappedNonSelectSql(const string &expanded_sql,
                                           const string &warnings,
                                           string &rewritten_sql) {
+    // Keep warnings inside EXPLAIN's statement. Prepending a warning SELECT
+    // executes it even for a nonexecuting EXPLAIN and adds a second result.
+    Parser parser(YardstickParserOptions());
+    parser.ParseQuery(expanded_sql);
+    if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::EXPLAIN_STATEMENT) {
+        auto &explain = parser.statements[0]->Cast<ExplainStatement>();
+        rewritten_sql = expanded_sql;
+        if (explain.explain_type == ExplainType::EXPLAIN_ANALYZE) {
+            string body = explain.stmt->ToString();
+            string warning_body;
+            if (explain.stmt->type == StatementType::SELECT_STATEMENT) {
+                warning_body = WarningWrappedSelectSql(body, warnings);
+            } else if (!TryWarningWrappedNonSelectSql(body, warnings, warning_body)) {
+                return false;
+            }
+            Parser body_parser(YardstickParserOptions());
+            body_parser.ParseQuery(warning_body);
+            explain.stmt = std::move(body_parser.statements[0]);
+            rewritten_sql = explain.ToString();
+        }
+        return true;
+    }
     string trimmed = expanded_sql;
     StringUtil::LTrim(trimmed);
     string upper = StringUtil::Upper(trimmed);
@@ -2177,6 +2203,10 @@ static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binde
         SelectDeferredMeasureNamespace(sql, *state, temporary_scope);
         Parser original_parser(*CurrentNativeYardstickParserOptions());
         ParseNativeYardstickQuery(sql, original_parser);
+        bool explain_only = original_parser.statements.size() == 1 &&
+                            original_parser.statements[0]->type == StatementType::EXPLAIN_STATEMENT &&
+                            original_parser.statements[0]->Cast<ExplainStatement>().explain_type !=
+                                ExplainType::EXPLAIN_ANALYZE;
         bool temporary_create = false;
         if (original_parser.statements.size() == 1 &&
             original_parser.statements[0]->type == StatementType::CREATE_STATEMENT) {
@@ -2269,7 +2299,9 @@ static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binde
                 if (!error.empty()) {
                     throw BinderException(error);
                 }
-                HandleAggregateWarnings(context, warnings);
+                if (!explain_only) {
+                    HandleAggregateWarnings(context, warnings);
+                }
             }
         }
         Parser parser(*CurrentNativeYardstickParserOptions());
@@ -2407,6 +2439,30 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
 // EXTENSION LOADING
 //=============================================================================
 
+static void RegisterQueryFunction(ExtensionLoader &loader, TableFunction function,
+                                  vector<string> parameter_names, const string &description,
+                                  const string &example) {
+    FunctionDescription documentation;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    for (idx_t index = 0; index < parameter_names.size(); index++) {
+        function.GetSignature().GetParameter(index).SetName(Identifier(parameter_names[index]));
+    }
+    for (auto &parameter : function.GetSignature().GetParameters()) {
+        documentation.parameter_types.push_back(parameter.GetType());
+    }
+#else
+    documentation.parameter_types = function.arguments;
+#endif
+    documentation.parameter_names = std::move(parameter_names);
+    documentation.description = description;
+    documentation.examples = {example};
+    documentation.categories = {"query"};
+    CreateTableFunctionInfo info(std::move(function));
+    info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+    info.descriptions.push_back(std::move(documentation));
+    loader.RegisterFunction(std::move(info));
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
     RegisterYardstickAggregateStateFunctions(loader);
     // Initialize parser FFI function pointers before registering query entry points.
@@ -2468,26 +2524,43 @@ static void LoadInternal(ExtensionLoader &loader) {
 #if YARDSTICK_GRAMMAR_EXTENSION
     query_func.function_info = make_shared_ptr<DeferredMeasureFunctionInfo>(parser.parser_info);
 #endif
-    loader.RegisterFunction(query_func);
+    RegisterQueryFunction(loader, std::move(query_func), {"sql"},
+                          "Execute a SQL query after expanding Yardstick measure references and AT modifiers.",
+                          "SELECT * FROM yardstick('SELECT 1 AS value');");
     TableFunction query_func_with_warnings("yardstick", {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                            YardstickQueryFunction, YardstickQueryBind);
 #if YARDSTICK_GRAMMAR_EXTENSION
     query_func_with_warnings.function_info = make_shared_ptr<DeferredMeasureFunctionInfo>(parser.parser_info);
 #endif
-    loader.RegisterFunction(query_func_with_warnings);
+    RegisterQueryFunction(loader, std::move(query_func_with_warnings), {"sql", "warnings"},
+                          "Execute a Yardstick SQL query and report rewrite warnings from the supplied message.",
+                          "SELECT * FROM yardstick('SELECT 1 AS value', '');");
 
 #if YARDSTICK_GRAMMAR_EXTENSION
     TableFunction scoped_query("yardstick_scoped", {LogicalType::VARCHAR}, nullptr, nullptr);
     scoped_query.bind_replace = DeferredMeasureSelectBindReplace;
     scoped_query.function_info = make_shared_ptr<DeferredMeasureFunctionInfo>(parser.parser_info);
-    loader.RegisterFunction(scoped_query);
+    RegisterQueryFunction(loader, std::move(scoped_query), {"sql"},
+                          "Bind a Yardstick SELECT query in the caller's session and measure namespace.",
+                          "SELECT * FROM yardstick_scoped('SELECT 1 AS value');");
 #endif
 
     ScalarFunction warning_func("yardstick_warning", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
                                 YardstickWarningFunction);
     warning_func.SetVolatile();
     warning_func.SetFallible();
-    loader.RegisterFunction(warning_func);
+#if YARDSTICK_GRAMMAR_EXTENSION
+    warning_func.GetSignature().GetParameter(0).SetName("message");
+#endif
+    CreateScalarFunctionInfo warning_info(std::move(warning_func));
+    warning_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+    FunctionDescription warning_description;
+    warning_description.parameter_names = {"message"};
+    warning_description.description = "Report a Yardstick rewrite warning and return true, or fail when warnings_as_errors is enabled.";
+    warning_description.examples = {"yardstick_warning('')"};
+    warning_description.categories = {"utility"};
+    warning_info.descriptions.push_back(std::move(warning_description));
+    loader.RegisterFunction(std::move(warning_info));
 }
 
 void YardstickExtension::Load(ExtensionLoader &loader) {
