@@ -85,15 +85,24 @@ struct YardstickParseData : ParserExtensionParseData {
 };
 
 #if YARDSTICK_GRAMMAR_EXTENSION
+struct YardstickTemporaryBatch {
+    vector<string> view_names;
+};
+
 // Column-list declarations and temporary metadata use bind-time lifecycle handling.
 struct YardstickDeferredParseData : ParserExtensionParseData {
     string sql;
     ParserOptions options;
+    shared_ptr<YardstickTemporaryBatch> temporary_batch;
+    bool completes_temporary_batch = false;
 
-    YardstickDeferredParseData(string sql, ParserOptions options)
-        : sql(std::move(sql)), options(std::move(options)) {}
+    YardstickDeferredParseData(string sql, ParserOptions options,
+                              shared_ptr<YardstickTemporaryBatch> temporary_batch = nullptr)
+        : sql(std::move(sql)), options(std::move(options)), temporary_batch(std::move(temporary_batch)) {}
     unique_ptr<ParserExtensionParseData> Copy() const override {
-        return make_uniq_base<ParserExtensionParseData, YardstickDeferredParseData>(sql, options);
+        auto result = make_uniq<YardstickDeferredParseData>(sql, options, temporary_batch);
+        result->completes_temporary_batch = completes_temporary_batch;
+        return std::move(result);
     }
     string ToString() const override { return sql; }
 };

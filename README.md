@@ -139,6 +139,16 @@ FROM view_name;
 
 On DuckDB 1.5+, queries containing `AGGREGATE()` are automatically intercepted by the extension's parser override, so no special prefix is needed. On older versions, the `SEMANTIC` prefix is still supported as a fallback.
 
+The native frontend also supports measures directly in `PIVOT`:
+
+```sql
+PIVOT sales_v ON region USING AGGREGATE(revenue) GROUP BY year;
+```
+
+When `GROUP BY` is omitted, exposed dimensions other than the pivot inputs form
+the groups; unused measure columns are excluded. Each measure is recomputed at
+the final cell grain, preserving averages, distinct counts, and `AT` contexts.
+
 ### AT Modifiers
 
 | Modifier | Description | Example |

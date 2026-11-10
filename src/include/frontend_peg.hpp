@@ -79,6 +79,19 @@ void RemoveNativeContextDimensions(unique_ptr<ParsedExpression> &expression,
                                     const vector<unique_ptr<ParsedExpression>> &dimensions,
                                     const string &source_alias);
 
+// Stage measure PIVOT cells before ordinary AGGREGATE lowering. Detection is
+// parse-only; rewriting probes source columns in the originating bind context.
+bool RequiresNativeMeasurePivotBinding(const string &sql);
+string RewriteNativeMeasurePivots(const string &sql);
+
+struct NativeMeasurePivotBinding {
+    vector<unique_ptr<SQLStatement>> preparations;
+    string sql;
+};
+// Keep DuckDB's dynamic enum preparation outside deferred binding, while the
+// deferred SQL retains its original AT syntax and uses those concrete enums.
+NativeMeasurePivotBinding PrepareNativeMeasurePivotBinding(const string &sql);
+
 // Returns a complete native result or recognized semantic error, freed with
 // yardstick_free_aggregate_list. nullptr retains compatibility for unavailable
 // native grammar or source forms outside the native adapter.

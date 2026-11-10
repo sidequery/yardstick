@@ -1,0 +1,226 @@
+# name: test/sql/issue_pivot.test
+# description: Direct PIVOT computes measures at each cell's final context (#65).
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+# Loading Yardstick also works after a connection has already parsed SQL.
+query I
+SELECT 1;
+----
+1
+
+require yardstick
+
+statement ok
+CREATE TABLE issue_pivot_sales(year INTEGER, region VARCHAR, amount INTEGER, customer VARCHAR);
+
+statement ok
+INSERT INTO issue_pivot_sales VALUES
+(2023, 'East', 10, 'a'), (2023, 'East', 20, 'a'), (2023, 'West', 40, 'b'),
+(2024, 'East', 50, 'a'), (2024, 'West', 60, 'b');
+
+statement ok
+CREATE VIEW issue_pivot_v AS SELECT year, region,
+    SUM(amount) AS MEASURE revenue, COUNT(*) AS MEASURE order_count,
+    AVG(amount) AS MEASURE average_amount,
+    COUNT(DISTINCT customer) AS MEASURE customers
+FROM issue_pivot_sales;
+
+# Exact issue syntax: unused measure placeholders are not implicit dimensions.
+query III rowsort
+PIVOT issue_pivot_v ON region USING AGGREGATE(revenue);
+----
+2023	30	40
+2024	50	60
+
+query III rowsort
+PIVOT issue_pivot_v ON region USING AGGREGATE(revenue) GROUP BY year;
+----
+2023	30	40
+2024	50	60
+
+query IIIII rowsort
+PIVOT issue_pivot_v ON region
+USING AGGREGATE(revenue) AS revenue, AGGREGATE(order_count) AS orders
+GROUP BY year;
+----
+2023	30	2	40	1
+2024	50	1	60	1
+
+query IRR rowsort
+PIVOT issue_pivot_v ON region USING AGGREGATE(average_amount) GROUP BY year;
+----
+2023	15	40
+2024	50	60
+
+# Recompute from base rows at the requested grain, rather than averaging
+# yearly averages or adding distinct counts from overlapping customer sets.
+statement ok
+CREATE VIEW issue_pivot_all_v AS SELECT year, region, 'all' AS scope,
+    AVG(amount) AS MEASURE average_amount,
+    COUNT(DISTINCT customer) AS MEASURE customers
+FROM issue_pivot_sales;
+
+query TRR
+PIVOT issue_pivot_all_v ON region USING AGGREGATE(average_amount) GROUP BY scope;
+----
+all	26.6666666667	50
+
+query TII
+PIVOT issue_pivot_all_v ON region USING AGGREGATE(customers) GROUP BY scope;
+----
+all	1	1
+
+query III rowsort
+PIVOT issue_pivot_v ON region USING AGGREGATE(revenue) AT (ALL region) GROUP BY year;
+----
+2023	70	70
+2024	110	110
+
+query III rowsort
+PIVOT issue_pivot_v ON region USING AGGREGATE(revenue) AT (SET year=year-1) GROUP BY year;
+----
+2023	NULL	NULL
+2024	30	40
+
+# Expressions on multiple measures keep their scalar arithmetic.
+query IRR rowsort
+PIVOT issue_pivot_v ON region USING AGGREGATE(revenue) / AGGREGATE(order_count) GROUP BY year;
+----
+2023	15	40
+2024	50	60
+
+# Ordinary DuckDB aggregates retain their normal behavior.
+query III rowsort
+PIVOT issue_pivot_sales ON region USING SUM(amount) GROUP BY year;
+----
+2023	30	40
+2024	50	60
+
+# Nesting and statement wrappers must use the same measure lowering.
+query III rowsort
+SELECT * FROM (PIVOT issue_pivot_v ON region USING AGGREGATE(revenue) GROUP BY year);
+----
+2023	30	40
+2024	50	60
+
+statement ok
+CREATE TABLE issue_pivot_output AS PIVOT issue_pivot_v ON region USING AGGREGATE(revenue) GROUP BY year;
+
+query III rowsort
+SELECT * FROM issue_pivot_output;
+----
+2023	30	40
+2024	50	60
+
+# The explicit precompute form remains equivalent to the direct syntax.
+query III rowsort
+PIVOT (
+    SELECT year, region, AGGREGATE(revenue) AS revenue FROM issue_pivot_v
+) ON region USING SUM(revenue) GROUP BY year;
+----
+2023	30	40
+2024	50	60
+
+# Dynamic domains can read a precomputed measure with its own AT context.
+query III rowsort
+PIVOT (
+    SELECT year, region, AGGREGATE(revenue) AT (ALL region) AS revenue FROM issue_pivot_v
+) ON region USING SUM(revenue) GROUP BY year;
+----
+2023	70	70
+2024	110	110
+
+# Static pivot domains retain declared column order and missing-cell NULLs.
+query IIII rowsort
+PIVOT issue_pivot_v ON region IN ('East', 'West', 'Missing')
+USING AGGREGATE(revenue) GROUP BY year;
+----
+2023	30	40	NULL
+2024	50	60	NULL
+
+# SQL-standard syntax uses the same PivotRef and measure contexts.
+query III rowsort
+SELECT * FROM issue_pivot_v PIVOT (
+    AGGREGATE(revenue) FOR region IN ('East', 'West')
+);
+----
+2023	30	40
+2024	50	60
+
+statement ok
+CREATE VIEW issue_pivot_exposed_v AS SELECT year, region, amount,
+    SUM(amount) AS MEASURE revenue FROM issue_pivot_sales;
+
+query IIIII rowsort
+PIVOT issue_pivot_exposed_v ON region
+USING AGGREGATE(revenue) AS revenue, SUM(amount) AS raw_total GROUP BY year;
+----
+2023	30	30	40	40
+2024	50	50	60	60
+
+# Schema inspection and execution share the caller's transaction and namespace.
+statement ok
+BEGIN;
+
+statement ok
+CREATE TEMP TABLE issue_pivot_local(year INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO issue_pivot_local VALUES (2025, 'East', 7), (2025, 'West', 9);
+
+statement ok
+CREATE TEMP VIEW issue_pivot_local_v("Fiscal Year", area, "Sales Total") AS
+SELECT year, region, SUM(amount) AS MEASURE revenue FROM issue_pivot_local;
+
+query III
+PIVOT issue_pivot_local_v ON area USING AGGREGATE("Sales Total") GROUP BY "Fiscal Year";
+----
+2025	7	9
+
+statement ok
+ROLLBACK;
+
+statement ok
+CREATE TYPE issue_pivot_regions AS ENUM ('West', 'East', 'Missing');
+
+query IIII rowsort
+PIVOT issue_pivot_v ON region IN issue_pivot_regions
+USING AGGREGATE(revenue) GROUP BY year;
+----
+2023	40	30	NULL
+2024	60	50	NULL
+
+# Two source views expose the same measure name with different definitions.
+# CTE consumers must retain their own source rather than search global metadata.
+statement ok
+CREATE VIEW issue_pivot_other_v AS SELECT year, region,
+    SUM(amount * 1000) AS MEASURE revenue FROM issue_pivot_sales;
+
+query III rowsort
+WITH pivot_input AS (SELECT * FROM issue_pivot_v)
+PIVOT pivot_input ON region USING AGGREGATE(revenue) GROUP BY year;
+----
+2023	30	40
+2024	50	60
+
+query III rowsort
+WITH pivot_input AS (SELECT * FROM issue_pivot_other_v)
+PIVOT pivot_input ON region USING AGGREGATE(revenue) GROUP BY year;
+----
+2023	30000	40000
+2024	50000	60000
+
+query III
+WITH pivot_input AS (SELECT * FROM issue_pivot_v WHERE year=2023)
+PIVOT pivot_input ON region USING AGGREGATE(revenue);
+----
+2023	30	40
+
+query II rowsort
+PIVOT issue_pivot_v ON region IN (SELECT 'West' AS region)
+USING AGGREGATE(revenue) GROUP BY year;
+----
+2023	40
+2024	60

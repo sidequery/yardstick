@@ -20,6 +20,7 @@ Implementation of Julian Hyde's "Measures in SQL" paper (arXiv:2406.00251).
   - Recompute is correct but can be more expensive than decomposable measures
 - Derived measures: `revenue - cost AS MEASURE profit` expands to `SUM(revenue) - SUM(cost)`
 - Multi-fact JOINs: measures from different views can be queried together in a single JOIN
+- Direct `PIVOT ... USING AGGREGATE(measure)` with implicit or explicit grouping on the native frontend
 
 ## Known Limitations
 
@@ -63,8 +64,8 @@ A CTE or derived table that passes a measure through while removing rows
 cannot feed a grouped `AGGREGATE()`. The grouped form recomputes from the
 measure's defining view, and `VISIBLE` covers only the consuming query's own
 `WHERE`, so the removed rows would silently return. Yardstick rejects the query;
-apply the filter in the consuming query instead. Window measures carry row
-lineage and honor the CTE's rows.
+apply the filter in the consuming query instead. Window measures and `PIVOT`
+carry row lineage and honor the CTE's rows.
 
 ```sql
 -- Error: measure is read through f, which filters its rows

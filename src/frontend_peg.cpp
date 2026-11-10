@@ -987,6 +987,81 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
     return true;
 }
 
+bool ContainsPivotMeasure(const ParsedExpression &expression) {
+    if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) return false;
+    if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+        auto &function = expression.Cast<FunctionExpression>();
+        if (StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate") &&
+            function.GetArguments().size() == 1) {
+            return true;
+        }
+    }
+    bool found = false;
+    ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
+        found |= ContainsPivotMeasure(child);
+    });
+    return found;
+}
+
+// AT's native AST marker intentionally stores only its operand. Restore its
+// source suffix while rendering a staged expression, including nested ATs.
+string PivotMeasureExpression(const ParsedExpression &expression, const string &sql,
+                              const SyntaxCapture &capture, const string &prefix,
+                              const std::function<void(FunctionExpression &)> &qualify_measure = {},
+                              const string &window_clause = string()) {
+    auto copy = expression.Copy();
+    copy->ClearAlias();
+    vector<pair<string, string>> replacements;
+    std::function<void(unique_ptr<ParsedExpression> &)> restore = [&](unique_ptr<ParsedExpression> &node) {
+        if (node->GetExpressionClass() == ExpressionClass::SUBQUERY) return;
+        if (node->GetExpressionClass() == ExpressionClass::FUNCTION) {
+            auto &function = node->Cast<FunctionExpression>();
+            if (qualify_measure) qualify_measure(function);
+            if (function.FunctionName() == "__yardstick_at" && function.GetArguments().size() == 1) {
+                auto location = node->GetQueryLocation();
+                auto clause = std::find_if(capture.clauses.begin(), capture.clauses.end(),
+                    [&](const NativeAtClause &candidate) {
+                        return location.IsValid() && candidate.start == location.Start();
+                    });
+                if (clause == capture.clauses.end()) {
+                    throw ParserException("Unable to retain the AT context of a PIVOT measure");
+                }
+                auto operand = PivotMeasureExpression(function.GetArguments()[0].GetExpression(), sql,
+                                                       capture, prefix + "_", qualify_measure, window_clause);
+                auto name = prefix + std::to_string(replacements.size()) + "__end";
+                auto reference = make_uniq<ColumnRefExpression>(Identifier(name));
+                replacements.emplace_back(reference->ToString(),
+                    "(" + operand + " " + sql.substr(clause->start, clause->end - clause->start) + ")");
+                node = std::move(reference);
+                return;
+            }
+            if (!window_clause.empty()) {
+                bool aggregate = StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate") &&
+                                 function.GetArguments().size() == 1;
+                if (!aggregate) {
+                    auto context = CurrentNativeYardstickClientContext();
+                    EntryLookupInfo lookup(CatalogType::AGGREGATE_FUNCTION_ENTRY, function.GetQualifiedName());
+                    auto entry = Catalog::GetEntry(*context, lookup, OnEntryNotFound::RETURN_NULL);
+                    aggregate = entry && entry->type == CatalogType::AGGREGATE_FUNCTION_ENTRY;
+                }
+                if (aggregate) {
+                    auto windows = YardstickParseExpressionList(function.ToString() + window_clause,
+                                                               *CurrentNativeYardstickParserOptions());
+                    node = std::move(windows[0]);
+                    return;
+                }
+            }
+        }
+        ParsedExpressionIterator::EnumerateChildren(*node, restore);
+    };
+    restore(copy);
+    auto rendered = copy->ToString();
+    for (auto &replacement : replacements) {
+        rendered = StringUtil::Replace(rendered, replacement.first, replacement.second);
+    }
+    return rendered;
+}
+
 struct PivotMeasureOrigin {
     Identifier view;
     Identifier column;
@@ -1062,7 +1137,431 @@ bool PivotSourceColumnIsMeasure(const TableRef &source, const Identifier &column
     }
     return found_measure;
 }
+
+string StagePivotMeasures(PivotRef &pivot, const string &sql, const SyntaxCapture &capture,
+                         const vector<QueryNode *> &scopes,
+                         const vector<unique_ptr<CreatePivotEntry>> &generated_pivots) {
+    if (!CurrentNativeYardstickClientContext()) {
+        throw BinderException("Measure PIVOT requires the originating bind context");
+    }
+    auto probe = make_uniq<SelectNode>();
+    probe->from_table = pivot.source->Copy();
+    probe->select_list.push_back(make_uniq<StarExpression>());
+    auto bound = BindNativeYardstickProbe(*probe, scopes);
+    string prefix = "__yardstick_pivot_";
+    while (sql.find(prefix) != string::npos) prefix += "_";
+    for (auto &name : bound.names) {
+        while (StringUtil::StartsWith(name.GetIdentifierName(), prefix)) prefix += "_";
+    }
+
+    std::unordered_set<string> consumed;
+    auto consume_columns = [&](const ParsedExpression &expression) {
+        ParsedExpressionIterator::VisitExpressionClass(expression, ExpressionClass::COLUMN_REF,
+            [&](const ParsedExpression &child) {
+                consumed.insert(StringUtil::Lower(child.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName()));
+            });
+    };
+    for (auto &column : pivot.pivots) {
+        for (auto &expression : column.pivot_expressions) consume_columns(*expression);
+    }
+    for (auto &expression : pivot.aggregates) consume_columns(*expression);
+
+    vector<Identifier> groups = pivot.groups;
+    if (groups.empty()) {
+        for (auto &name : bound.names) {
+            auto column = name.GetIdentifierName();
+            if (!consumed.count(StringUtil::Lower(column)) &&
+                !PivotSourceColumnIsMeasure(*pivot.source, name, scopes, scopes.size())) {
+                groups.push_back(name);
+            }
+        }
+    }
+
+    vector<string> projections;
+    vector<string> grouping;
+    for (auto &group : groups) {
+        auto reference = make_uniq<ColumnRefExpression>(group);
+        projections.push_back(reference->ToString());
+        grouping.push_back(reference->ToString());
+    }
+    vector<string> pivot_columns;
+    idx_t key_index = 0;
+    for (auto &column : pivot.pivots) {
+        auto staged_column = column.Copy();
+        staged_column.pivot_expressions.clear();
+        vector<string> keys;
+        for (auto &expression : column.pivot_expressions) {
+            auto key = Identifier(prefix + "key_" + std::to_string(key_index++));
+            auto key_sql = make_uniq<ColumnRefExpression>(key)->ToString();
+            auto original = PivotMeasureExpression(*expression, sql, capture, prefix + "expression_");
+            projections.push_back(original + " AS " + key_sql);
+            grouping.push_back(original);
+            keys.push_back(key_sql);
+            staged_column.pivot_expressions.push_back(make_uniq<ColumnRefExpression>(key));
+        }
+        auto generated = std::find_if(generated_pivots.begin(), generated_pivots.end(),
+            [&](const unique_ptr<CreatePivotEntry> &entry) {
+                return entry && column.pivot_enum == entry->enum_name;
+            });
+        if (!column.entries.empty() || (!column.pivot_enum.empty() && generated == generated_pivots.end())) {
+            pivot_columns.push_back(staged_column.ToString());
+        } else {
+            auto key = keys.size() == 1 ? keys[0] : "(" + StringUtil::Join(keys, ", ") + ")";
+            if (generated != generated_pivots.end() && (*generated)->subquery) {
+                key += " IN (" + (*generated)->subquery->ToString() + ")";
+            }
+            pivot_columns.push_back(std::move(key));
+        }
+    }
+    vector<string> aggregates;
+    auto window_clause = grouping.empty() ? " OVER ()" :
+        " OVER (PARTITION BY " + StringUtil::Join(grouping, ", ") + ")";
+    auto qualify_inherited_measure = [&](FunctionExpression &function) {
+        if (!StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "aggregate") ||
+            function.GetArguments().size() != 1) return;
+        auto &argument = function.GetArgumentsMutable()[0].GetExpressionMutable();
+        if (argument->GetExpressionClass() != ExpressionClass::COLUMN_REF) return;
+        PivotMeasureOrigin origin;
+        if (PivotSourceColumnIsMeasure(*pivot.source, argument->Cast<ColumnRefExpression>().GetColumnName(),
+                                      scopes, scopes.size(), &origin) && origin.inherited) {
+            // This qualifier addresses the registered measure definition;
+            // the staged FROM still names the physical CTE and keeps its
+            // filtering and the caller's relation namespace intact.
+            argument = make_uniq<ColumnRefExpression>(origin.column, origin.view);
+        }
+    };
+    for (idx_t i = 0; i < pivot.aggregates.size(); i++) {
+        auto &expression = *pivot.aggregates[i];
+        auto value = Identifier(prefix + "value_" + std::to_string(i));
+        auto value_sql = make_uniq<ColumnRefExpression>(value)->ToString();
+        auto original = PivotMeasureExpression(expression, sql, capture, prefix + "expression_",
+                                              qualify_inherited_measure, window_clause);
+        projections.push_back("__yardstick_pivot_cell(" + original + ") AS " + value_sql);
+        string aggregate = "FIRST(" + value_sql + ")";
+        if (expression.HasAlias() || pivot.aggregates.size() > 1) {
+            auto alias = expression.HasAlias() ? expression.GetAlias() : Identifier(
+                PivotMeasureExpression(expression, sql, capture, prefix + "expression_"));
+            aggregate += " AS " + SQLIdentifier(alias);
+        }
+        aggregates.push_back(std::move(aggregate));
+    }
+    auto source_location = pivot.source->query_location;
+    auto source_sql = pivot.source->type != TableReferenceType::BASE_TABLE &&
+                      source_location.IsValid() && source_location.length && source_location.End() <= sql.size()
+        ? sql.substr(source_location.Start(), source_location.length) : pivot.source->ToString();
+    if (pivot.source->type == TableReferenceType::SUBQUERY) {
+        Parser source_parser(*CurrentNativeYardstickParserOptions());
+        ParseNativeYardstickQuery("SELECT * FROM " + source_sql, source_parser);
+        auto &source = source_parser.statements[0]->Cast<SelectStatement>().node->Cast<SelectNode>().from_table;
+        if (source->alias.empty()) {
+            auto alias = pivot.source->alias.empty() ? Identifier(prefix + "input") : pivot.source->alias;
+            source_sql += " AS " + SQLIdentifier(alias);
+        }
+        if (source->column_name_alias.empty() && !pivot.source->column_name_alias.empty()) {
+            vector<string> aliases;
+            for (auto &alias : pivot.source->column_name_alias) aliases.push_back(SQLIdentifier::ToString(alias));
+            source_sql += "(" + StringUtil::Join(aliases, ", ") + ")";
+        }
+    }
+    auto stage = "SELECT DISTINCT " + StringUtil::Join(projections, ", ") + " FROM " + source_sql;
+    string result = "PIVOT (" + stage + ") ON " + StringUtil::Join(pivot_columns, ", ") +
+                    " USING " + StringUtil::Join(aggregates, ", ");
+    if (!groups.empty()) {
+        vector<string> group_names;
+        for (auto &group : groups) group_names.push_back(SQLIdentifier::ToString(group));
+        result += " GROUP BY " + StringUtil::Join(group_names, ", ");
+    }
+    return result;
+}
+
+struct PivotSourceReplacement {
+    idx_t start;
+    idx_t end;
+    string sql;
+};
+
+void PreparePivotDomains(PivotRef &pivot, PEGTransformer &transformer, ParseResult &syntax,
+                        const string &sql, const SyntaxCapture &capture,
+                        const vector<QueryNode *> &scopes, NativeMeasurePivotBinding &binding,
+                        vector<PivotSourceReplacement> &domains) {
+    auto add_ctes = [&](QueryNode &query) {
+        auto local_ctes = query.cte_map.Copy();
+        query.cte_map = CommonTableExpressionMap();
+        auto add_scope = [&](QueryNode &scope) {
+            for (auto &entry : scope.cte_map.map) {
+                auto found = query.cte_map.map.find(entry.first);
+                if (found == query.cte_map.map.end()) {
+                    query.cte_map.map.insert(entry.first, entry.second->Copy());
+                } else {
+                    found->second = entry.second->Copy();
+                }
+            }
+        };
+        if (auto inherited = CurrentNativeYardstickCteBindings()) {
+            for (auto &scope : *inherited) add_scope(*scope);
+        }
+        for (auto *scope : scopes) add_scope(*scope);
+        // A domain subquery's own WITH declarations shadow enclosing names.
+        for (auto &entry : local_ctes.map) {
+            auto found = query.cte_map.map.find(entry.first);
+            if (found == query.cte_map.map.end()) {
+                query.cte_map.map.insert(entry.first, std::move(entry.second));
+            } else {
+                found->second = std::move(entry.second);
+            }
+        }
+    };
+    for (auto &column : pivot.pivots) {
+        auto generated = std::find_if(transformer.pivot_entries.begin(), transformer.pivot_entries.end(),
+            [&](const unique_ptr<CreatePivotEntry> &entry) {
+                return entry && column.pivot_enum == entry->enum_name;
+            });
+        if (generated == transformer.pivot_entries.end()) continue;
+        auto &entry = **generated;
+        if (entry.has_parameters) {
+            throw ParserException("Dynamic measure PIVOT requires an explicit IN domain when its source has parameters");
+        }
+        auto location = column.pivot_expressions[0]->GetQueryLocation();
+        if (!location.IsValid() || !location.length) {
+            throw ParserException("Unable to retain the dynamic domain of a PIVOT measure");
+        }
+        idx_t domain_end = location.End();
+        if (entry.subquery) {
+            vector<ParseResult *> pending {&syntax};
+            while (!pending.empty()) {
+                auto *node = pending.back();
+                pending.pop_back();
+                if (node->type == ParseResultType::LIST && node->Name() == "PivotColumnSubquery") {
+                    auto key = node->Cast<ListParseResult>().GetChild(0).GetLocation();
+                    if (key.Start() == location.Start()) {
+                        domain_end = node->GetLocation().End();
+                        break;
+                    }
+                }
+                for (auto child : QuerySyntaxChildren(*node)) pending.push_back(&child.get());
+            }
+            if (domain_end == location.End()) {
+                throw ParserException("Unable to retain the explicit PIVOT domain subquery");
+            }
+            add_ctes(*entry.subquery);
+        }
+        add_ctes(*entry.base);
+        domains.push_back({location.End(), domain_end,
+                           " IN " + SQLIdentifier(Identifier(entry.enum_name))});
+        auto preparation = transformer.GenerateCreateEnumStmt(std::move(*generated));
+        string prefix = "__yardstick_pivot_domain_expression_";
+        while (sql.find(prefix) != string::npos) prefix += "_";
+        vector<pair<string, string>> source_expressions;
+        std::function<void(QueryNode &)> restore_query;
+        std::function<void(unique_ptr<ParsedExpression> &)> restore_expression;
+        restore_expression = [&](unique_ptr<ParsedExpression> &expression) {
+            if (expression->GetExpressionClass() == ExpressionClass::FUNCTION &&
+                expression->Cast<FunctionExpression>().FunctionName() == "__yardstick_at") {
+                auto original = PivotMeasureExpression(*expression, sql, capture, prefix + "at_");
+                auto name = Identifier(prefix + std::to_string(source_expressions.size()) + "__end");
+                auto reference = make_uniq<ColumnRefExpression>(name);
+                source_expressions.emplace_back(reference->ToString(), std::move(original));
+                reference->SetAlias(expression->GetAlias());
+                expression = std::move(reference);
+                return;
+            }
+            if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+                restore_query(*expression->Cast<SubqueryExpression>().SubqueryMutable()->node);
+            }
+            ParsedExpressionIterator::EnumerateChildren(*expression, restore_expression);
+        };
+        restore_query = [&](QueryNode &query) {
+            for (auto &cte : query.cte_map.map) restore_query(*cte.second->query_node);
+            ParsedExpressionIterator::EnumerateQueryNodeChildren(query, restore_expression);
+            ParsedExpressionIterator::EnumerateQueryNodeModifiers(query, restore_expression);
+        };
+        auto &type_info = preparation->Cast<CreateStatement>().info->Cast<CreateTypeInfo>();
+        restore_query(*type_info.query->Cast<SelectStatement>().node);
+        auto rendered = preparation->ToString();
+        for (auto &expression : source_expressions) {
+            rendered = StringUtil::Replace(rendered, expression.first, expression.second);
+        }
+        preparation->query = std::move(rendered);
+        binding.preparations.push_back(std::move(preparation));
+    }
+}
+
+vector<PivotSourceReplacement> NativeMeasurePivotReplacements(
+    const string &sql, bool stage, NativeMeasurePivotBinding *binding = nullptr,
+    vector<PivotSourceReplacement> *domains = nullptr) {
+    vector<PivotSourceReplacement> replacements;
+    if (!StringUtil::Contains(StringUtil::Upper(sql), "PIVOT")) return replacements;
+    auto *options = CurrentNativeYardstickParserOptions();
+    if (!options || !options->compiled_grammar) return replacements;
+    auto parser_options = *options;
+    auto &grammar = *options->compiled_grammar;
+    vector<MatcherToken> tokens;
+    TokenizerBehavior behavior(sql, tokens);
+    grammar.GetTokenizer().TokenizeInput(behavior);
+    TokenIterator iterator(tokens);
+    while (iterator.HasMoreStatements()) {
+        vector<MatcherSuggestion> suggestions;
+        ParseResultAllocator results;
+        idx_t max_token = iterator.Position();
+        ArenaAllocator process_allocator(Allocator::DefaultAllocator());
+        ArenaAllocator packrat_allocator(Allocator::DefaultAllocator());
+        ParserPackratCache packrat(packrat_allocator);
+        MatchContext context(suggestions, results, process_allocator, max_token, MatchMode::BUILD_PARSE_RESULT,
+                             options->identifier_case_mode, &packrat);
+        MatchState state(iterator, context);
+        auto match = grammar.TopLevelStatementMatcher().MatchParseResult(state);
+        if (!match.IsSuccess() || !match.HasParseResult() || state.token_iterator.Position() <= iterator.Position()) {
+            return {};
+        }
+        iterator.SetPosition(state.token_iterator);
+        ArenaAllocator transform_allocator(Allocator::DefaultAllocator());
+        PEGTransformer transformer(transform_allocator, iterator, parser_options, grammar);
+        struct Work {
+            ParseResult *node;
+            vector<QueryNode *> scopes;
+        };
+        vector<unique_ptr<SelectNode>> cte_scopes;
+        vector<Work> pending {{match.GetParseResult().get(), {}}};
+        while (!pending.empty()) {
+            auto work = std::move(pending.back());
+            pending.pop_back();
+            auto *node = work.node;
+            bool rewritten = false;
+            if (node->type == ParseResultType::LIST && node->Name() == "PivotStatement") {
+                if (!node->GetRule()) node->SetRule(transformer.GetRule("PivotStatement"));
+                SyntaxCapture capture;
+                capture.source = &sql;
+                CaptureScope capture_scope(capture);
+                auto statement = transformer.Transform<unique_ptr<SelectStatement>>(*node);
+                auto &select = statement->node->Cast<SelectNode>();
+                if (select.from_table && select.from_table->type == TableReferenceType::PIVOT) {
+                    auto &pivot = select.from_table->Cast<PivotRef>();
+                    bool has_measure = false;
+                    for (auto &expression : pivot.aggregates) has_measure |= ContainsPivotMeasure(*expression);
+                    if (binding) PreparePivotDomains(pivot, transformer, *node, sql, capture, work.scopes,
+                                                     *binding, *domains);
+                    if (has_measure) {
+                        auto location = node->GetLocation();
+                        replacements.push_back({location.Start(), location.End(),
+                            stage ? StagePivotMeasures(pivot, sql, capture, work.scopes, transformer.pivot_entries)
+                                  : string()});
+                        rewritten = true;
+                    }
+                }
+            }
+            if (node->type == ParseResultType::LIST && node->Name() == "TableRef") {
+                if (!node->GetRule()) node->SetRule(transformer.GetRule("TableRef"));
+                SyntaxCapture capture;
+                capture.source = &sql;
+                CaptureScope capture_scope(capture);
+                auto table = transformer.Transform<unique_ptr<TableRef>>(*node);
+                if (table->type == TableReferenceType::PIVOT) {
+                    auto &pivot = table->Cast<PivotRef>();
+                    bool has_measure = false;
+                    for (auto &expression : pivot.aggregates) has_measure |= ContainsPivotMeasure(*expression);
+                    if (binding) PreparePivotDomains(pivot, transformer, *node, sql, capture, work.scopes,
+                                                     *binding, *domains);
+                    if (has_measure) {
+                        auto location = node->GetLocation();
+                        string replacement;
+                        if (stage) {
+                            replacement = "(" + StagePivotMeasures(pivot, sql, capture, work.scopes,
+                                                                    transformer.pivot_entries) + ")";
+                            if (!pivot.alias.empty()) replacement += " AS " + SQLIdentifier(pivot.alias);
+                            if (!pivot.column_name_alias.empty()) {
+                                vector<string> names;
+                                for (auto &name : pivot.column_name_alias) names.push_back(SQLIdentifier::ToString(name));
+                                replacement += "(" + StringUtil::Join(names, ", ") + ")";
+                            }
+                        }
+                        replacements.push_back({location.Start(), location.End(), std::move(replacement)});
+                        rewritten = true;
+                    }
+                }
+            }
+            if (!rewritten) {
+                auto children = QuerySyntaxChildren(*node);
+                idx_t first_child = 0;
+                if (node->type == ParseResultType::LIST && !children.empty() &&
+                    children[0].get().type == ParseResultType::OPTIONAL) {
+                    auto &optional_with = children[0].get().Cast<OptionalParseResult>();
+                    if (optional_with.HasResult() && optional_with.GetResult().Name() == "WithClause") {
+                        auto &with = optional_with.GetResult().Cast<ListParseResult>();
+                        bool recursive = with.Child<OptionalParseResult>(1).HasResult();
+                        vector<ParseResult *> declarations;
+                        vector<ParseResult *> search {&with.GetChild(2)};
+                        while (!search.empty()) {
+                            auto *candidate = search.back();
+                            search.pop_back();
+                            if (candidate->type == ParseResultType::LIST && candidate->Name() == "WithStatement") {
+                                declarations.push_back(candidate);
+                                continue;
+                            }
+                            auto descendants = QuerySyntaxChildren(*candidate);
+                            for (auto child = descendants.rbegin(); child != descendants.rend(); ++child) {
+                                search.push_back(&child->get());
+                            }
+                        }
+                        for (auto *declaration : declarations) {
+                            if (!declaration->GetRule()) declaration->SetRule(transformer.GetRule("WithStatement"));
+                            SyntaxCapture capture;
+                            capture.source = &sql;
+                            CaptureScope capture_scope(capture);
+                            auto entry = transformer.Transform<pair<Identifier, unique_ptr<CommonTableExpressionInfo>>>(
+                                *declaration);
+                            auto scope = make_uniq<SelectNode>();
+                            scope->cte_map.map.insert(entry.first, std::move(entry.second));
+                            auto *binding_scope = scope.get();
+                            cte_scopes.push_back(std::move(scope));
+                            auto visible = work.scopes;
+                            if (recursive) visible.push_back(binding_scope);
+                            pending.push_back({declaration, std::move(visible)});
+                            work.scopes.push_back(binding_scope);
+                        }
+                        first_child = 1;
+                    }
+                }
+                for (idx_t i = first_child; i < children.size(); i++) {
+                    pending.push_back({&children[i].get(), work.scopes});
+                }
+            }
+        }
+    }
+    return replacements;
+}
 } // namespace
+
+bool RequiresNativeMeasurePivotBinding(const string &sql) {
+    return !NativeMeasurePivotReplacements(sql, false).empty();
+}
+
+string RewriteNativeMeasurePivots(const string &sql) {
+    auto replacements = NativeMeasurePivotReplacements(sql, true);
+    std::sort(replacements.begin(), replacements.end(), [](const PivotSourceReplacement &left,
+                                                          const PivotSourceReplacement &right) {
+        return left.start > right.start;
+    });
+    string rewritten = sql;
+    for (auto &replacement : replacements) {
+        rewritten.replace(replacement.start, replacement.end - replacement.start, replacement.sql);
+    }
+    return rewritten;
+}
+
+NativeMeasurePivotBinding PrepareNativeMeasurePivotBinding(const string &sql) {
+    NativeMeasurePivotBinding binding;
+    binding.sql = sql;
+    vector<PivotSourceReplacement> domains;
+    NativeMeasurePivotReplacements(sql, false, &binding, &domains);
+    std::sort(domains.begin(), domains.end(), [](const PivotSourceReplacement &left,
+                                               const PivotSourceReplacement &right) {
+        return left.start > right.start;
+    });
+    for (auto &domain : domains) {
+        binding.sql.replace(domain.start, domain.end - domain.start, domain.sql);
+    }
+    return binding;
+}
 
 extern "C" char *yardstick_resolve_measure_reference(const char *relation, const char *column,
     const char *const *binding_ctes, size_t binding_cte_count, char **error) {
@@ -1090,8 +1589,8 @@ extern "C" char *yardstick_resolve_measure_reference(const char *relation, const
         }
         auto reference = make_uniq<ColumnRefExpression>(origin.column, origin.view)->ToString();
         if (origin.removes_rows && error) {
-            // Returned together with the origin: window lowering carries row
-            // lineage and honors the removal, while grouped lowering
+            // Returned together with the origin: window and PIVOT lowering carry
+            // row lineage and honor the removal, while grouped lowering
             // recomputes from the defining view and must refuse instead.
             *error = strdup(StringUtil::Format(
                 "Measure %s is read through %s, which filters, groups, or limits its rows. "
