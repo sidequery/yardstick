@@ -1,0 +1,273 @@
+# name: test/sql/issue_rewrite_regressions.test
+# description: GitHub reports for grouping, aliases, expressions, and modifier contexts.
+# group: [yardstick]
+
+require yardstick
+
+statement ok
+CREATE TABLE issue_sales(year INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO issue_sales VALUES (2023,'North',15),(2023,'North',22),(2023,'South',18),
+    (2024,'North',28),(2024,'South',21),(2024,'East',33),(2024,'East',29);
+
+statement ok
+CREATE VIEW issue_sales_v AS SELECT year, region, amount,
+    SUM(amount) AS MEASURE issue_revenue, COUNT(*) AS MEASURE issue_count FROM issue_sales;
+
+# #55: resolve GROUP BY ALL before introducing correlated HAVING subqueries.
+query I
+SELECT year FROM issue_sales_v GROUP BY ALL HAVING AGGREGATE(issue_revenue)>60;
+----
+2024
+
+# #57: aliases containing lowered scalar subqueries can be used in SELECT.
+query IIIR rowsort
+SELECT year, AGGREGATE(issue_revenue) AS r, AGGREGATE(issue_count) AS o,
+    ROUND(r/o, 2) AS revenue_per_order FROM issue_sales_v;
+----
+2023	55	3	18.33
+2024	111	4	27.75
+
+query IIIR rowsort
+SELECT year, AGGREGATE(issue_revenue) AS r, AGGREGATE(issue_count) AS o,
+    ROUND(r/o, 2) AS revenue_per_order FROM issue_sales_v GROUP BY year;
+----
+2023	55	3	18.33
+2024	111	4	27.75
+
+# #58: CAST's AS belongs to the expression rather than a SELECT alias.
+query IIT rowsort
+SELECT year, AGGREGATE(issue_revenue), CAST(0 AS VARCHAR) FROM issue_sales_v;
+----
+2023	55	0
+2024	111	0
+
+# #59: each UNION operand owns its dimensions, FROM, and measure context.
+query TI rowsort
+SELECT year AS a, AGGREGATE(issue_revenue) AS b FROM issue_sales_v GROUP BY year
+UNION ALL SELECT region AS a, AGGREGATE(issue_count) AS b FROM issue_sales_v GROUP BY region;
+----
+2023	55
+2024	111
+East	2
+North	3
+South	2
+
+# #60: slice expressions are grouping dimensions rather than column names.
+query TI rowsort
+SELECT region[1:2] AS a, AGGREGATE(issue_revenue) FROM issue_sales_v;
+----
+Ea	62
+No	65
+So	39
+
+# An expression dimension partitions the measure alongside plain columns.
+query TII rowsort
+SELECT region[1:2] AS a, year, AGGREGATE(issue_revenue) FROM issue_sales_v;
+----
+Ea	2024	62
+No	2023	37
+No	2024	28
+So	2023	18
+So	2024	21
+
+query TTI rowsort
+SELECT CAST(year AS VARCHAR) AS a, region, AGGREGATE(issue_revenue) FROM issue_sales_v;
+----
+2023	North	37
+2023	South	18
+2024	East	62
+2024	North	28
+2024	South	21
+
+# `::` casts and unspaced operators are expressions, not column names.
+query TI rowsort
+SELECT year::VARCHAR AS a, AGGREGATE(issue_revenue) FROM issue_sales_v;
+----
+2023	55
+2024	111
+
+query ITI rowsort
+SELECT year+1 AS a, region, AGGREGATE(issue_count) FROM issue_sales_v;
+----
+2024	North	2
+2024	South	1
+2025	East	2
+2025	North	1
+2025	South	1
+
+query TI rowsort
+SELECT year::VARCHAR AS a, AGGREGATE(issue_revenue) AS b FROM issue_sales_v
+UNION ALL SELECT region, AGGREGATE(issue_count) FROM issue_sales_v;
+----
+2023	55
+2024	111
+East	2
+North	3
+South	2
+
+# GROUP BY may name the SELECT alias of an expression dimension.
+query TII rowsort
+SELECT UPPER(region) AS a, year, AGGREGATE(issue_revenue) FROM issue_sales_v GROUP BY a, year;
+----
+EAST	2024	62
+NORTH	2023	37
+NORTH	2024	28
+SOUTH	2023	18
+SOUTH	2024	21
+
+# Subtotals and alias arithmetic lower the same way inside CREATE TABLE AS.
+statement ok
+CREATE TABLE issue_rollup AS
+SELECT region, AGGREGATE(issue_count) AS n FROM issue_sales_v GROUP BY ROLLUP(region);
+
+query TI rowsort
+SELECT * FROM issue_rollup;
+----
+East	2
+NULL	7
+North	3
+South	2
+
+statement ok
+CREATE TABLE issue_ratio AS
+SELECT year, AGGREGATE(issue_revenue) AS r, AGGREGATE(issue_count) AS o, r/o AS ratio FROM issue_sales_v;
+
+query IR rowsort
+SELECT year, ROUND(ratio, 2) FROM issue_ratio;
+----
+2023	18.33
+2024	27.75
+
+# A projection star next to a grand total keeps its grouping.
+query ITI rowsort
+SELECT * EXCLUDE (amount, issue_revenue, issue_count), AGGREGATE(issue_revenue) AT (ALL)
+FROM issue_sales_v GROUP BY ALL;
+----
+2023	North	166
+2023	South	166
+2024	East	166
+2024	North	166
+2024	South	166
+
+# HAVING evaluates the measure at the same expression grain.
+query IT rowsort
+SELECT year, UPPER(region) AS a FROM issue_sales_v GROUP BY ALL HAVING AGGREGATE(issue_count)>1;
+----
+2023	NORTH
+2024	EAST
+
+# #63: a grouped CTE does not supply the consumer's GROUP BY.
+query II
+WITH step1 AS (SELECT region, AVG(amount) AS avg_amount FROM issue_sales GROUP BY ALL)
+SELECT year, AGGREGATE(issue_count) AS cnt FROM issue_sales_v
+INNER JOIN step1 ON step1.region=issue_sales_v.region
+WHERE amount>avg_amount HAVING cnt>=1;
+----
+2023	1
+2024	3
+
+# A join does not restrict a measure by itself; only WHERE does. The South and
+# East rows have no match in the join and still count.
+query II rowsort
+SELECT year, AGGREGATE(issue_count) FROM issue_sales_v
+JOIN (SELECT 'North' AS region) r ON r.region=issue_sales_v.region
+WHERE amount>20 GROUP BY year;
+----
+2023	1
+2024	4
+
+# The same holds for a `SELECT *` measure view, whose columns are not recorded:
+# its rows are compared whole.
+statement ok
+CREATE VIEW issue_star_v AS SELECT *, SUM(amount) AS MEASURE star_revenue, COUNT(*) AS MEASURE star_count FROM issue_sales;
+
+query II rowsort
+SELECT year, AGGREGATE(star_count) FROM issue_star_v
+JOIN (SELECT 'North' AS region) r ON r.region=issue_star_v.region
+WHERE amount>20 GROUP BY year;
+----
+2023	1
+2024	4
+
+# A filter on a joined column applies to the rows it matches.
+query III rowsort
+WITH step1 AS (SELECT region, AVG(amount) AS avg_amount FROM issue_sales GROUP BY ALL)
+SELECT year, AGGREGATE(star_count), AGGREGATE(star_revenue) FROM issue_star_v
+INNER JOIN step1 ON step1.region=issue_star_v.region
+WHERE amount>avg_amount GROUP BY year;
+----
+2023	1	22
+2024	3	82
+
+# #54: VISIBLE retains independent filters when SET changes the year.
+query II rowsort
+SELECT year, AGGREGATE(issue_revenue) AT (VISIBLE SET year=year-1)
+FROM issue_sales_v WHERE region='North';
+----
+2023	NULL
+2024	37
+
+# Replacing year must preserve region and remove the previous year predicate.
+query II
+SELECT year, AGGREGATE(issue_revenue) AT (VISIBLE SET year=year-1)
+FROM issue_sales_v WHERE year=2024 AND region='North';
+----
+2024	37
+
+# A join must not reintroduce the year predicate replaced by SET.
+query II
+SELECT s.year, AGGREGATE(issue_revenue) AT (VISIBLE SET year=year-1)
+FROM issue_sales_v s JOIN (SELECT DISTINCT region FROM issue_sales) r ON s.region=r.region
+WHERE s.year=2024 AND s.region='North';
+----
+2024	37
+
+# A term spanning both dimensions cannot be safely discarded.
+statement error
+SELECT * FROM yardstick($$SELECT year, AGGREGATE(issue_revenue) AT (VISIBLE SET year=year-1)
+FROM issue_sales_v WHERE year=2024 OR region='North'$$);
+----
+mixed VISIBLE predicate
+
+# Without VISIBLE, SET drops the ungrouped region filter and says so.
+statement ok
+SET enable_logging=true;
+
+statement ok
+SET warnings_as_errors=true;
+
+statement error
+SELECT year, AGGREGATE(issue_revenue) AT (SET year=year-1) FROM issue_sales_v WHERE region='North';
+----
+AT (SET ...) on AGGREGATE(issue_revenue) does not preserve outer WHERE filter(s) on ungrouped dimension(s): region
+
+# A filter on the replaced dimension, or VISIBLE, needs no warning.
+query II
+SELECT year, AGGREGATE(issue_revenue) AT (SET year=year-1) FROM issue_sales_v WHERE year=2024;
+----
+2024	55
+
+query II rowsort
+SELECT year, AGGREGATE(issue_revenue) AT (VISIBLE SET year=year-1) FROM issue_sales_v WHERE region='North';
+----
+2023	NULL
+2024	37
+
+statement ok
+SET warnings_as_errors=false;
+
+# #61: combined modifiers transform context in written order (paper §3.5).
+query I
+SELECT AGGREGATE(issue_revenue) AT (WHERE region='North' VISIBLE)
+FROM issue_sales_v WHERE year=2023;
+----
+37
+
+# A later WHERE replaces the entire previously visible context.
+query I
+SELECT AGGREGATE(issue_revenue) AT (VISIBLE WHERE region='North')
+FROM issue_sales_v WHERE year=2023;
+----
+65

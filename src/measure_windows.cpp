@@ -7,6 +7,7 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/lambda_expression.hpp"
@@ -261,7 +262,7 @@ bool IsGrouped(SelectNode &select) {
     return select.having && HasAggregate(select.having);
 }
 
-void ExpandStars(SelectNode &select) {
+void ExpandStars(SelectNode &select, const vector<QueryNode *> &scopes = {}) {
     auto contains_star = [](unique_ptr<ParsedExpression> &expression) {
         bool found = false;
         Walk(expression, [&](unique_ptr<ParsedExpression> &node) {
@@ -309,7 +310,7 @@ void ExpandStars(SelectNode &select) {
             placeholders.emplace(name, i);
         }
     }
-    auto bound = BindNativeYardstickProbe(*probe);
+    auto bound = BindNativeYardstickProbe(*probe, scopes);
     Names base_qualifiers;
     if (select.from_table) {
         BaseQualifiers(*select.from_table, base_qualifiers);
@@ -374,6 +375,9 @@ struct SourcePlan {
     vector<unique_ptr<ParsedExpression>> columns;
     std::unordered_map<string, idx_t> column_index;
     ExpressionMap dimensions;
+    ExpressionMap consumer_dimensions;
+    vector<unique_ptr<ParsedExpression>> input_predicates;
+    bool input_predicates_complete = true;
     Names qualifiers;
     Names input_columns;
 };
@@ -634,6 +638,33 @@ void RebindColumns(unique_ptr<ParsedExpression> &expression, const SourcePlan &p
     references.Expression(expression);
 }
 
+void RebindContextExpression(unique_ptr<ParsedExpression> &expression, const SourcePlan &plan,
+                              const string &qualifier) {
+    struct Snapshot {
+        unique_ptr<ParsedExpression> *slot;
+        unique_ptr<ParsedExpression> expression;
+    };
+    vector<Snapshot> snapshots;
+    Walk(expression, [&](unique_ptr<ParsedExpression> &node) {
+        if (node->GetExpressionClass() != ExpressionClass::SUBQUERY) return true;
+        auto &query = *node->Cast<SubqueryExpression>().Subquery()->node;
+        if (query.type != QueryNodeType::SELECT_NODE) return false;
+        auto &select = query.Cast<SelectNode>();
+        if (!select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE) return false;
+        auto &table = select.from_table->Cast<BaseTableRef>();
+        if (table.Table() != Identifier(plan.base_name) ||
+            !StringUtil::StartsWith(table.alias.GetIdentifierName(), "__ys_current_context_")) return false;
+        // This snapshot is already bound to generated base-column names. A
+        // schema probe during captured-reference rebinding would look for its
+        // generated CTE before it is attached to the final query.
+        snapshots.push_back({&node, std::move(node)});
+        node = ConstantExpression::FromValue(Value());
+        return false;
+    });
+    RebindColumns(expression, plan, qualifier);
+    for (auto &snapshot : snapshots) *snapshot.slot = std::move(snapshot.expression);
+}
+
 SourcePlan BuildSource(const MeasureWindowSource &source, const vector<MeasureWindowCall> &calls,
                        const std::unordered_map<string, idx_t> &caller_order_counts,
                        idx_t index, Names &cte_names, const ParserOptions &options) {
@@ -816,29 +847,220 @@ SourcePlan BuildSource(const MeasureWindowSource &source, const vector<MeasureWi
     return plan;
 }
 
-bool ReplaceSource(unique_ptr<TableRef> &relation, const SourcePlan &plan) {
+struct LineageInput {
+    unique_ptr<TableRef> table;
+    string lineage;
+    ExpressionMap dimensions;
+    bool found = false;
+};
+
+bool MapLineageExpression(unique_ptr<ParsedExpression> &expression, const ExpressionMap &dimensions) {
+    bool mapped = true;
+    Walk(expression, [&](unique_ptr<ParsedExpression> &node) {
+        if (node->GetExpressionClass() == ExpressionClass::SUBQUERY ||
+            node->GetExpressionClass() == ExpressionClass::WINDOW) {
+            mapped = false;
+            return false;
+        }
+        if (node->GetExpressionClass() != ExpressionClass::COLUMN_REF) return true;
+        auto &column = node->Cast<ColumnRefExpression>();
+        auto key = Key(column.GetColumnName().GetIdentifierName());
+        if (column.IsQualified()) {
+            auto &names = column.ColumnNames();
+            key = Key(names[names.size() - 2].GetIdentifierName()) + "." + key;
+        }
+        auto found = dimensions.find(key);
+        if (found == dimensions.end()) mapped = false;
+        else node = found->second->Copy();
+        return false;
+    });
+    return mapped;
+}
+
+struct LineageQuery {
+    unique_ptr<QueryNode> query;
+    ExpressionMap dimensions;
+    bool found = false;
+};
+
+// Retain the actual input relation above a measure definition. Its projection,
+// predicates, DISTINCT and row selection determine which original identities
+// belong to a window frame; substituting the definition itself would lose them.
+class SourceLineage {
+public:
+    SourceLineage(SourcePlan &plan_p, const ParserOptions &options_p) : plan(plan_p), options(options_p) {
+    }
+
+    LineageInput Table(TableRef &table, vector<QueryNode *> scopes) {
+        auto alias = table.alias.GetIdentifierName();
+        if (table.type == TableReferenceType::BASE_TABLE) {
+            auto &base = table.Cast<BaseTableRef>();
+            if (alias.empty()) alias = base.Table().GetIdentifierName();
+            if (base.GetQualifiedName().Schema().empty()) {
+                for (idx_t i = scopes.size(); i > 0; i--) {
+                    auto found = scopes[i - 1]->cte_map.map.find(base.Table());
+                    if (found == scopes[i - 1]->cte_map.map.end()) continue;
+                    auto visible = vector<QueryNode *>(scopes.begin(), scopes.begin() + i - 1);
+                    auto query = QueryInput(found->second->query_node->Copy(), found->second->aliases, visible);
+                    return FromQuery(std::move(query), table, alias);
+                }
+            }
+            if (StringUtil::CIEquals(base.Table().GetIdentifierName(), plan.spec->relation_name)) {
+                LineageInput input;
+                input.table = Subquery(plan.view->Copy(), alias);
+                input.table->sample = table.sample ? table.sample->Copy() : nullptr;
+                input.table->column_name_alias = table.column_name_alias;
+                input.lineage = Quote(alias) + "." + Quote(plan.lineage_name);
+                for (auto &dimension : plan.dimensions) {
+                    input.dimensions.emplace(dimension.first, dimension.second->Copy());
+                    input.dimensions.emplace(Key(alias) + "." + dimension.first, dimension.second->Copy());
+                }
+                input.found = true;
+                return input;
+            }
+        } else if (table.type == TableReferenceType::SUBQUERY) {
+            if (alias.empty()) alias = "__ys_window_input";
+            auto query = QueryInput(table.Cast<SubqueryRef>().subquery->node->Copy(), table.column_name_alias, scopes);
+            return FromQuery(std::move(query), table, alias);
+        } else if (table.type == TableReferenceType::JOIN) {
+            plan.input_predicates_complete = false;
+            auto copy = table.Copy();
+            auto &join = copy->Cast<JoinRef>();
+            auto left = Table(*join.left, scopes);
+            auto right = Table(*join.right, scopes);
+            if (left.found && right.found) {
+                throw BinderException("A measure window input must identify one contributing relation for its measure");
+            }
+            join.left = std::move(left.table);
+            join.right = std::move(right.table);
+            LineageInput input;
+            input.table = std::move(copy);
+            auto &contributing = left.found ? left : right;
+            input.found = contributing.found;
+            input.lineage = contributing.lineage;
+            input.dimensions = std::move(contributing.dimensions);
+            return input;
+        }
+        LineageInput input;
+        input.table = table.Copy();
+        return input;
+    }
+
+private:
+    LineageInput FromQuery(LineageQuery query, TableRef &original, const string &alias) {
+        LineageInput input;
+        if (!query.found) {
+            input.table = original.Copy();
+            return input;
+        }
+        input.table = Subquery(std::move(query.query), alias);
+        input.table->sample = original.sample ? original.sample->Copy() : nullptr;
+        input.lineage = Quote(alias) + "." + Quote(plan.lineage_name);
+        for (auto &dimension : query.dimensions) {
+            input.dimensions.emplace(Key(alias) + "." + dimension.first, dimension.second->Copy());
+            input.dimensions.emplace(dimension.first, std::move(dimension.second));
+        }
+        input.found = true;
+        return input;
+    }
+
+    LineageQuery QueryInput(unique_ptr<QueryNode> query, const vector<Identifier> &column_aliases,
+                            vector<QueryNode *> scopes) {
+        LineageQuery result;
+        if (query->type != QueryNodeType::SELECT_NODE) {
+            throw BinderException("Measure input lineage requires a SELECT projection");
+        }
+        auto &select = query->Cast<SelectNode>();
+        scopes.push_back(query.get());
+        ExpandStars(select, scopes);
+        auto input = Table(*select.from_table, scopes);
+        if (!input.found) {
+            result.query = std::move(query);
+            return result;
+        }
+        if (select.where_clause) {
+            auto predicate = select.where_clause->Copy();
+            if (MapLineageExpression(predicate, input.dimensions)) {
+                plan.input_predicates.push_back(std::move(predicate));
+            } else {
+                plan.input_predicates_complete = false;
+            }
+        }
+        for (auto &modifier : select.modifiers) {
+            if (modifier->type != ResultModifierType::ORDER_MODIFIER &&
+                modifier->type != ResultModifierType::DISTINCT_MODIFIER) {
+                plan.input_predicates_complete = false;
+            }
+        }
+        for (idx_t i = 0; i < select.select_list.size(); i++) {
+            auto &projection = select.select_list[i];
+            auto name = i < column_aliases.size() ? column_aliases[i] : projection->GetName();
+            auto dimension = projection->Copy();
+            dimension->ClearAlias();
+            bool mapped = MapLineageExpression(dimension, input.dimensions);
+            if (mapped && !HasAggregate(dimension)) {
+                result.dimensions.emplace(Key(name.GetIdentifierName()), std::move(dimension));
+            }
+            projection->SetAlias(name);
+        }
+        bool grouped = IsGrouped(select);
+        if (!grouped) {
+            for (auto modifier = select.modifiers.begin(); modifier != select.modifiers.end();) {
+                if ((*modifier)->type == ResultModifierType::DISTINCT_MODIFIER &&
+                    (*modifier)->Cast<DistinctModifier>().distinct_on_targets.empty()) {
+                    GroupingSet grouping;
+                    for (auto &projection : select.select_list) {
+                        auto dimension = projection->Copy();
+                        dimension->ClearAlias();
+                        grouping.insert(ProjectionIndex(select.groups.group_expressions.size()));
+                        select.groups.group_expressions.push_back(std::move(dimension));
+                    }
+                    select.groups.grouping_sets.push_back(std::move(grouping));
+                    modifier = select.modifiers.erase(modifier);
+                    grouped = true;
+                } else {
+                    ++modifier;
+                }
+            }
+        }
+        auto lineage_sql = grouped ? "flatten(list(" + input.lineage + "))" : input.lineage;
+        auto lineage = Expression(lineage_sql, options);
+        lineage->SetAlias(Identifier(plan.lineage_name));
+        select.select_list.push_back(std::move(lineage));
+        select.from_table = std::move(input.table);
+        result.query = std::move(query);
+        result.found = true;
+        return result;
+    }
+
+    SourcePlan &plan;
+    const ParserOptions &options;
+};
+
+bool ReplaceSource(unique_ptr<TableRef> &relation, SourcePlan &plan,
+                    const vector<QueryNode *> &scopes, const ParserOptions &options) {
     if (!relation) {
         return false;
     }
     if (relation->type == TableReferenceType::JOIN) {
         auto &join = relation->Cast<JoinRef>();
-        bool left = ReplaceSource(join.left, plan);
-        bool right = ReplaceSource(join.right, plan);
+        bool left = ReplaceSource(join.left, plan, scopes, options);
+        bool right = ReplaceSource(join.right, plan, scopes, options);
         return left || right;
     }
-    if (relation->type != TableReferenceType::BASE_TABLE) {
-        return false;
+    auto alias = relation->alias.GetIdentifierName();
+    if (alias.empty() && relation->type == TableReferenceType::BASE_TABLE) {
+        alias = relation->Cast<BaseTableRef>().Table().GetIdentifierName();
     }
-    auto &table = relation->Cast<BaseTableRef>();
-    auto alias = relation->alias.empty() ? table.Table().GetIdentifierName() : relation->alias.GetIdentifierName();
     auto expected_alias = plan.spec->alias.empty() ? plan.spec->relation_name : plan.spec->alias;
     if (!StringUtil::CIEquals(alias, expected_alias)) {
         return false;
     }
-    auto replacement = Subquery(plan.view->Copy(), alias);
-    replacement->sample = std::move(relation->sample);
-    replacement->column_name_alias = std::move(relation->column_name_alias);
-    relation = std::move(replacement);
+    SourceLineage lineage(plan, options);
+    auto input = lineage.Table(*relation, scopes);
+    if (!input.found) return false;
+    plan.consumer_dimensions = std::move(input.dimensions);
+    relation = std::move(input.table);
     return true;
 }
 
@@ -846,9 +1068,10 @@ class WindowRewrite {
 public:
     WindowRewrite(SelectNode &owner_p, vector<SourcePlan> &sources_p,
                   const vector<MeasureWindowCall> &calls_p, const ParserOptions &options_p,
-                  const Names &input_columns_p)
+                  const Names &input_columns_p,
+                  const std::unordered_map<string, vector<string>> &cell_partitions_p)
         : owner(owner_p), sources(sources_p), calls(calls_p), options(options_p), grouped(IsGrouped(owner_p)),
-          aliases(Aliases(owner_p)), input_columns(input_columns_p) {
+          aliases(Aliases(owner_p)), input_columns(input_columns_p), cell_partitions(cell_partitions_p) {
     }
 
     unique_ptr<QueryNode> Run() {
@@ -974,46 +1197,115 @@ private:
         Rewrite(expression);
     }
 
-    string DimensionSQL(const SourcePlan &source, const string &dimension, const string &qualifier) const {
+    unique_ptr<ParsedExpression> DimensionExpression(const SourcePlan &source, const string &dimension) const {
         auto expression = Expression(dimension, options);
-        if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-            auto key = Key(expression->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
-            auto match = source.dimensions.find(key);
-            if (match != source.dimensions.end()) {
-                expression = match->second->Copy();
+        Walk(expression, [&](unique_ptr<ParsedExpression> &node) {
+            if (node->GetExpressionClass() != ExpressionClass::COLUMN_REF) return true;
+            auto &column = node->Cast<ColumnRefExpression>();
+            auto key = Key(column.GetColumnName().GetIdentifierName());
+            auto visible = source.consumer_dimensions.find(key);
+            if (column.IsQualified()) {
+                auto &names = column.ColumnNames();
+                auto qualified = Key(names[names.size() - 2].GetIdentifierName()) + "." + key;
+                auto found = source.consumer_dimensions.find(qualified);
+                if (found != source.consumer_dimensions.end()) visible = found;
             }
-        }
+            if (visible != source.consumer_dimensions.end()) {
+                node = visible->second->Copy();
+            } else {
+                auto original = source.dimensions.find(key);
+                if (original != source.dimensions.end()) node = original->second->Copy();
+            }
+            return false;
+        });
+        return expression;
+    }
+
+    string DimensionSQL(const SourcePlan &source, const string &dimension, const string &qualifier) const {
+        auto expression = DimensionExpression(source, dimension);
         RebindColumns(expression, source, qualifier);
         return expression->ToString();
     }
 
     string Context(const SourcePlan &source, const MeasureWindowCall &call, const string &frame,
                    const string &visible_frame, const string &payload_ids = "") const {
-        const string candidate = "__ys_candidate";
-        const string selected = "__ys_selected";
         auto frame_ids = payload_ids.empty() ? "SELECT unnest(flatten(" + Quote(frame) + "))" : payload_ids;
-        auto membership = candidate + "." + Quote(source.id_name) + " IN (" + frame_ids + ")";
-        std::unordered_set<string> removed;
-        struct SetOverride {
+        struct Predicate {
+            unique_ptr<ParsedExpression> expression;
             string dimension;
-            string value;
+            string members;
+            vector<string> excluded;
         };
-        std::unordered_map<string, SetOverride> sets;
-        string condition;
-        bool global = false;
-        bool expand = call.modifiers.size() > 1;
-        bool has_set = false;
-        for (auto &modifier : call.modifiers) {
-            has_set |= modifier.type == WindowContextType::SET;
+        vector<Predicate> predicates;
+        predicates.push_back({nullptr, string(), frame_ids, {}});
+        for (auto &condition : source.input_predicates) {
+            predicates.push_back({condition->Copy(), string(), string(), {}});
         }
-        bool visible = false;
         auto dimension_key = [&](const string &dimension) {
-            auto expression = Expression(dimension, options);
-            if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-                return Key(expression->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
-            }
+            auto expression = DimensionExpression(source, dimension);
             return Key(expression->ToString());
         };
+        vector<string> context_dimensions;
+        auto cell = cell_partitions.find(call.marker_name);
+        if (cell != cell_partitions.end()) {
+            context_dimensions = cell->second;
+        } else {
+            for (auto &dimension : source.dimensions) context_dimensions.push_back(dimension.first);
+        }
+        auto render = [&](const string &candidate) {
+            vector<string> conditions;
+            idx_t selection_index = 0;
+            for (auto &predicate : predicates) {
+                if (!predicate.members.empty()) {
+                    if (predicate.excluded.empty()) {
+                        conditions.push_back(candidate + "." + Quote(source.id_name) +
+                                             " IN (" + predicate.members + ")");
+                        continue;
+                    }
+                    auto selected = "__ys_context_selected_" + std::to_string(selection_index++);
+                    vector<string> correlations;
+                    for (auto &dimension : context_dimensions) {
+                        bool excluded = false;
+                        for (auto &removed : predicate.excluded) {
+                            excluded |= dimension_key(removed) == dimension_key(dimension);
+                        }
+                        if (!excluded) {
+                            correlations.push_back(DimensionSQL(source, dimension, candidate) +
+                                " IS NOT DISTINCT FROM " + DimensionSQL(source, dimension, selected));
+                        }
+                    }
+                    if (correlations.empty()) continue;
+                    correlations.push_back(selected + "." + Quote(source.id_name) +
+                                           " IN (" + predicate.members + ")");
+                    conditions.push_back("EXISTS (SELECT 1 FROM " + Quote(source.base_name) + " " + selected +
+                        " WHERE " + StringUtil::Join(correlations, " AND ") + ")");
+                    continue;
+                }
+                auto expression = predicate.expression->Copy();
+                RebindContextExpression(expression, source, candidate);
+                vector<unique_ptr<ParsedExpression>> excluded;
+                for (auto &dimension : predicate.excluded) {
+                    auto removed = DimensionExpression(source, dimension);
+                    RebindColumns(removed, source, candidate);
+                    excluded.push_back(std::move(removed));
+                }
+                RemoveNativeContextDimensions(expression, excluded, candidate);
+                conditions.push_back("(" + expression->ToString() + ")");
+            }
+            return conditions.empty() ? string("true") : StringUtil::Join(conditions, " AND ");
+        };
+        auto remove_dimension = [&](const string &dimension) {
+            auto key = dimension_key(dimension);
+            for (auto predicate = predicates.begin(); predicate != predicates.end();) {
+                if (!predicate->dimension.empty() && predicate->dimension == key) {
+                    predicate = predicates.erase(predicate);
+                } else {
+                    predicate->excluded.push_back(dimension);
+                    ++predicate;
+                }
+            }
+        };
+        idx_t current_index = 0;
         auto resolve_current = [&](unique_ptr<ParsedExpression> &expression, bool bare_dimensions) {
             Walk(expression, [&](unique_ptr<ParsedExpression> &node) {
                 string dimension;
@@ -1025,104 +1317,74 @@ private:
                     }
                 } else if (bare_dimensions && node->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
                     auto &column = node->Cast<ColumnRefExpression>();
-                    if (source.dimensions.count(Key(column.GetColumnName().GetIdentifierName()))) {
+                    if (source.dimensions.count(Key(column.GetColumnName().GetIdentifierName())) ||
+                        source.consumer_dimensions.count(Key(column.GetColumnName().GetIdentifierName()))) {
                         dimension = node->ToString();
                     }
                 }
                 if (dimension.empty()) {
                     return true;
                 }
+                auto selected = "__ys_current_context_" + std::to_string(current_index++);
                 auto dim = DimensionSQL(source, dimension, selected);
+                // CURRENT observes the context produced by preceding modifiers,
+                // rather than repeatedly reading the original window frame.
+                auto current_context = render(selected);
                 node = Expression("(SELECT CASE WHEN count(DISTINCT " + dim +
                                   ") + max(CASE WHEN " + dim + " IS NULL THEN 1 ELSE 0 END) = 1 THEN first(" + dim +
                                   ") ELSE NULL END FROM " + Quote(source.base_name) + " " + selected + " WHERE " +
-                                  selected + "." + Quote(source.id_name) + " IN (" + frame_ids + "))", options);
+                                  current_context + ")", options);
                 return false;
             });
         };
-        for (auto it = call.modifiers.rbegin(); it != call.modifiers.rend(); ++it) {
-            auto &modifier = *it;
+        for (auto &modifier : call.modifiers) {
             switch (modifier.type) {
             case WindowContextType::ALL_GLOBAL:
-                global = true;
-                condition.clear();
-                visible = false;
-                removed.clear();
-                sets.clear();
+                predicates.clear();
                 break;
             case WindowContextType::ALL:
-                removed.insert(dimension_key(modifier.dimension));
-                expand = true;
+                remove_dimension(modifier.dimension);
                 break;
-            case WindowContextType::SET:
-                if (!global && !removed.count(dimension_key(modifier.dimension))) {
-                    sets[dimension_key(modifier.dimension)] = {modifier.dimension, modifier.value};
-                    expand = true;
+            case WindowContextType::SET: {
+                auto value = ModifierExpression(modifier.value, options);
+                resolve_current(value, true);
+                value = DimensionExpression(source, value->ToString());
+                remove_dimension(modifier.dimension);
+                auto dimension = DimensionExpression(source, modifier.dimension);
+                auto equality = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOT_DISTINCT_FROM,
+                                                                std::move(dimension), std::move(value));
+                predicates.push_back({std::move(equality), dimension_key(modifier.dimension), string(), {}});
+                break;
+            }
+            case WindowContextType::WHERE: {
+                auto condition = ModifierExpression(modifier.value, options);
+                resolve_current(condition, false);
+                condition = DimensionExpression(source, condition->ToString());
+                predicates.clear();
+                predicates.push_back({std::move(condition), string(), string(), {}});
+                break;
+            }
+            case WindowContextType::VISIBLE: {
+                for (auto &condition : source.input_predicates) {
+                    predicates.push_back({condition->Copy(), string(), string(), {}});
                 }
-                break;
-            case WindowContextType::WHERE:
-                if (!global) {
-                    auto expression = ModifierExpression(modifier.value, options);
-                    NormalizeModifierReferences(expression, source);
-                    RebindColumns(expression, source, candidate);
-                    resolve_current(expression, false);
-                    condition = expression->ToString();
-                    visible = false;
+                bool mapped = source.input_predicates_complete &&
+                              owner.from_table->type != TableReferenceType::JOIN;
+                if (owner.where_clause) {
+                    auto condition = owner.where_clause->Copy();
+                    if (MapLineageExpression(condition, source.consumer_dimensions)) {
+                        predicates.push_back({std::move(condition), string(), string(), {}});
+                    } else mapped = false;
                 }
-                break;
-            case WindowContextType::VISIBLE:
-                if (!global && !has_set) {
-                    condition.clear();
-                    visible = true;
+                if (!mapped && !visible_frame.empty()) {
+                    predicates.push_back({nullptr, string(),
+                        "SELECT unnest(flatten(" + Quote(visible_frame) + "))", {}});
                 }
                 break;
             }
-        }
-        if (global) {
-            return "true";
-        }
-        if (!condition.empty() && call.modifiers.size() == 1) {
-            return condition;
-        }
-        if (!expand) {
-            return membership;
-        }
-        vector<string> correlations;
-        for (auto &dimension : source.dimensions) {
-            auto base_expression = dimension.second->ToString();
-            bool replaced = false;
-            for (auto &entry : sets) {
-                replaced |= entry.first == dimension_key(dimension.first) ||
-                            entry.first == dimension_key(base_expression);
-            }
-            if (!removed.count(dimension_key(dimension.first)) &&
-                !removed.count(dimension_key(base_expression)) && !replaced) {
-                correlations.push_back(DimensionSQL(source, dimension.first, candidate) +
-                                       " IS NOT DISTINCT FROM " + DimensionSQL(source, dimension.first, selected));
             }
         }
-        bool needs_selected_row = !correlations.empty();
-        for (auto &entry : sets) {
-            auto value = ModifierExpression(entry.second.value, options);
-            // CURRENT values use the single value of the frame dimension. A
-            // multi-valued or empty frame has NULL as its current value.
-            resolve_current(value, true);
-            correlations.push_back(DimensionSQL(source, entry.second.dimension, candidate) + " IS NOT DISTINCT FROM " +
-                                   value->ToString());
-        }
-        if (!condition.empty()) {
-            correlations.push_back(condition);
-        }
-        if (visible && !visible_frame.empty()) {
-            correlations.push_back(candidate + "." + Quote(source.id_name) +
-                                   " IN (SELECT unnest(flatten(" + Quote(visible_frame) + ")))");
-        }
-        if (!needs_selected_row) {
-            return correlations.empty() ? "true" : StringUtil::Join(correlations, " AND ");
-        }
-        correlations.push_back(selected + "." + Quote(source.id_name) + " IN (" + frame_ids + ")");
-        return "EXISTS (SELECT 1 FROM " + Quote(source.base_name) + " " + selected + " WHERE " +
-               StringUtil::Join(correlations, " AND ") + ")";
+        return render("__ys_candidate");
     }
 
     void Rewrite(unique_ptr<ParsedExpression> &expression) {
@@ -1299,9 +1561,14 @@ private:
     ExpressionMap aliases;
     Names input_columns;
     std::unordered_map<string, string> visible_frames;
+    const std::unordered_map<string, vector<string>> &cell_partitions;
 };
 
 } // namespace
+
+void ExpandNativeMeasureProjectionStars(SelectNode &select, const vector<QueryNode *> &scopes) {
+    ExpandStars(select, scopes);
+}
 
 string RewriteNativeMeasureWindows(const string &scope_sql, const vector<MeasureWindowSource> &sources,
                                    const vector<MeasureWindowCall> &calls, const vector<string> &visible_ctes,
@@ -1314,6 +1581,31 @@ string RewriteNativeMeasureWindows(const string &scope_sql, const vector<Measure
     auto &owner = query->Cast<SelectNode>();
     ExpandStars(owner);
     auto input_columns = InputColumns(owner);
+    std::unordered_map<string, vector<string>> cell_partitions;
+    SelectExpressions(owner, [&](unique_ptr<ParsedExpression> &expression) {
+        Walk(expression, [&](unique_ptr<ParsedExpression> &node) {
+            if (node->GetExpressionClass() != ExpressionClass::FUNCTION) return true;
+            auto &function = node->Cast<FunctionExpression>();
+            if (function.FunctionName() != "__yardstick_pivot_cell" || function.GetArguments().size() != 1) {
+                return true;
+            }
+            auto value = function.GetArguments()[0].GetExpression().Copy();
+            auto alias = node->GetAlias();
+            Walk(value, [&](unique_ptr<ParsedExpression> &child) {
+                if (child->GetExpressionClass() != ExpressionClass::WINDOW) return true;
+                auto &window = child->Cast<WindowExpression>();
+                for (auto &call : calls) {
+                    if (window.FunctionName() != call.marker_name) continue;
+                    auto &partitions = cell_partitions[call.marker_name];
+                    for (auto &partition : window.Partitions()) partitions.push_back(partition->ToString());
+                }
+                return false;
+            });
+            node = std::move(value);
+            node->SetAlias(alias);
+            return true;
+        });
+    });
     std::unordered_map<string, idx_t> caller_order_counts;
     for (auto &call : calls) {
         caller_order_counts.emplace(call.marker_name, 0);
@@ -1341,12 +1633,17 @@ string RewriteNativeMeasureWindows(const string &scope_sql, const vector<Measure
     for (idx_t i = 0; i < sources.size(); i++) {
         plans.push_back(BuildSource(sources[i], calls, caller_order_counts, i, cte_names, options));
     }
+    vector<QueryNode *> scopes;
+    if (auto inherited = CurrentNativeYardstickCteBindings()) {
+        for (auto &scope : *inherited) scopes.push_back(scope.get());
+    }
+    scopes.push_back(&owner);
     for (auto &plan : plans) {
-        if (!ReplaceSource(owner.from_table, plan)) {
+        if (!ReplaceSource(owner.from_table, plan, scopes, options)) {
             throw BinderException("Cannot locate measure window source %s in the query", plan.spec->relation_name);
         }
     }
-    WindowRewrite rewrite(owner, plans, calls, options, input_columns);
+    WindowRewrite rewrite(owner, plans, calls, options, input_columns, cell_partitions);
     auto output = rewrite.Run();
     for (auto &plan : plans) {
         auto cte = make_uniq<CommonTableExpressionInfo>();

@@ -9,6 +9,8 @@ namespace duckdb {
 class DatabaseInstance;
 bool IsYardstickStandardAggregate(const string &name);
 class Parser;
+class SQLStatement;
+class ParsedExpression;
 
 #if YARDSTICK_GRAMMAR_EXTENSION
 shared_ptr<ParserExtensionInfo> RegisterYardstickGrammar(DatabaseInstance &db);
@@ -70,6 +72,12 @@ BoundStatement BindNativeYardstickProbe(QueryNode &probe, const vector<QueryNode
 
 // Parse through the active grammar while retaining Yardstick syntax capture.
 bool ParseNativeYardstickQuery(const string &sql, Parser &parser);
+
+// Share scalar and window predicate normalization when a context dimension is
+// replaced. Inseparable predicates retain the same explicit error behavior.
+void RemoveNativeContextDimensions(unique_ptr<ParsedExpression> &expression,
+                                    const vector<unique_ptr<ParsedExpression>> &dimensions,
+                                    const string &source_alias);
 
 // Returns a complete native result or recognized semantic error, freed with
 // yardstick_free_aggregate_list. nullptr retains compatibility for unavailable

@@ -16,16 +16,21 @@
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
-#include "duckdb/parser/query_node/set_operation_node.hpp"
-#include "duckdb/parser/query_node/recursive_cte_node.hpp"
 #include "duckdb/parser/tableref/list.hpp"
-#include "duckdb/parser/tableref/table_function_ref.hpp"
-#include "duckdb/parser/tableref/expressionlistref.hpp"
-#include "duckdb/parser/expression/lambda_expression.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
+#include "duckdb/planner/bound_statement.hpp"
 #endif
 
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
+#include "duckdb/parser/common_table_expression_info.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
@@ -91,6 +96,45 @@ static ParserOptions YardstickParserOptions() {
 inline const std::string &YsName(const Identifier &id) { return id.GetIdentifierName(); }
 #endif
 inline const std::string &YsName(const std::string &s) { return s; }
+
+// Parsed-expression accessors that differ between DuckDB releases. The context
+// and grouping rewrites serve builds with and without the native grammar, so
+// they reach the AST through these.
+#if YARDSTICK_NEW_EXPR_API
+using YsIdent = Identifier;
+inline bool YsSameName(const Identifier &name, const std::string &other) { return name == Identifier(other); }
+inline decltype(auto) YsColumnNames(ColumnRefExpression &c) { return c.ColumnNamesMutable(); }
+inline decltype(auto) YsColumnNames(const ColumnRefExpression &c) { return c.ColumnNames(); }
+inline decltype(auto) YsSubquery(SubqueryExpression &s) { return s.SubqueryMutable(); }
+inline ProjectionIndex YsGroupIndex(idx_t index) { return ProjectionIndex(index); }
+inline unique_ptr<ParsedExpression> YsConstant(Value value) { return ConstantExpression::FromValue(std::move(value)); }
+inline decltype(auto) YsCaseElse(CaseExpression &c) { return c.ElseMutable(); }
+inline QueryNode *YsCteNode(CommonTableExpressionInfo &cte) { return cte.query_node.get(); }
+template <class T> decltype(auto) YsConstChildren(const T &e) { return e.GetChildren(); }
+inline std::string YsStringLiteral(const ConstantExpression &c) { return c.GetLiteral().text; }
+inline Value YsConstantValue(const ConstantExpression &c) { return c.GetLiteral().ToValue(); }
+inline void YsClearAlias(ParsedExpression &e) { e.ClearAlias(); }
+inline bool YsIsKeywordLambda(const LambdaExpression &l) {
+    return l.GetLambdaSyntaxType() == LambdaSyntaxType::LAMBDA_KEYWORD;
+}
+inline decltype(auto) YsLambdaBody(LambdaExpression &l) { return l.RightMutable(); }
+#else
+using YsIdent = std::string;
+inline bool YsSameName(const std::string &name, const std::string &other) { return StringUtil::CIEquals(name, other); }
+inline vector<string> &YsColumnNames(ColumnRefExpression &c) { return c.column_names; }
+inline const vector<string> &YsColumnNames(const ColumnRefExpression &c) { return c.column_names; }
+inline unique_ptr<SelectStatement> &YsSubquery(SubqueryExpression &s) { return s.subquery; }
+inline idx_t YsGroupIndex(idx_t index) { return index; }
+inline unique_ptr<ParsedExpression> YsConstant(Value value) { return make_uniq<ConstantExpression>(std::move(value)); }
+inline unique_ptr<ParsedExpression> &YsCaseElse(CaseExpression &c) { return c.else_expr; }
+inline QueryNode *YsCteNode(CommonTableExpressionInfo &cte) { return cte.query ? cte.query->node.get() : nullptr; }
+template <class T> const vector<unique_ptr<ParsedExpression>> &YsConstChildren(const T &e) { return e.children; }
+inline std::string YsStringLiteral(const ConstantExpression &c) { return c.value.ToString(); }
+inline Value YsConstantValue(const ConstantExpression &c) { return c.value; }
+inline void YsClearAlias(ParsedExpression &e) { e.alias.clear(); }
+inline bool YsIsKeywordLambda(const LambdaExpression &l) { return l.syntax_type == LambdaSyntaxType::LAMBDA_KEYWORD; }
+inline unique_ptr<ParsedExpression> &YsLambdaBody(LambdaExpression &l) { return l.expr; }
+#endif
 
 inline const std::string &YsFuncName(const FunctionExpression &f) {
 #if YARDSTICK_NEW_EXPR_API
@@ -994,6 +1038,12 @@ static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableR
             break;
         }
 
+#if YARDSTICK_GRAMMAR_EXTENSION
+        case TableReferenceType::PIVOT:
+            CollectTablesFromTableRef(ref->Cast<PivotRef>().source.get(), tables, cte_names);
+            break;
+#endif
+
         default:
             // TABLE_FUNCTION, EXPRESSION_LIST, etc.
             break;
@@ -1038,6 +1088,9 @@ static bool ExpressionContainsAggregate(ParsedExpression* expr) {
 
         case ExpressionClass::OPERATOR: {
             auto* op = static_cast<OperatorExpression*>(expr);
+            if (op->GetExpressionType() == ExpressionType::GROUPING_FUNCTION) {
+                return true;
+            }
             for (auto* child : YsChildren(*op)) {
                 if (ExpressionContainsAggregate(child)) return true;
             }
@@ -1514,6 +1567,15 @@ extern "C" char* yardstick_decorate_measure(
     return nullptr;
 }
 
+#if !YARDSTICK_GRAMMAR_EXTENSION
+// CTE lineage needs the native frontend; without it no relation is traced.
+extern "C" char* yardstick_resolve_measure_reference(const char*, const char*, const char* const*, size_t,
+                                                    char** error) {
+    if (error) *error = nullptr;
+    return nullptr;
+}
+#endif
+
 extern "C" char* yardstick_window_marker(const char* call_sql, const char* marker_name, char** error) {
     if (error) *error = nullptr;
 #if YARDSTICK_GRAMMAR_EXTENSION
@@ -1595,6 +1657,56 @@ extern "C" char* yardstick_rewrite_measure_windows(
 //=============================================================================
 
 #if YARDSTICK_GRAMMAR_EXTENSION
+static std::unordered_set<string> SelectInputColumns(SelectNode &select) {
+    std::unordered_set<string> names;
+    if (!CurrentNativeYardstickClientContext() || !select.from_table ||
+        select.from_table->type == TableReferenceType::EMPTY_FROM) return names;
+    auto probe = select.Copy();
+    auto &layout = probe->Cast<SelectNode>();
+    layout.select_list.clear();
+    layout.select_list.push_back(make_uniq<StarExpression>());
+    layout.groups = GroupByNode();
+    layout.where_clause.reset();
+    layout.having.reset();
+    layout.qualify.reset();
+    layout.modifiers.clear();
+    layout.aggregate_handling = AggregateHandling::STANDARD_HANDLING;
+    auto bound = BindNativeYardstickProbe(*probe);
+    for (auto &name : bound.names) names.insert(StringUtil::Lower(name.GetIdentifierName()));
+    return names;
+}
+#endif
+
+static unique_ptr<ParsedExpression> ResolveGroupingDimension(
+    SelectNode &select, const ParsedExpression &dimension, const std::unordered_set<string> &input_columns) {
+    const ParsedExpression *resolved = &dimension;
+    if (dimension.GetExpressionClass() == ExpressionClass::CONSTANT) {
+        auto value = YsConstantValue(dimension.Cast<ConstantExpression>());
+        if (!value.IsNull() && value.type().IsIntegral()) {
+            auto ordinal = value.GetValue<int64_t>();
+            if (ordinal > 0 && idx_t(ordinal) <= select.select_list.size()) {
+                resolved = select.select_list[ordinal - 1].get();
+            }
+        }
+    } else if (dimension.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+        auto &column = dimension.Cast<ColumnRefExpression>();
+        auto name = StringUtil::Lower(YsName(column.GetColumnName()));
+        if (!column.IsQualified() && !input_columns.count(name)) {
+            for (auto &projection : select.select_list) {
+                if (projection->HasAlias() && StringUtil::Lower(YsName(projection->GetAlias())) == name) {
+                    resolved = projection.get();
+                    break;
+                }
+            }
+        }
+    }
+    auto result = resolved->Copy();
+    YsClearAlias(*result);
+    return result;
+}
+
+#if YARDSTICK_GRAMMAR_EXTENSION
+
 // Resolve only lexical ownership here. An unqualified column below a sourced
 // query needs schema binding; do not guess that it belongs to the outer query.
 static void NativeRelationQualifiers(TableRef &ref, std::unordered_set<string> &qualifiers) {
@@ -1838,7 +1950,11 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
         }
 
         auto* select_node = static_cast<SelectNode*>(select_stmt->node.get());
+        std::unordered_set<string> input_columns;
 #if YARDSTICK_GRAMMAR_EXTENSION
+        if (result->native_parsed && CurrentNativeYardstickClientContext()) {
+            input_columns = SelectInputColumns(*select_node);
+        }
         if (result->native_parsed) {
             vector<YardstickMeasureReference> references;
             for (auto &expression : select_node->select_list) {
@@ -1873,7 +1989,75 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
 
         // Process SELECT list
         std::vector<YardstickSelectItem> items;
+        std::unordered_set<std::string> measure_aliases;
+        std::function<bool(const ParsedExpression &)> references_measure_alias =
+            [&](const ParsedExpression &expression) {
+                // Nested queries own their aliases and column references.
+                if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+                    return false;
+                }
+                if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+                    auto &column = expression.Cast<ColumnRefExpression>();
+                    return YsColumnNameCount(column) == 1 &&
+                           !input_columns.count(StringUtil::Lower(YsName(column.GetColumnName()))) &&
+                           measure_aliases.count(StringUtil::Lower(YsName(column.GetColumnName())));
+                }
+                bool found = false;
+                ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
+                    found |= references_measure_alias(child);
+                });
+                return found;
+            };
         for (auto& expr : select_node->select_list) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+            // A projection star supplies grouping dimensions that only the FROM
+            // schema can name. With a bind context, replace it by one star item
+            // per column; without one the star stays and its columns are unknown.
+            if (result->native_parsed && expr->GetExpressionClass() == ExpressionClass::STAR &&
+                !expr->Cast<StarExpression>().IsColumns() && CurrentNativeYardstickClientContext() &&
+                select_node->from_table && select_node->from_table->type != TableReferenceType::EMPTY_FROM) {
+                vector<YardstickSelectItem> columns;
+                try {
+                    auto probe = select_node->Copy();
+                    auto &layout = probe->Cast<SelectNode>();
+                    layout.select_list.clear();
+                    layout.select_list.push_back(expr->Copy());
+                    layout.groups = GroupByNode();
+                    layout.where_clause.reset();
+                    layout.having.reset();
+                    layout.qualify.reset();
+                    layout.modifiers.clear();
+                    layout.aggregate_handling = AggregateHandling::STANDARD_HANDLING;
+                    std::vector<YardstickTableRef> sources;
+                    CollectTablesFromTableRef(select_node->from_table.get(), sources, nullptr);
+                    auto bound = BindNativeYardstickProbe(*probe);
+                    for (auto &name : bound.names) {
+                        auto &column = name.GetIdentifierName();
+                        bool measure_column = false;
+                        for (auto &source : sources) {
+                            // A measure's placeholder column is not a dimension.
+                            measure_column |= yardstick_is_measure_column(source.table_name, column.c_str());
+                        }
+                        if (measure_column) continue;
+                        // Still a star item, now naming one of its columns.
+                        // Only callers that ask for star columns read it.
+                        YardstickSelectItem column_item {};
+                        column_item.expression_sql = safe_strdup(make_uniq<ColumnRefExpression>(name)->ToString());
+                        column_item.reference_column = safe_strdup(column);
+                        column_item.is_star = true;
+                        columns.push_back(column_item);
+                    }
+                    for (auto &source : sources) {
+                        free(const_cast<char *>(source.table_name));
+                        free(const_cast<char *>(source.alias));
+                    }
+                    items.insert(items.end(), columns.begin(), columns.end());
+                    continue;
+                } catch (const std::exception &) {
+                    // The star could not be bound here; DuckDB reports it later.
+                }
+            }
+#endif
             YardstickSelectItem item {};
             item.expression_sql = safe_strdup(expr->ToString());
             item.alias = expr->HasAlias() ? safe_strdup(YsName(expr->GetAlias())) : nullptr;
@@ -1888,11 +2072,24 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
             item.end_pos = static_cast<uint32_t>(end_pos);
 #if YARDSTICK_GRAMMAR_EXTENSION
             if (result->native_parsed) {
-                // Native locations cover the expression itself, excluding its
-                // SELECT alias. Replacements leave original alias/trivia intact.
-                auto location = expr->GetQueryLocation();
-                item.start_pos = location.IsValid() ? location.Start() : 0;
-                item.end_pos = location.IsValid() ? location.End() : 0;
+                // Indirection nodes can cover only their suffix: region[1:1]
+                // places the slice's root location on [1:1]. Include this
+                // expression's operands, keeping SELECT aliases and neighboring
+                // projections outside the replacement range.
+                auto source_length = std::strlen(sql);
+                QueryLocation expression_location;
+                std::function<void(const ParsedExpression &)> include_span =
+                    [&](const ParsedExpression &node) {
+                    auto location = node.GetQueryLocation();
+                    if (location.IsValid() && location.End() > location.Start() &&
+                        location.End() <= source_length) {
+                        expression_location = expression_location.Merge(location);
+                    }
+                    ParsedExpressionIterator::EnumerateChildren(node, include_span);
+                };
+                include_span(*expr);
+                item.start_pos = expression_location.IsValid() ? expression_location.Start() : 0;
+                item.end_pos = expression_location.IsValid() ? expression_location.End() : 0;
                 ParsedExpressionIterator::VisitExpressionClass(*expr, ExpressionClass::SUBQUERY,
                     [&](const ParsedExpression &) { item.contains_subquery = true; });
                 if (item.contains_subquery) {
@@ -1920,7 +2117,10 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
             item.is_aggregate = ExpressionContainsAggregate(expr.get());
             item.contains_window = expr->IsWindow();
             item.is_star = expr->GetExpressionClass() == ExpressionClass::STAR;
-            item.is_measure_ref = ExpressionContainsMeasureRef(expr.get());
+            item.is_measure_ref = ExpressionContainsMeasureRef(expr.get()) || references_measure_alias(*expr);
+            if (expr->HasAlias() && (item.is_measure_ref || item.is_aggregate)) {
+                measure_aliases.insert(StringUtil::Lower(YsName(expr->GetAlias())));
+            }
 
             items.push_back(item);
         }
@@ -1964,6 +2164,13 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
             result->group_by_cols = new const char*[result->group_by_count];
 
             for (size_t i = 0; i < select_node->groups.group_expressions.size(); i++) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+                if (result->native_parsed) {
+                    result->group_by_cols[i] = safe_strdup(ResolveGroupingDimension(
+                        *select_node, *select_node->groups.group_expressions[i], input_columns)->ToString());
+                    continue;
+                }
+#endif
                 result->group_by_cols[i] = safe_strdup(
                     select_node->groups.group_expressions[i]->ToString()
                 );
@@ -1986,6 +2193,25 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
     }
 
     return result;
+}
+
+extern "C" YardstickSelectInfo* yardstick_parse_select_with_ctes(
+    const char* sql, const char* const* binding_ctes, size_t binding_cte_count) {
+    if (binding_cte_count == 0) return yardstick_parse_select(sql);
+#if YARDSTICK_GRAMMAR_EXTENSION
+    try {
+        vector<string> queries;
+        for (size_t i = 0; i < binding_cte_count; i++) queries.emplace_back(binding_ctes[i]);
+        NativeYardstickCteBindScope scope(queries, YardstickParserOptions());
+        return yardstick_parse_select(sql);
+    } catch (const std::exception &error) {
+        auto *result = new YardstickSelectInfo {};
+        result->error = safe_strdup(error.what());
+        return result;
+    }
+#else
+    return yardstick_parse_select(sql);
+#endif
 }
 
 //=============================================================================
@@ -2151,7 +2377,8 @@ static bool ReferencesSubqueryAlias(
 static bool InlineSelectAliases(
     unique_ptr<ParsedExpression> &expr,
     const SelectAliasMap &aliases,
-    const TableQualifierSet &from_qualifiers
+    const TableQualifierSet &from_qualifiers,
+    const std::unordered_set<string> *input_columns = nullptr
 ) {
     if (!expr) {
         return false;
@@ -2159,6 +2386,8 @@ static bool InlineSelectAliases(
 
     SelectAliasMap::const_iterator alias_entry;
     if (FindSelectAliasRef(*expr, aliases, from_qualifiers, alias_entry)) {
+        if (input_columns && !expr->Cast<ColumnRefExpression>().IsQualified() &&
+            input_columns->count(alias_entry->first)) return false;
         if (!alias_entry->second.has_subquery) {
             return false;
         }
@@ -2170,16 +2399,226 @@ static bool InlineSelectAliases(
 
     bool changed = false;
     EnumerateOrderAliasScopeChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
-        if (InlineSelectAliases(child, aliases, from_qualifiers)) {
+        if (InlineSelectAliases(child, aliases, from_qualifiers, input_columns)) {
             changed = true;
         }
     });
     return changed;
 }
 
+extern "C" bool yardstick_requires_select_alias_binding(const char* sql) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    try {
+        Parser parser(YardstickParserOptions());
+        if (!ParseNativeYardstickQuery(sql, parser)) return false;
+        if (parser.statements.size() != 1 ||
+            parser.statements[0]->type != StatementType::SELECT_STATEMENT) return false;
+        auto &statement = parser.statements[0]->Cast<SelectStatement>();
+        if (statement.node->type != QueryNodeType::SELECT_NODE) return false;
+        auto &select = statement.node->Cast<SelectNode>();
+        TableQualifierSet qualifiers;
+        CollectTableQualifiers(select.from_table.get(), qualifiers);
+        // A projection star names its columns only through the FROM schema.
+        for (auto &expression : select.select_list) {
+            if (expression->GetExpressionClass() == ExpressionClass::STAR &&
+                !expression->Cast<StarExpression>().IsColumns()) return true;
+        }
+        SelectAliasMap aliases;
+        std::function<bool(const ParsedExpression &)> references_alias = [&](const ParsedExpression &expression) {
+            SelectAliasMap::const_iterator entry;
+            if (FindSelectAliasRef(expression, aliases, qualifiers, entry)) return true;
+            bool found = false;
+            EnumerateOrderAliasScopeChildren(expression, [&](const ParsedExpression &child) {
+                found |= references_alias(child);
+            });
+            return found;
+        };
+        for (auto &expression : select.select_list) {
+            if (references_alias(*expression)) return true;
+            if (expression->HasAlias()) {
+                aliases[NormalizeAliasName(YsName(expression->GetAlias()))] = {expression.get(), false};
+            }
+        }
+        for (auto &expression : select.groups.group_expressions) {
+            if (references_alias(*expression)) return true;
+        }
+        return select.having && references_alias(*select.having);
+    } catch (const std::exception &) {
+        return false;
+    }
+#endif
+    return false;
+}
+
 //=============================================================================
 // FFI Implementation: yardstick_inline_order_by_subquery_aliases
 //=============================================================================
+
+static unique_ptr<ParsedExpression> GroupingContextExpression(const ParsedExpression &expression,
+                                                             bool unqualify_columns = false) {
+    auto result = expression.Copy();
+    if (result->GetExpressionClass() == ExpressionClass::FUNCTION) {
+        auto &function = result->Cast<FunctionExpression>();
+        if (StringUtil::CIEquals(YsFuncName(function), "any_value") && YsArgs(function).size() == 1) {
+            result = YsArgs(function)[0]->Copy();
+        }
+    }
+    std::function<void(ParsedExpression &)> unqualify = [&](ParsedExpression &node) {
+        if (node.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+            auto &names = YsColumnNames(node.Cast<ColumnRefExpression>());
+            if (names.size() > 1) {
+                auto name = names.back();
+                names = {name};
+            }
+        }
+        ParsedExpressionIterator::EnumerateChildren(node, [&](unique_ptr<ParsedExpression> &child) {
+            unqualify(*child);
+        });
+    };
+    if (unqualify_columns) unqualify(*result);
+    result->ClearAlias();
+    return result;
+}
+
+// Correlation markers identify only predicates generated for grouping context.
+// SET predicates and user-authored subqueries must retain their own semantics.
+static bool RewriteGroupingCorrelations(unique_ptr<ParsedExpression> &expression,
+                                        const vector<unique_ptr<ParsedExpression>> &dimensions,
+                                        const GroupingSet *grouping_set) {
+    if (!expression) return false;
+    if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+        auto &function = expression->Cast<FunctionExpression>();
+        if (YsFuncName(function) == "__yardstick_grouping_correlation" && YsArgs(function).size() == 1) {
+            auto condition = YsArgs(function)[0]->Copy();
+            bool removed = false;
+            if (grouping_set && condition->GetExpressionClass() == ExpressionClass::COMPARISON) {
+                auto &comparison = condition->Cast<ComparisonExpression>();
+                for (idx_t i = 0; i < dimensions.size(); i++) {
+                    bool qualified = false;
+                    ParsedExpressionIterator::VisitExpressionClass(*dimensions[i], ExpressionClass::COLUMN_REF,
+                        [&](const ParsedExpression &column) {
+                            qualified |= column.Cast<ColumnRefExpression>().IsQualified();
+                        });
+                    auto outer_dimension = GroupingContextExpression(*YsRight(comparison), !qualified);
+                    if (!grouping_set->count(YsGroupIndex(i)) && outer_dimension->Equals(*dimensions[i])) {
+                        removed = true;
+                        break;
+                    }
+                }
+            }
+            expression = removed ? YsConstant(Value::BOOLEAN(true)) : std::move(condition);
+            return removed;
+        }
+    }
+    if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+        auto &subquery = expression->Cast<SubqueryExpression>();
+        if (YsSubquery(subquery) && YsSubquery(subquery)->node->type == QueryNodeType::SELECT_NODE) {
+            auto &select = YsSubquery(subquery)->node->Cast<SelectNode>();
+            return RewriteGroupingCorrelations(select.where_clause, dimensions, grouping_set);
+        }
+        return false;
+    }
+    bool removed = false;
+    ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+        removed |= RewriteGroupingCorrelations(child, dimensions, grouping_set);
+    });
+    return removed;
+}
+
+static bool RewriteGroupingSetContexts(SelectNode &select) {
+    vector<unique_ptr<ParsedExpression>> dimensions;
+    // Without a bind context the FROM schema is unknown and SELECT aliases
+    // cannot be told apart from input columns.
+    std::unordered_set<string> input_columns;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    input_columns = SelectInputColumns(select);
+#endif
+    for (auto &dimension : select.groups.group_expressions) {
+        auto resolved = ResolveGroupingDimension(select, *dimension, input_columns);
+        dimensions.push_back(GroupingContextExpression(*resolved));
+    }
+    bool changed = false;
+    std::function<void(unique_ptr<ParsedExpression> &, bool)> rewrite =
+        [&](unique_ptr<ParsedExpression> &expression, bool grouped_context) {
+        if (!expression || expression->GetExpressionClass() == ExpressionClass::SUBQUERY) return;
+        if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+            auto &function = expression->Cast<FunctionExpression>();
+            if (YsFuncName(function) == "__yardstick_grouping_context" && YsArgs(function).size() == 1) {
+                auto original = YsArgs(function)[0]->Copy();
+                auto alias = expression->GetAlias();
+                auto result = make_uniq<CaseExpression>();
+                if (grouped_context && select.groups.grouping_sets.size() > 1) {
+                    for (auto &grouping_set : select.groups.grouping_sets) {
+                        auto value = original->Copy();
+                        if (!RewriteGroupingCorrelations(value, dimensions, &grouping_set)) continue;
+                        vector<unique_ptr<ParsedExpression>> conditions;
+                        for (idx_t i = 0; i < dimensions.size(); i++) {
+                            vector<unique_ptr<ParsedExpression>> arguments;
+                            arguments.push_back(dimensions[i]->Copy());
+                            auto grouping = make_uniq<OperatorExpression>(ExpressionType::GROUPING_FUNCTION,
+                                                                          std::move(arguments));
+                            conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+                                std::move(grouping), YsConstant(
+                                    Value::BIGINT(grouping_set.count(YsGroupIndex(i)) ? 0 : 1))));
+                        }
+                        auto condition = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+                                                                          std::move(conditions));
+                        YsCaseChecks(*result).push_back({std::move(condition), std::move(value)});
+                    }
+                }
+                RewriteGroupingCorrelations(original, dimensions, nullptr);
+                if (YsCaseChecks(*result).empty()) {
+                    expression = std::move(original);
+                } else {
+                    // GROUPING executes in the outer grouped query. Moving it
+                    // into a correlated subquery is rejected by DuckDB, and
+                    // checking NULL would confuse real NULLs with subtotals.
+                    YsCaseElse(*result) = std::move(original);
+                    expression = std::move(result);
+                }
+                expression->SetAlias(alias);
+                changed = true;
+                return;
+            }
+        }
+        ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+            rewrite(child, grouped_context);
+        });
+    };
+    for (auto &expression : select.select_list) rewrite(expression, true);
+    rewrite(select.having, true);
+    rewrite(select.qualify, true);
+    // WHERE runs before grouping. Its measure contexts use individual rows,
+    // even when the enclosing SELECT also produces grouping-set subtotals.
+    rewrite(select.where_clause, false);
+    std::function<void(TableRef &)> rewrite_row_predicates = [&](TableRef &table) {
+        switch (table.type) {
+        case TableReferenceType::JOIN: {
+            auto &join = table.Cast<JoinRef>();
+            rewrite_row_predicates(*join.left);
+            rewrite_row_predicates(*join.right);
+            rewrite(join.condition, false);
+            break;
+        }
+        case TableReferenceType::TABLE_FUNCTION:
+            rewrite(table.Cast<TableFunctionRef>().function, false);
+            break;
+        case TableReferenceType::EXPRESSION_LIST:
+            for (auto &row : table.Cast<ExpressionListRef>().values) {
+                for (auto &expression : row) rewrite(expression, false);
+            }
+            break;
+        default:
+            // Derived tables own their grouping context and are lowered as
+            // separate native query scopes.
+            break;
+        }
+    };
+    if (select.from_table) rewrite_row_predicates(*select.from_table);
+    ParsedExpressionIterator::EnumerateQueryNodeModifiers(select,
+        [&](unique_ptr<ParsedExpression> &expression) { rewrite(expression, true); });
+    return changed;
+}
 
 extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
     if (!sql) {
@@ -2204,12 +2643,28 @@ extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
         }
 
         auto* select_node = static_cast<SelectNode*>(select_stmt->node.get());
+        bool changed = false;
+        changed = RewriteGroupingSetContexts(*select_node);
         TableQualifierSet from_qualifiers;
         CollectTableQualifiers(select_node->from_table.get(), from_qualifiers);
+        std::unordered_set<string> input_columns;
+        bool bind_select_aliases = true;
+#if YARDSTICK_GRAMMAR_EXTENSION
+        input_columns = SelectInputColumns(*select_node);
+        bind_select_aliases = CurrentNativeYardstickClientContext() != nullptr;
+#endif
 
         SelectAliasMap aliases;
         bool has_subquery_alias = false;
         for (auto& expr : select_node->select_list) {
+            // DuckDB cannot reuse a scalar-subquery alias in another SELECT
+            // expression. Expand references in declaration order so dependent
+            // aliases already contain their fully lowered definitions.
+            if (bind_select_aliases && ReferencesSubqueryAlias(*expr, aliases, from_qualifiers)) {
+                auto alias = expr->GetAlias();
+                changed = InlineSelectAliases(expr, aliases, from_qualifiers, &input_columns) || changed;
+                expr->SetAlias(alias);
+            }
             if (!expr->HasAlias()) {
                 continue;
             }
@@ -2219,10 +2674,13 @@ extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
         }
 
         if (!has_subquery_alias || aliases.empty()) {
-            return nullptr;
+            return changed ? safe_strdup(stmt->ToString()) : nullptr;
         }
 
-        bool changed = false;
+        if (bind_select_aliases && select_node->having &&
+            ReferencesSubqueryAlias(*select_node->having, aliases, from_qualifiers)) {
+            changed = InlineSelectAliases(select_node->having, aliases, from_qualifiers, &input_columns) || changed;
+        }
         for (auto& modifier : select_node->modifiers) {
             if (modifier->type != ResultModifierType::ORDER_MODIFIER) {
                 continue;
@@ -2250,6 +2708,23 @@ extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
     } catch (...) {
         return nullptr;
     }
+}
+
+extern "C" char* yardstick_inline_order_by_subquery_aliases_with_ctes(
+    const char* sql, const char* const* binding_ctes, size_t binding_cte_count) {
+    if (binding_cte_count == 0) return yardstick_inline_order_by_subquery_aliases(sql);
+#if YARDSTICK_GRAMMAR_EXTENSION
+    try {
+        vector<string> queries;
+        for (size_t i = 0; i < binding_cte_count; i++) queries.emplace_back(binding_ctes[i]);
+        NativeYardstickCteBindScope scope(queries, YardstickParserOptions());
+        return yardstick_inline_order_by_subquery_aliases(sql);
+    } catch (const std::exception &) {
+        return nullptr;
+    }
+#else
+    return yardstick_inline_order_by_subquery_aliases(sql);
+#endif
 }
 
 //=============================================================================
@@ -2326,7 +2801,6 @@ extern "C" int32_t yardstick_expressions_equal(const char* left, const char* rig
     }
 }
 
-#if YARDSTICK_GRAMMAR_EXTENSION
 namespace {
 struct VisibleFilterScope {
     bool unqualified_is_local = true;
@@ -2349,22 +2823,22 @@ public:
             return;
         }
         if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-            auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
-            if (scope.lambda_parameters.count(StringUtil::Lower(names[0].GetIdentifierName()))) {
+            auto &names = YsColumnNames(expression->Cast<ColumnRefExpression>());
+            if (scope.lambda_parameters.count(StringUtil::Lower(YsName(names[0])))) {
                 return;
             }
             bool local = names.size() == 1 ? scope.unqualified_is_local &&
-                    !scope.aliases.count(StringUtil::Lower(names[0].GetIdentifierName()))
+                    !scope.aliases.count(StringUtil::Lower(YsName(names[0])))
                 : names.size() >= 2 && scope.alias_is_local && !local_alias.empty() &&
-                  names[names.size() - 2] == Identifier(local_alias);
+                  YsSameName(names[names.size() - 2], local_alias);
             if (local) {
                 if (scope.inner_alias_shadowed) {
                     throw ParserException("Conflicting recomputation alias in visible filter");
                 }
                 auto alias = expression->GetAlias();
-                auto entry = dimensions.find(StringUtil::Lower(names.back().GetIdentifierName()));
+                auto entry = dimensions.find(StringUtil::Lower(YsName(names.back())));
                 if (entry == dimensions.end()) {
-                    expression = make_uniq<ColumnRefExpression>(names.back(), Identifier("_inner"));
+                    expression = make_uniq<ColumnRefExpression>(names.back(), YsIdent("_inner"));
                 } else {
                     expression = entry->second->Copy();
                 }
@@ -2374,16 +2848,16 @@ public:
         }
         if (expression->GetExpressionClass() == ExpressionClass::LAMBDA) {
             auto &lambda = expression->Cast<LambdaExpression>();
-            if (lambda.GetLambdaSyntaxType() == LambdaSyntaxType::LAMBDA_KEYWORD) {
+            if (YsIsKeywordLambda(lambda)) {
                 string error;
                 auto parameters = lambda.ExtractColumnRefExpressions(error);
                 if (!error.empty()) throw ParserException(error);
                 for (auto &parameter : parameters) {
-                    auto &names = parameter.get().Cast<ColumnRefExpression>().ColumnNames();
+                    auto &names = YsColumnNames(parameter.get().Cast<ColumnRefExpression>());
                     if (names.size() != 1) throw ParserException("Invalid lambda parameter in visible filter");
-                    scope.lambda_parameters.insert(StringUtil::Lower(names[0].GetIdentifierName()));
+                    scope.lambda_parameters.insert(StringUtil::Lower(YsName(names[0])));
                 }
-                Expression(lambda.RightMutable(), scope);
+                Expression(YsLambdaBody(lambda), scope);
                 return;
             }
             // Arrow expressions also represent JSON access. Only explicit
@@ -2392,8 +2866,8 @@ public:
         if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
             auto &subquery = expression->Cast<SubqueryExpression>();
             // IN/ANY's left operand belongs to the containing expression scope.
-            Expression(subquery.GetChildMutable(), scope);
-            Query(*subquery.SubqueryMutable()->node, scope);
+            Expression(YsChildRef(subquery), scope);
+            Query(*YsSubquery(subquery)->node, scope);
             return;
         }
         ParsedExpressionIterator::EnumerateChildren(*expression,
@@ -2407,9 +2881,9 @@ public:
         }
         ParsedExpressionIterator::VisitExpressionClassMutable(*expressions[0], ExpressionClass::COLUMN_REF,
             [](ParsedExpression &expression) {
-                auto &names = expression.Cast<ColumnRefExpression>().ColumnNamesMutable();
+                auto &names = YsColumnNames(expression.Cast<ColumnRefExpression>());
                 auto column = names.back();
-                names = {Identifier("_inner"), std::move(column)};
+                names = {YsIdent("_inner"), std::move(column)};
             });
         dimensions.emplace(StringUtil::Lower(name), std::move(expressions[0]));
     }
@@ -2446,10 +2920,10 @@ private:
     void Query(QueryNode &query, VisibleFilterScope outer) {
         // CTE bodies cannot see the containing SELECT's FROM bindings.
         for (auto &entry : query.cte_map.map) {
-            if (!entry.second->query_node) {
+            if (!YsCteNode(*entry.second)) {
                 throw ParserException("Unsupported CTE in visible filter");
             }
-            Query(*entry.second->query_node, outer);
+            Query(*YsCteNode(*entry.second), outer);
         }
         auto scope = outer;
         switch (query.type) {
@@ -2523,32 +2997,354 @@ private:
     }
 };
 } // namespace
+
+// De Morgan, distributivity, idempotence, and absorption hold for SQL's
+// three-valued AND/OR/NOT. Normalize before separating dimension predicates so
+// equivalent NOT and factorable OR forms retain the same independent filters.
+static unique_ptr<ParsedExpression> ContextNegationNormalForm(const ParsedExpression &expression, bool negate = false) {
+    auto type = expression.GetExpressionType();
+    if (type == ExpressionType::OPERATOR_NOT) {
+        auto &children = YsConstChildren(expression.Cast<OperatorExpression>());
+        if (children.size() == 1) return ContextNegationNormalForm(*children[0], !negate);
+    }
+    if (type == ExpressionType::CONJUNCTION_AND || type == ExpressionType::CONJUNCTION_OR) {
+        if (negate) type = type == ExpressionType::CONJUNCTION_AND
+            ? ExpressionType::CONJUNCTION_OR : ExpressionType::CONJUNCTION_AND;
+        vector<unique_ptr<ParsedExpression>> children;
+        for (auto &child : YsConstChildren(expression.Cast<ConjunctionExpression>())) {
+            children.push_back(ContextNegationNormalForm(*child, negate));
+        }
+        return make_uniq<ConjunctionExpression>(type, std::move(children));
+    }
+    auto result = expression.Copy();
+    if (!negate) return result;
+    return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(result));
+}
+
+using ContextClause = vector<unique_ptr<ParsedExpression>>;
+using ContextConjunction = vector<ContextClause>;
+
+static bool ContextExpressionCanRepeat(const ParsedExpression &expression) {
+    if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) return false;
+    if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+        auto *context = CurrentNativeYardstickClientContext();
+        if (!context) return false;
+        try {
+            auto &function = expression.Cast<FunctionExpression>();
+            auto entry = Catalog::GetEntry<ScalarFunctionCatalogEntry>(
+                *context, function.GetQualifiedName(), OnEntryNotFound::RETURN_NULL);
+            if (!entry || entry->functions.functions.empty()) return false;
+            for (auto &overload : entry->functions.functions) {
+                if (overload->GetStability() == FunctionStability::VOLATILE) return false;
+            }
+        } catch (const std::exception &) {
+            return false; // No catalog proof permits no evaluation-changing rewrite.
+        }
+#else
+        return false; // No bind context, so no catalog proof that the call is stable.
+#endif
+    }
+    bool repeatable = true;
+    ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
+        repeatable &= ContextExpressionCanRepeat(child);
+    });
+    return repeatable;
+}
+
+static ContextConjunction ContextConjunctiveNormalForm(const ParsedExpression &expression) {
+    constexpr idx_t MAX_CONTEXT_CLAUSES = 128;
+    auto type = expression.GetExpressionType();
+    if (type != ExpressionType::CONJUNCTION_AND && type != ExpressionType::CONJUNCTION_OR) {
+        ContextClause clause;
+        clause.push_back(expression.Copy());
+        ContextConjunction result;
+        result.push_back(std::move(clause));
+        return result;
+    }
+    ContextConjunction result;
+    for (auto &child : YsConstChildren(expression.Cast<ConjunctionExpression>())) {
+        auto next = ContextConjunctiveNormalForm(*child);
+        if (result.empty()) {
+            result = std::move(next);
+        } else if (type == ExpressionType::CONJUNCTION_AND) {
+            for (auto &clause : next) result.push_back(std::move(clause));
+        } else {
+            if (next.size() > MAX_CONTEXT_CLAUSES / result.size()) {
+                throw ParserException("AT dimension replacement requires a simpler predicate; use an explicit AT WHERE predicate");
+            }
+            ContextConjunction product;
+            for (auto &left : result) {
+                for (auto &right : next) {
+                    ContextClause clause;
+                    for (auto &atom : left) clause.push_back(atom->Copy());
+                    for (auto &atom : right) clause.push_back(atom->Copy());
+                    product.push_back(std::move(clause));
+                }
+            }
+            result = std::move(product);
+        }
+        if (result.size() > MAX_CONTEXT_CLAUSES) {
+            throw ParserException("AT dimension replacement requires a simpler predicate; use an explicit AT WHERE predicate");
+        }
+    }
+    return result;
+}
+
+static unique_ptr<ParsedExpression> ContextDimensionReference(const ParsedExpression &expression,
+                                                             const string &source_alias) {
+    auto result = expression.Copy();
+    ParsedExpressionIterator::VisitExpressionClassMutable(*result, ExpressionClass::COLUMN_REF,
+        [&](ParsedExpression &column) {
+            auto &names = YsColumnNames(column.Cast<ColumnRefExpression>());
+            if (names.size() == 1 || (names.size() == 2 && YsSameName(names[0], source_alias))) {
+                auto name = names.back();
+                names = {YsIdent("_inner"), std::move(name)};
+            }
+        });
+    return result;
+}
+
+static bool ContextReferencesDimension(const ParsedExpression &expression,
+                                       const vector<unique_ptr<ParsedExpression>> &dimensions,
+                                       const string &source_alias) {
+    auto canonical = ContextDimensionReference(expression, source_alias);
+    for (auto &dimension : dimensions) {
+        if (canonical->Equals(*dimension)) return true;
+    }
+    if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) return false;
+    bool found = false;
+    ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
+        found |= ContextReferencesDimension(child, dimensions, source_alias);
+    });
+    return found;
+}
+
+static void DropContextDimensions(unique_ptr<ParsedExpression> &expression,
+                                  const vector<unique_ptr<ParsedExpression>> &excluded,
+                                  const string &source_alias = string()) {
+    if (!expression || excluded.empty()) return;
+    // Unrelated subtrees are already valid context terms. Keep their original
+    // shape and repeated evaluations, including separate volatile OR calls.
+    if (!ContextReferencesDimension(*expression, excluded, source_alias)) return;
+    if (!ContextExpressionCanRepeat(*expression)) {
+        if (expression->GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+            ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+                DropContextDimensions(child, excluded, source_alias);
+            });
+            return;
+        }
+        bool boolean_reassociation = false;
+        ParsedExpressionIterator::VisitExpressionClass(*expression, ExpressionClass::CONJUNCTION,
+            [&](const ParsedExpression &) { boolean_reassociation = true; });
+        if (boolean_reassociation) {
+            throw ParserException("AT dimension replacement cannot safely normalize a volatile or unproven predicate; "
+                                  "use an explicit AT WHERE predicate");
+        }
+    }
+    auto normalized = ContextNegationNormalForm(*expression);
+    auto clauses = ContextConjunctiveNormalForm(*normalized);
+    // Deduplicate disjuncts, then absorb clauses containing a smaller clause.
+    // For example (year=A AND region=N) OR (year=B AND region=N)
+    // reduces to (year=A OR year=B) AND region=N before removing year.
+    for (auto &clause : clauses) {
+        for (idx_t i = 0; i < clause.size(); i++) {
+            for (idx_t j = i + 1; j < clause.size();) {
+                if (clause[i]->Equals(*clause[j])) clause.erase(clause.begin() + j);
+                else j++;
+            }
+        }
+    }
+    vector<bool> absorbed(clauses.size(), false);
+    for (idx_t i = 0; i < clauses.size(); i++) {
+        for (idx_t j = 0; j < clauses.size(); j++) {
+            if (i == j || clauses[i].size() > clauses[j].size() ||
+                (clauses[i].size() == clauses[j].size() && i > j)) continue;
+            bool subset = true;
+            for (auto &atom : clauses[i]) {
+                bool present = false;
+                for (auto &candidate : clauses[j]) present |= atom->Equals(*candidate);
+                subset &= present;
+            }
+            if (subset) absorbed[j] = true;
+        }
+    }
+    std::function<void(const ParsedExpression &, bool &, bool &)> dependencies;
+    dependencies = [&](const ParsedExpression &term, bool &overridden, bool &other) {
+        auto canonical = ContextDimensionReference(term, source_alias);
+        for (auto &dimension : excluded) {
+            if (canonical->Equals(*dimension)) {
+                overridden = true;
+                return;
+            }
+        }
+        if (term.GetExpressionClass() == ExpressionClass::COLUMN_REF ||
+            term.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+            other = true;
+            return;
+        }
+        ParsedExpressionIterator::EnumerateChildren(term, [&](const ParsedExpression &child) {
+            dependencies(child, overridden, other);
+        });
+    };
+    vector<unique_ptr<ParsedExpression>> remaining;
+    for (idx_t i = 0; i < clauses.size(); i++) {
+        if (absorbed[i]) continue;
+        bool overridden = false, other = false;
+        for (auto &atom : clauses[i]) {
+            bool atom_overridden = false, atom_other = false;
+            dependencies(*atom, atom_overridden, atom_other);
+            if (atom_overridden && atom_other && atom->GetExpressionClass() == ExpressionClass::COMPARISON) {
+                // A join equality such as source.year = allowed.year constrains
+                // the source year using an external value. It is a year term;
+                // the external operand is not another source dimension.
+                bool other_source_dimension = false;
+                ParsedExpressionIterator::VisitExpressionClass(*atom, ExpressionClass::COLUMN_REF,
+                    [&](const ParsedExpression &column) {
+                        auto canonical = ContextDimensionReference(column, source_alias);
+                        bool removed = false;
+                        for (auto &dimension : excluded) removed |= canonical->Equals(*dimension);
+                        if (removed) return;
+                        auto &names = YsColumnNames(column.Cast<ColumnRefExpression>());
+                        other_source_dimension |= names.size() == 1 ||
+                            (names.size() == 2 && (YsSameName(names[0], source_alias) || YsSameName(names[0], "_inner")));
+                    });
+                if (!other_source_dimension) atom_other = false;
+            }
+            overridden |= atom_overridden;
+            other |= atom_other;
+        }
+        if (overridden && other) {
+            throw ParserException("AT dimension replacement cannot separate a mixed VISIBLE predicate; "
+                                  "use an explicit AT WHERE predicate");
+        }
+        if (overridden) continue;
+        if (clauses[i].size() == 1) remaining.push_back(std::move(clauses[i][0]));
+        else remaining.push_back(make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(clauses[i])));
+    }
+    if (remaining.empty()) expression = YsConstant(Value::BOOLEAN(true));
+    else if (remaining.size() == 1) expression = std::move(remaining[0]);
+    else expression = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(remaining));
+}
+
+#if YARDSTICK_GRAMMAR_EXTENSION
+void duckdb::RemoveNativeContextDimensions(unique_ptr<ParsedExpression> &expression,
+                                           const vector<unique_ptr<ParsedExpression>> &dimensions,
+                                           const string &source_alias) {
+    vector<unique_ptr<ParsedExpression>> canonical;
+    for (auto &dimension : dimensions) {
+        canonical.push_back(ContextDimensionReference(*dimension, source_alias));
+    }
+    DropContextDimensions(expression, canonical, source_alias);
+}
 #endif
 
 extern "C" char* yardstick_rewrite_visible_filter(const char* expression, const char* local_alias,
                                                   const char* const* dimension_names,
                                                   const char* const* dimension_expressions,
-                                                  size_t dimension_count, char** error) {
+                                                  size_t dimension_count,
+                                                  const char* const* excluded_dimensions,
+                                                  size_t excluded_count, char** error) {
     if (error) *error = nullptr;
+    if (!expression) return nullptr;
 #if YARDSTICK_GRAMMAR_EXTENSION
-    auto *options = CurrentNativeYardstickParserOptions();
-    if (!options || !expression) return nullptr;
+    auto *native_options = CurrentNativeYardstickParserOptions();
+    if (!native_options) return nullptr;
+    auto parser_options = *native_options;
+#else
+    auto parser_options = YardstickParserOptions();
+#endif
+    auto *options = &parser_options;
     try {
         auto expressions = YardstickParseExpressionList(expression, *options);
-        if (expressions.size() != 1) {
-            throw ParserException("Expected one expression in visible filter");
+        if (expressions.size() != 1) throw ParserException("Expected one expression in visible filter");
+        string visible_source;
+        bool joined_visibility = false;
+        if (expressions[0]->GetExpressionClass() == ExpressionClass::FUNCTION) {
+            auto &function = expressions[0]->Cast<FunctionExpression>();
+            auto arguments = YsArgs(function);
+            if (YsFuncName(function) == "__yardstick_visible_join" && arguments.size() == 2 &&
+                arguments[0]->GetExpressionClass() == ExpressionClass::CONSTANT) {
+                visible_source = YsStringLiteral(arguments[0]->Cast<ConstantExpression>());
+                expressions[0] = arguments[1]->Copy();
+                joined_visibility = true;
+            }
         }
         VisibleFilterRewriter rewriter(local_alias ? local_alias : "", *options);
-        for (size_t i = 0; i < dimension_count; i++) {
-            rewriter.AddDimension(dimension_names[i], dimension_expressions[i]);
-        }
+        for (size_t i = 0; i < dimension_count; i++) rewriter.AddDimension(dimension_names[i], dimension_expressions[i]);
         rewriter.Expression(expressions[0], {});
+        vector<unique_ptr<ParsedExpression>> excluded;
+        for (size_t i = 0; i < excluded_count; i++) {
+            auto dimensions = YardstickParseExpressionList(excluded_dimensions[i], *options);
+            if (dimensions.size() != 1) throw ParserException("Expected one context dimension");
+            excluded.push_back(ContextDimensionReference(*dimensions[0], local_alias ? local_alias : ""));
+            rewriter.Expression(dimensions[0], {});
+            excluded.push_back(std::move(dimensions[0]));
+        }
+        if (joined_visibility) {
+            if (expressions[0]->GetExpressionClass() != ExpressionClass::SUBQUERY ||
+                YsSubquery(expressions[0]->Cast<SubqueryExpression>())->node->type != QueryNodeType::SELECT_NODE) {
+                throw ParserException("Invalid joined visibility context");
+            }
+            auto &select = YsSubquery(expressions[0]->Cast<SubqueryExpression>())->node->Cast<SelectNode>();
+            // A join does not restrict a measure by itself: the measure evaluates
+            // against its defining view's rows and only WHERE removes any. Keep
+            // every source row through the joins, so an unmatched row fails a
+            // predicate on a joined column instead of disappearing with the join.
+            auto source_qualifier = NormalizeAliasName(visible_source);
+            std::function<bool(TableRef &)> preserve_source = [&](TableRef &table) -> bool {
+                if (table.type != TableReferenceType::JOIN) {
+                    TableQualifierSet qualifiers;
+                    CollectTableQualifiers(&table, qualifiers);
+                    return qualifiers.count(source_qualifier) > 0;
+                }
+                auto &join = table.Cast<JoinRef>();
+                bool in_left = preserve_source(*join.left);
+                bool in_right = !in_left && preserve_source(*join.right);
+                if (!in_left && !in_right) return false;
+                if (join.ref_type == JoinRefType::CROSS) {
+                    join.ref_type = JoinRefType::REGULAR;
+                    join.type = JoinType::INNER;
+                    join.condition = YsConstant(Value::BOOLEAN(true));
+                }
+                if (join.type == JoinType::INNER &&
+                    (join.ref_type == JoinRefType::REGULAR || join.ref_type == JoinRefType::NATURAL)) {
+                    join.type = in_left ? JoinType::LEFT : JoinType::RIGHT;
+                }
+                return true;
+            };
+            if (select.from_table) preserve_source(*select.from_table);
+            DropContextDimensions(select.where_clause, excluded, visible_source);
+            std::function<void(TableRef &)> prune_joins = [&](TableRef &table) {
+                if (table.type != TableReferenceType::JOIN) return;
+                auto &join = table.Cast<JoinRef>();
+                DropContextDimensions(join.condition, excluded, visible_source);
+                bool removed_using_dimension = false;
+                for (idx_t i = 0; i < join.using_columns.size();) {
+                    auto column = make_uniq<ColumnRefExpression>(join.using_columns[i]);
+                    auto canonical = ContextDimensionReference(*column, visible_source);
+                    bool removed = false;
+                    for (auto &dimension : excluded) removed |= canonical->Equals(*dimension);
+                    if (removed) {
+                        join.using_columns.erase(join.using_columns.begin() + i);
+                        removed_using_dimension = true;
+                    } else i++;
+                }
+                if (removed_using_dimension && join.using_columns.empty() && !join.condition) {
+                    join.condition = YsConstant(Value::BOOLEAN(true));
+                }
+                prune_joins(*join.left);
+                prune_joins(*join.right);
+            };
+            if (select.from_table) prune_joins(*select.from_table);
+        } else {
+            DropContextDimensions(expressions[0], excluded);
+        }
         return safe_strdup(expressions[0]->ToString());
     } catch (const std::exception &exception) {
         if (error) *error = safe_strdup(exception.what());
         return nullptr;
     }
-#endif
     return nullptr;
 }
 

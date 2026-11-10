@@ -19,7 +19,9 @@
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/operator/logical_create.hpp"
 #include <atomic>
@@ -88,7 +90,7 @@ extern "C" {
     void yardstick_init_parser_ffi(
         YardstickAggregateCallList* (*find_aggregates)(const char*),
         void (*free_aggregate_list)(YardstickAggregateCallList*),
-        YardstickSelectInfo* (*parse_select)(const char*),
+        YardstickSelectInfo* (*parse_select)(const char*, const char* const*, size_t),
         void (*free_select_info)(YardstickSelectInfo*),
         YardstickExpressionInfo* (*parse_expression)(const char*),
         void (*free_expression_info)(YardstickExpressionInfo*),
@@ -97,7 +99,7 @@ extern "C" {
         char* (*replace_range)(const char*, uint32_t, uint32_t, const char*),
         char* (*apply_replacements)(const char*, const YardstickReplacement*, size_t),
         char* (*qualify_expression)(const char*, const char*, const char*),
-        char* (*inline_order_by_subquery_aliases)(const char*),
+        char* (*inline_order_by_subquery_aliases)(const char*, const char* const*, size_t),
         void (*free_string)(char*),
         char* (*expand_aggregate_call)(const char*, const char*, const YardstickAtModifier*, size_t, const char*, const char*, const char*, const char* const*, size_t),
         YardstickCurrentReferenceList* (*find_current_references)(const char*),
@@ -106,13 +108,15 @@ extern "C" {
         int32_t (*expressions_equal)(const char*, const char*),
         YardstickQueryScopeList* (*find_query_scopes)(const char*),
         void (*free_query_scopes)(YardstickQueryScopeList*),
-        char* (*rewrite_visible_filter)(const char*, const char*, const char* const*, const char* const*, size_t, char**),
+        char* (*rewrite_visible_filter)(const char*, const char*, const char* const*, const char* const*, size_t,
+                                        const char* const*, size_t, char**),
         char* (*decorate_measure)(const char*, const char*, const char* const*, const char* const*, size_t,
                                   const char* const*, size_t, const char* const*, size_t, char**),
         char* (*window_marker)(const char*, const char*, char**),
         char* (*rewrite_measure_windows)(const char*, const YardstickWindowSource*, size_t,
                                          const YardstickWindowCall*, size_t, const char* const*, size_t,
-                                         const char* const*, size_t, char**)
+                                         const char* const*, size_t, char**),
+        char* (*resolve_measure_reference)(const char*, const char*, const char* const*, size_t, char**)
     );
 }
 
@@ -933,6 +937,7 @@ static bool StatementTextReadsFromView(const std::string &sql,
             }
         }
 
+        if (i > 0 && IsIdentifierChar(sql[i - 1])) continue;
         size_t pos = i;
         bool from_keyword = ConsumeKeyword(sql, pos, "FROM");
         if (from_keyword && IsExtractFromKeyword(sql, i)) {
@@ -1451,6 +1456,31 @@ static bool TryWarningWrappedNonSelectSql(const string &expanded_sql,
     return false;
 }
 
+#if YARDSTICK_GRAMMAR_EXTENSION
+static string BindExpandedBatchSelectAliases(const string &sql) {
+    Parser parser(YardstickParserOptions());
+    parser.ParseQuery(sql);
+    if (parser.statements.size() != 1) return sql;
+    auto &statement = *parser.statements[0];
+    unique_ptr<SelectStatement> *select = nullptr;
+    if (statement.type == StatementType::CREATE_STATEMENT) {
+        auto &info = *statement.Cast<CreateStatement>().info;
+        if (info.type == CatalogType::TABLE_ENTRY) {
+            select = &info.Cast<CreateTableInfo>().query;
+        }
+    } else if (statement.type == StatementType::INSERT_STATEMENT) {
+        select = &statement.Cast<InsertStatement>().node->select_statement;
+    }
+    if (!select || !*select) return sql;
+    auto query = (*select)->ToString();
+    if (!yardstick_requires_select_alias_binding(query.c_str())) return sql;
+    Parser scoped(YardstickParserOptions());
+    scoped.ParseQuery("SELECT * FROM yardstick_scoped('" + EscapeSqlStringLiteral(query) + "')");
+    *select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(scoped.statements[0]));
+    return statement.ToString();
+}
+#endif
+
 static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
         const std::string &query,
         std::vector<MeasureViewSnapshot> &permanent_snapshots) {
@@ -1677,6 +1707,14 @@ static MeasureRewriteResult RewriteMeasureViewsStatementByStatement(
             }
             string expanded_sql(result.expanded_sql);
             string warnings = AggregateWarnings(result);
+#if YARDSTICK_GRAMMAR_EXTENSION
+            if (!pending_temporary_views.empty()) {
+                // Semantic lowering finishes before the temporary metadata is
+                // restored. Only alias binding waits for the caller's catalog,
+                // after the preceding CREATE TEMP VIEW has executed.
+                expanded_sql = BindExpandedBatchSelectAliases(expanded_sql);
+            }
+#endif
             if (ParsesAsSingleSelect(expanded_sql)) {
                 if (reads_pending_temporary_view) {
                     rewrite_result.error = "TEMPORARY AS MEASURE views cannot be returned directly from a statement batch";
@@ -1844,8 +1882,11 @@ static vector<unique_ptr<SQLStatement>> DeferMeasureColumnListBatch(const string
         return {};
     }
     bool requires_binding = deferred_temporary_contexts.load() != 0;
+    bool requires_structural_binding = false;
+    vector<std::pair<string, idx_t>> batch_temporary_declarations;
     auto statements = SplitSqlStatements(query);
-    for (auto &sql : statements) {
+    for (idx_t statement_index = 0; statement_index < statements.size(); statement_index++) {
+        auto &sql = statements[statement_index];
         string semantic_stripped;
         if (StartsWithSemantic(sql, semantic_stripped)) {
             sql = std::move(semantic_stripped);
@@ -1853,10 +1894,17 @@ static vector<unique_ptr<SQLStatement>> DeferMeasureColumnListBatch(const string
         auto inspect_calls = [&](const string &scope_sql) {
             bool inspect_nested_scopes = false;
             if (auto *calls = FindNativeYardstickAggregates(scope_sql.c_str())) {
+                if (calls->count) {
+                    // SELECT/GROUP BY alias precedence depends on the FROM
+                    // schema. Keep the original calls until bind-time probing.
+                    requires_binding |= yardstick_requires_select_alias_binding(scope_sql.c_str());
+                    inspect_nested_scopes = true;
+                }
                 for (size_t index = 0; index < calls->count; index++) {
                     // Decorations need the originating catalog for aggregate
                     // classification and star expansion before adding lineage.
                     requires_binding |= calls->calls[index].has_decorations;
+                    requires_structural_binding |= calls->calls[index].has_decorations;
                     inspect_nested_scopes |= calls->calls[index].modifier_count != 0;
                 }
                 yardstick_free_aggregate_list(calls);
@@ -1880,11 +1928,18 @@ static vector<unique_ptr<SQLStatement>> DeferMeasureColumnListBatch(const string
             continue;
         }
         if (auto *native = FindNativeYardstickMeasures(sql.c_str())) {
+            if (native->is_measure_view && !native->requires_binding && native->view_name &&
+                IsTemporaryCreateViewStatement(sql)) {
+                batch_temporary_declarations.emplace_back(StringUtil::Lower(native->view_name), statement_index);
+            }
             requires_binding |= native->requires_binding;
+            requires_structural_binding |= native->requires_binding;
             yardstick_free_create_view_info(native);
         }
     }
-    if (!requires_binding) {
+    // Simple TEMP declarations retain the statement-batch lifecycle, including
+    // unused-view validation and restoring shadowed metadata after lowering.
+    if (!requires_binding || (!batch_temporary_declarations.empty() && !requires_structural_binding)) {
         return {};
     }
     vector<unique_ptr<SQLStatement>> deferred;
@@ -2319,6 +2374,7 @@ static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binde
             state->temporary_views = *state->pending_temporary;
             state->pending_temporary.reset();
         }
+        state->RefreshTemporaryRouting();
         throw;
     }
 }
@@ -2343,6 +2399,10 @@ static unique_ptr<TableRef> DeferredMeasureSelectBindReplace(ClientContext &cont
             throw BinderException(error);
         }
         HandleAggregateWarnings(context, warnings);
+    }
+    if (auto *rewritten = yardstick_inline_order_by_subquery_aliases(sql.c_str())) {
+        sql = rewritten;
+        yardstick_free_string(rewritten);
     }
     Parser parser(*CurrentNativeYardstickParserOptions());
     if (!ParseNativeYardstickQuery(sql, parser)) {
@@ -2397,6 +2457,12 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
         return {};
     }
     case StatementType::SELECT_STATEMENT: {
+#if YARDSTICK_GRAMMAR_EXTENSION
+        auto *operator_info = dynamic_cast<YardstickOperatorInfo *>(info);
+        NativeYardstickBindScope bind_scope(context);
+        NativeYardstickParseScope parse_scope(operator_info ? operator_info->parser_info.get() : nullptr,
+                                              YardstickContextParserOptions(context));
+#endif
         auto sql_to_check = context.GetCurrentQuery();
 
         if (yardstick_has_aggregate(sql_to_check.c_str())) {
@@ -2469,7 +2535,7 @@ static void LoadInternal(ExtensionLoader &loader) {
     yardstick_init_parser_ffi(
         yardstick_find_aggregates,
         yardstick_free_aggregate_list,
-        yardstick_parse_select,
+        yardstick_parse_select_with_ctes,
         yardstick_free_select_info,
         yardstick_parse_expression,
         yardstick_free_expression_info,
@@ -2478,7 +2544,7 @@ static void LoadInternal(ExtensionLoader &loader) {
         yardstick_replace_range,
         yardstick_apply_replacements,
         yardstick_qualify_expression,
-        yardstick_inline_order_by_subquery_aliases,
+        yardstick_inline_order_by_subquery_aliases_with_ctes,
         yardstick_free_string,
         yardstick_expand_aggregate_call,
         yardstick_find_current_references,
@@ -2490,7 +2556,8 @@ static void LoadInternal(ExtensionLoader &loader) {
         yardstick_rewrite_visible_filter,
         yardstick_decorate_measure,
         yardstick_window_marker,
-        yardstick_rewrite_measure_windows
+        yardstick_rewrite_measure_windows,
+        yardstick_resolve_measure_reference
     );
 
     auto &db = loader.GetDatabaseInstance();
@@ -2513,9 +2580,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
     // Register operator extension
     #if __has_include("duckdb/main/extension_callback_manager.hpp")
-    OperatorExtension::Register(config, make_shared_ptr<YardstickOperatorExtension>());
+    OperatorExtension::Register(config, make_shared_ptr<YardstickOperatorExtension>(parser.parser_info));
     #else
-    config.operator_extensions.push_back(make_uniq<YardstickOperatorExtension>());
+    config.operator_extensions.push_back(make_uniq<YardstickOperatorExtension>(parser.parser_info));
     #endif
 
     // Register table function for AGGREGATE() expansion

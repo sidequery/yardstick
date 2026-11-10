@@ -1,0 +1,176 @@
+# name: test/sql/review_modifier_regressions.test
+# description: Modifier composition follows Measures in SQL §3.5, preserving separable visible predicates.
+# group: [yardstick]
+
+require yardstick
+
+statement ok
+CREATE TABLE modifier_review_sales(y INTEGER, r VARCHAR, a INTEGER);
+
+statement ok
+INSERT INTO modifier_review_sales VALUES (2023,'N',10),(2023,'S',20),(2024,'N',40),(2024,'S',80);
+
+statement ok
+CREATE VIEW modifier_review_v AS
+SELECT y,r,SUM(a) AS MEASURE review_m,COUNT(*) AS MEASURE review_n FROM modifier_review_sales;
+
+statement ok
+SET enable_logging=true;
+
+statement ok
+SET warnings_as_errors=true;
+
+# ALL followed by VISIBLE restores filters and must not emit a loss warning.
+query I
+SELECT AGGREGATE(review_m) AT (ALL VISIBLE) FROM modifier_review_v WHERE r='N';
+----
+50
+
+statement error
+SELECT * FROM yardstick($$SELECT AGGREGATE(review_m) AT (VISIBLE ALL)
+FROM modifier_review_v WHERE r='N'$$);
+----
+does not preserve outer WHERE
+
+statement ok
+SET warnings_as_errors=false;
+
+# Combined clauses run in written order; chained clauses run outside inward.
+query IIII
+SELECT AGGREGATE(review_m) AT (WHERE r='N' VISIBLE),
+       AGGREGATE(review_m) AT (VISIBLE WHERE r='N'),
+       AGGREGATE(review_m) AT (WHERE r='N') AT (VISIBLE),
+       AGGREGATE(review_m) AT (VISIBLE) AT (WHERE r='N')
+FROM modifier_review_v WHERE y=2023;
+----
+10	50	50	10
+
+# WHERE resets the grouping context as well as explicit predicates.
+query II rowsort
+SELECT y,AGGREGATE(review_m) AT (WHERE r='N') FROM modifier_review_v GROUP BY y;
+----
+2023	50
+2024	50
+
+# ALL is a reset at its position, and SET replaces the existing target terms.
+query IIIIII
+SELECT AGGREGATE(review_m) AT (WHERE r='N' ALL),
+       AGGREGATE(review_m) AT (ALL WHERE r='N'),
+       AGGREGATE(review_m) AT (ALL SET y=2023),
+       AGGREGATE(review_m) AT (SET y=2023 ALL),
+       AGGREGATE(review_m) AT (SET y=2023 SET y=2024),
+       AGGREGATE(review_m) AT (WHERE r='N' SET y=2024)
+FROM modifier_review_v;
+----
+150	50	30	150	120	40
+
+query IIII
+SELECT AGGREGATE(review_m) AT (SET y=2024 WHERE r='N'),
+       AGGREGATE(review_m) AT (VISIBLE ALL y),
+       AGGREGATE(review_m) AT (VISIBLE ALL r),
+       AGGREGATE(review_m) AT (VISIBLE ALL)
+FROM modifier_review_v WHERE y=2023 AND r='N';
+----
+50	50	30	150
+
+query II
+SELECT AGGREGATE(review_m) AT (ALL VISIBLE),
+       AGGREGATE(review_m) AT (VISIBLE SET y=2024)
+FROM modifier_review_v WHERE y=2023;
+----
+30	120
+
+# VISIBLE adds its predicates, so it can constrain a dimension after SET.
+query I
+SELECT AGGREGATE(review_m) AT (SET y=2024 VISIBLE)
+FROM modifier_review_v WHERE y=2023;
+----
+NULL
+
+# CURRENT observes preceding transformations, not only the original query.
+query IIII
+SELECT AGGREGATE(review_m) AT (SET y=2024 SET y=CURRENT y-1),
+       AGGREGATE(review_m) AT (WHERE y=2024 SET y=CURRENT y-1),
+       AGGREGATE(review_m) AT (SET y=CURRENT y-1) AT (SET y=2024),
+       AGGREGATE(review_m) AT (SET y=2024 WHERE y=CURRENT y-1)
+FROM modifier_review_v;
+----
+30	30	30	30
+
+query I
+SELECT AGGREGATE(review_m) AT (SET y=2024 ALL SET y=COALESCE(CURRENT y,2023))
+FROM modifier_review_v;
+----
+30
+
+# A join does not restrict a measure by itself, so replacing year leaves every
+# region of the prior year visible, whatever the join matches.
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v JOIN (VALUES ('N')) regions(r) USING(r) WHERE y=2024;
+----
+2024	30
+
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v JOIN (VALUES (2024,'N')) allowed(y,r) USING(y,r) WHERE y=2024;
+----
+2024	30
+
+query II
+SELECT v.y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v v JOIN (VALUES (2024,'N')) allowed(y,r)
+ON v.y=allowed.y AND v.r=allowed.r WHERE v.y=2024;
+----
+2024	30
+
+# A filter on a joined column is part of VISIBLE and survives replacing year.
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v JOIN (VALUES ('N',1),('S',0)) regions(r,keep) USING(r) WHERE y=2024 AND keep=1;
+----
+2024	10
+
+# VISIBLE covers WHERE, not the join: duplicate matches do not multiply the
+# measure's rows and unmatched rows are not removed.
+query I
+SELECT AGGREGATE(review_m) AT (VISIBLE)
+FROM modifier_review_v JOIN (VALUES ('N'),('N')) regions(r) USING(r);
+----
+150
+
+# These predicates are separable after De Morgan and distributive absorption.
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v WHERE NOT (y<>2024 OR r<>'N');
+----
+2024	10
+
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v WHERE (y=2024 AND r='N') OR (y=2025 AND r='N');
+----
+2024	10
+
+# Normalization retains SQL NULL semantics.
+statement ok
+INSERT INTO modifier_review_sales VALUES (2023,NULL,2),(2024,NULL,5);
+
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v WHERE NOT (y<>2024 OR r<>'N');
+----
+2024	10
+
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v WHERE NOT (y<>2024 OR r IS DISTINCT FROM NULL);
+----
+2024	2
+
+# An inseparable disjunction still requires an explicit context choice.
+statement error
+SELECT * FROM yardstick($$SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v WHERE y=2024 OR r='N'$$);
+----
+mixed VISIBLE predicate

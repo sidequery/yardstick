@@ -155,6 +155,25 @@ pub extern "C" fn yardstick_extract_drop_view_name(sql: *const c_char) -> *mut c
         .unwrap_or(ptr::null_mut())
 }
 
+/// Identify measure placeholders while deriving a pivot's implicit dimensions.
+#[no_mangle]
+pub extern "C" fn yardstick_is_measure_column(
+    view_name: *const c_char,
+    column_name: *const c_char,
+) -> bool {
+    if view_name.is_null() || column_name.is_null() {
+        return false;
+    }
+    let view_name = unsafe { CStr::from_ptr(view_name).to_str() };
+    let column_name = unsafe { CStr::from_ptr(column_name).to_str() };
+    let (Ok(view_name), Ok(column_name)) = (view_name, column_name) else {
+        return false;
+    };
+    get_measure_view(view_name).is_some_and(|view| {
+        view.measures.iter().any(|measure| measure.column_name.eq_ignore_ascii_case(column_name))
+    })
+}
+
 /// Snapshot a measure view catalog entry before a speculative rewrite mutates it.
 #[no_mangle]
 pub extern "C" fn yardstick_snapshot_measure_view(view_name: *const c_char) -> *mut c_void {

@@ -365,7 +365,8 @@ static FN_CURRENT_WHERE_IS_SINGLE_VALUED: AtomicPtr<()> = AtomicPtr::new(ptr::nu
 type FnExpressionsEqual = unsafe extern "C" fn(*const c_char, *const c_char) -> i32;
 static FN_EXPRESSIONS_EQUAL: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 type FnRewriteVisibleFilter = unsafe extern "C" fn(
-    *const c_char, *const c_char, *const *const c_char, *const *const c_char, usize, *mut *mut c_char,
+    *const c_char, *const c_char, *const *const c_char, *const *const c_char, usize,
+    *const *const c_char, usize, *mut *mut c_char,
 ) -> *mut c_char;
 static FN_REWRITE_VISIBLE_FILTER: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
@@ -375,6 +376,7 @@ pub fn rewrite_visible_filter(
     expression: &str,
     local_alias: Option<&str>,
     dimension_expressions: &std::collections::HashMap<String, String>,
+    excluded_dimensions: &[String],
 ) -> Option<Result<String, String>> {
     let function = FN_REWRITE_VISIBLE_FILTER.load(Ordering::SeqCst);
     if function.is_null() || FN_FREE_STRING.load(Ordering::SeqCst).is_null() {
@@ -387,10 +389,14 @@ pub fn rewrite_visible_filter(
         .collect::<Option<Vec<_>>>()?;
     let names: Vec<_> = entries.iter().map(|(name, _)| name.as_ptr()).collect();
     let expressions: Vec<_> = entries.iter().map(|(_, expression)| expression.as_ptr()).collect();
+    let excluded = excluded_dimensions.iter().map(|dimension| CString::new(dimension.as_str()).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let excluded_pointers: Vec<_> = excluded.iter().map(|dimension| dimension.as_ptr()).collect();
     unsafe {
         let function: FnRewriteVisibleFilter = std::mem::transmute(function);
         let mut error = ptr::null_mut();
-        let result = function(expression.as_ptr(), local_alias.as_ptr(), names.as_ptr(), expressions.as_ptr(), names.len(), &mut error);
+        let result = function(expression.as_ptr(), local_alias.as_ptr(), names.as_ptr(), expressions.as_ptr(), names.len(),
+            excluded_pointers.as_ptr(), excluded_pointers.len(), &mut error);
         if !error.is_null() {
             let text = CStr::from_ptr(error).to_string_lossy().into_owned();
             yardstick_free_string(error);
@@ -484,7 +490,9 @@ pub fn find_current_references(expression: &str) -> Option<Result<Vec<CurrentRef
 
 type FnFindAggregates = unsafe extern "C" fn(*const c_char) -> *mut YardstickAggregateCallList;
 type FnFreeAggregateList = unsafe extern "C" fn(*mut YardstickAggregateCallList);
-type FnParseSelect = unsafe extern "C" fn(*const c_char) -> *mut YardstickSelectInfo;
+type FnParseSelect = unsafe extern "C" fn(
+    *const c_char, *const *const c_char, usize,
+) -> *mut YardstickSelectInfo;
 type FnFreeSelectInfo = unsafe extern "C" fn(*mut YardstickSelectInfo);
 type FnParseExpression = unsafe extern "C" fn(*const c_char) -> *mut YardstickExpressionInfo;
 type FnFreeExpressionInfo = unsafe extern "C" fn(*mut YardstickExpressionInfo);
@@ -493,7 +501,9 @@ type FnFreeCreateViewInfo = unsafe extern "C" fn(*mut YardstickCreateViewInfo);
 type FnReplaceRange = unsafe extern "C" fn(*const c_char, u32, u32, *const c_char) -> *mut c_char;
 type FnApplyReplacements = unsafe extern "C" fn(*const c_char, *const YardstickReplacement, usize) -> *mut c_char;
 type FnQualifyExpression = unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> *mut c_char;
-type FnInlineOrderBySubqueryAliases = unsafe extern "C" fn(*const c_char) -> *mut c_char;
+type FnInlineOrderBySubqueryAliases = unsafe extern "C" fn(
+    *const c_char, *const *const c_char, usize,
+) -> *mut c_char;
 type FnFreeString = unsafe extern "C" fn(*mut c_char);
 type FnDecorateMeasure = unsafe extern "C" fn(
     *const c_char, *const c_char, *const *const c_char, *const *const c_char, usize,
@@ -504,9 +514,13 @@ type FnRewriteMeasureWindows = unsafe extern "C" fn(
     *const c_char, *const YardstickWindowSource, usize, *const YardstickWindowCall, usize,
     *const *const c_char, usize, *const *const c_char, usize, *mut *mut c_char,
 ) -> *mut c_char;
+type FnResolveMeasureReference = unsafe extern "C" fn(
+    *const c_char, *const c_char, *const *const c_char, usize, *mut *mut c_char,
+) -> *mut c_char;
 static FN_DECORATE_MEASURE: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_WINDOW_MARKER: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FN_REWRITE_MEASURE_WINDOWS: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static FN_RESOLVE_MEASURE_REFERENCE: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 type FnExpandAggregateCall = unsafe extern "C" fn(
     *const c_char, *const c_char, *const YardstickAtModifier, usize,
     *const c_char, *const c_char, *const c_char, *const *const c_char, usize
@@ -555,6 +569,7 @@ pub extern "C" fn yardstick_init_parser_ffi(
     decorate_measure: FnDecorateMeasure,
     window_marker: FnWindowMarker,
     rewrite_measure_windows: FnRewriteMeasureWindows,
+    resolve_measure_reference: FnResolveMeasureReference,
 ) {
     FN_FIND_AGGREGATES.store(find_aggregates as *mut (), Ordering::SeqCst);
     FN_FREE_AGGREGATE_LIST.store(free_aggregate_list as *mut (), Ordering::SeqCst);
@@ -580,6 +595,47 @@ pub extern "C" fn yardstick_init_parser_ffi(
     FN_DECORATE_MEASURE.store(decorate_measure as *mut (), Ordering::SeqCst);
     FN_WINDOW_MARKER.store(window_marker as *mut (), Ordering::SeqCst);
     FN_REWRITE_MEASURE_WINDOWS.store(rewrite_measure_windows as *mut (), Ordering::SeqCst);
+    FN_RESOLVE_MEASURE_REFERENCE.store(resolve_measure_reference as *mut (), Ordering::SeqCst);
+}
+
+/// A measure's defining view column, reached through CTEs or derived tables.
+#[derive(Debug, Clone)]
+pub struct MeasureOrigin {
+    pub reference: String,
+    /// Set when a relation on the path removed rows. A lowering that recomputes
+    /// from the defining view cannot honor that removal and must report this.
+    pub row_loss: Option<String>,
+}
+
+pub fn resolve_measure_reference(relation: &str, column: &str) -> Option<Result<MeasureOrigin, String>> {
+    let function = FN_RESOLVE_MEASURE_REFERENCE.load(Ordering::SeqCst);
+    if function.is_null() {
+        return None;
+    }
+    let relation = CString::new(relation).ok()?;
+    let column = CString::new(column).ok()?;
+    let bindings = QUERY_BINDING_CTES.with(|ctes| {
+        ctes.borrow().iter().map(|query| CString::new(query.as_str()).ok())
+            .collect::<Option<Vec<_>>>()
+    })?;
+    let queries: Vec<_> = bindings.iter().map(|query| query.as_ptr()).collect();
+    unsafe {
+        let function: FnResolveMeasureReference = std::mem::transmute(function);
+        let mut error = ptr::null_mut();
+        let result = function(relation.as_ptr(), column.as_ptr(), queries.as_ptr(), queries.len(), &mut error);
+        if result.is_null() && error.is_null() {
+            return None;
+        }
+        if !result.is_null() && !error.is_null() {
+            let reference = CStr::from_ptr(result).to_string_lossy().into_owned();
+            let row_loss = CStr::from_ptr(error).to_string_lossy().into_owned();
+            yardstick_free_string(result);
+            yardstick_free_string(error);
+            return Some(Ok(MeasureOrigin { reference, row_loss: Some(row_loss) }));
+        }
+        Some(owned_rewrite_result(result, error)
+            .map(|reference| MeasureOrigin { reference, row_loss: None }))
+    }
 }
 
 unsafe fn owned_rewrite_result(result: *mut c_char, error: *mut c_char) -> Result<String, String> {
@@ -830,7 +886,13 @@ unsafe fn yardstick_free_aggregate_list(list: *mut YardstickAggregateCallList) {
 }
 
 unsafe fn yardstick_parse_select(sql: *const c_char) -> *mut YardstickSelectInfo {
-    call_ffi!(FN_PARSE_SELECT, FnParseSelect, sql)
+    let bindings = QUERY_BINDING_CTES.with(|ctes| {
+        ctes.borrow().iter().map(|query| CString::new(query.as_str()).ok())
+            .collect::<Option<Vec<_>>>()
+    });
+    let Some(bindings) = bindings else { return ptr::null_mut(); };
+    let queries: Vec<_> = bindings.iter().map(|query| query.as_ptr()).collect();
+    call_ffi!(FN_PARSE_SELECT, FnParseSelect, sql, queries.as_ptr(), queries.len())
 }
 
 unsafe fn yardstick_free_select_info(info: *mut YardstickSelectInfo) {
@@ -866,7 +928,14 @@ unsafe fn yardstick_free_string(ptr: *mut c_char) {
 }
 
 unsafe fn yardstick_inline_order_by_subquery_aliases(sql: *const c_char) -> *mut c_char {
-    call_ffi!(FN_INLINE_ORDER_BY_SUBQUERY_ALIASES, FnInlineOrderBySubqueryAliases, sql)
+    let bindings = QUERY_BINDING_CTES.with(|ctes| {
+        ctes.borrow().iter().map(|query| CString::new(query.as_str()).ok())
+            .collect::<Option<Vec<_>>>()
+    });
+    let Some(bindings) = bindings else { return ptr::null_mut(); };
+    let queries: Vec<_> = bindings.iter().map(|query| query.as_ptr()).collect();
+    call_ffi!(FN_INLINE_ORDER_BY_SUBQUERY_ALIASES, FnInlineOrderBySubqueryAliases,
+        sql, queries.as_ptr(), queries.len())
 }
 
 unsafe fn yardstick_expand_aggregate_call(

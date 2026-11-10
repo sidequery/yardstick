@@ -16,6 +16,9 @@
 extern "C" {
 #endif
 
+/* Consult the current measure namespace without treating placeholder columns as dimensions. */
+bool yardstick_is_measure_column(const char* view_name, const char* column_name);
+
 /* =============================================================================
  * AT Modifier Types (matches ContextModifier enum in Rust)
  * ============================================================================= */
@@ -88,6 +91,12 @@ char* yardstick_decorate_measure(
     const char* const* qualifiers, size_t qualifier_count,
     const char* const* binding_ctes, size_t binding_cte_count, char** error);
 char* yardstick_window_marker(const char* call_sql, const char* marker_name, char** error);
+/* Trace a measure column through a CTE to the view that defines it. Returns
+ * "view.column", or NULL when the relation is not a CTE. A result together with
+ * an error means a relation on the path removed rows. */
+char* yardstick_resolve_measure_reference(const char* relation, const char* column,
+                                         const char* const* binding_ctes, size_t binding_cte_count,
+                                         char** error);
 char* yardstick_rewrite_measure_windows(
     const char* sql, const YardstickWindowSource* sources, size_t source_count,
     const YardstickWindowCall* calls, size_t call_count,
@@ -119,6 +128,7 @@ int32_t yardstick_expressions_equal(const char* left, const char* right);
 char* yardstick_rewrite_visible_filter(const char* expression, const char* local_alias,
                                      const char* const* dimension_names,
                                      const char* const* dimension_expressions, size_t dimension_count,
+                                     const char* const* excluded_dimensions, size_t excluded_count,
                                      char** error);
 
 /* Complete native SELECT scopes, including nested queries and set operands. */
@@ -287,6 +297,8 @@ void yardstick_free_aggregate_list(YardstickAggregateCallList* list);
  * @return Allocated select info. Caller must free with yardstick_free_select_info().
  */
 YardstickSelectInfo* yardstick_parse_select(const char* sql);
+YardstickSelectInfo* yardstick_parse_select_with_ctes(const char* sql,
+    const char* const* binding_ctes, size_t binding_cte_count);
 
 /**
  * Inline SELECT aliases inside complex ORDER BY expressions when they reference
@@ -294,6 +306,9 @@ YardstickSelectInfo* yardstick_parse_select(const char* sql);
  * rewrite is needed or parsing fails.
  */
 char* yardstick_inline_order_by_subquery_aliases(const char* sql);
+bool yardstick_requires_select_alias_binding(const char* sql);
+char* yardstick_inline_order_by_subquery_aliases_with_ctes(const char* sql,
+    const char* const* binding_ctes, size_t binding_cte_count);
 
 /**
  * Free a select info structure.

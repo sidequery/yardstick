@@ -480,9 +480,16 @@ FROM measure_window_grouped ORDER BY yr;
 2024	100
 2025	400
 
-# ALL may expand a frame; VISIBLE retains the enclosing query's visible set.
+# Modifiers apply in written order: ALL removes the visible year restriction.
 query II
 SELECT yr, AGGREGATE(revenue) OVER (ORDER BY yr ROWS CURRENT ROW) AT (VISIBLE ALL yr)
+FROM measure_window_grouped WHERE yr = 2022 ORDER BY yr;
+----
+2022	140
+
+# Chaining applies the outer ALL first, then restores the visible restriction.
+query II
+SELECT yr, AGGREGATE(revenue) OVER (ORDER BY yr ROWS CURRENT ROW) AT (VISIBLE) AT (ALL yr)
 FROM measure_window_grouped WHERE yr = 2022 ORDER BY yr;
 ----
 2022	40

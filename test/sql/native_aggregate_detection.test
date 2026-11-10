@@ -43,12 +43,13 @@ FROM aggregate_detection_v;
 ----
 東京	30.0
 
+# The outer ALL applies first, then the inner WHERE selects 2023.
 query RR
 SELECT (AGGREGATE(revenue) AT (WHERE year = 2023)) AT (ALL),
        2 * ((AGGREGATE(revenue))) AT (WHERE year = 2024)
 FROM aggregate_detection_v;
 ----
-70.0	80.0
+30.0	80.0
 
 query R
 SELECT aggregate([1, ((AGGREGATE(revenue))) AT (ALL)], 'sum') FROM aggregate_detection_v;

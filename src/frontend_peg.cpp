@@ -1,20 +1,27 @@
 #include "frontend_peg.hpp"
 #include "yardstick_parser_compat.hpp"
+#include "measure_windows.hpp"
 
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "native_statement_traversal.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/grammar_extension.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/parsed_data/create_type_info.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/peg/compiled_grammar.hpp"
@@ -22,12 +29,16 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/table_binding.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/pivotref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <unordered_set>
 
 namespace duckdb {
 namespace {
@@ -464,6 +475,18 @@ shared_ptr<CompiledGrammar> SelectGrammar(ParserExtensionInfo *info, const Parse
     // Only replace the database's default grammar. A different active grammar
     // or dialect that lacks Yardstick rules must retain its own parser.
     if (options.compiled_grammar && options.compiled_grammar != yardstick.base_grammar) {
+        if (options.context) {
+            auto &config = ClientConfig::GetConfig(*options.context);
+            // DuckDB's CLI enables its built-in shell grammar on every
+            // connection. Preserve its bare-expression/table statements while
+            // enabling Yardstick's adapter after LOAD, just as for base SQL.
+            if (!config.current_dialect && !config.connected_grammar &&
+                config.active_grammar_extensions.size() == 1 &&
+                StringUtil::CIEquals(config.active_grammar_extensions[0], "shell") &&
+                options.compiled_grammar == config.cached_grammar) {
+                return CompiledGrammar::Create(*options.context, {"shell", "yardstick"});
+            }
+        }
         return nullptr;
     }
     return yardstick.grammar;
@@ -963,7 +986,123 @@ bool CollectNativeQueryScopes(ParseResult &root, PEGTransformer &transformer,
     }
     return true;
 }
+
+struct PivotMeasureOrigin {
+    Identifier view;
+    Identifier column;
+    bool inherited = false;
+    // A CTE or derived table on the path removed rows before its consumer.
+    bool removes_rows = false;
+};
+
+bool PivotSourceColumnIsMeasure(const TableRef &source, const Identifier &column,
+                                const vector<QueryNode *> &scopes, idx_t scope_limit,
+                                PivotMeasureOrigin *origin = nullptr) {
+    auto from_projection = [&](QueryNode &query, const vector<Identifier> &column_aliases,
+                               idx_t visible_scope_limit) {
+        if (query.type != QueryNodeType::SELECT_NODE) return false;
+        auto copy = query.Copy();
+        auto &select = copy->Cast<SelectNode>();
+        if (!select.from_table) return false;
+        bool removes_rows = select.where_clause || select.having || select.qualify || select.sample ||
+                            !select.groups.group_expressions.empty() || !select.groups.grouping_sets.empty();
+        for (auto &modifier : select.modifiers) {
+            removes_rows |= modifier->type != ResultModifierType::ORDER_MODIFIER;
+        }
+        vector<QueryNode *> visible(scopes.begin(), scopes.begin() + visible_scope_limit);
+        visible.push_back(&query);
+        if (column_aliases.empty() && select.select_list.size() == 1 &&
+            select.select_list[0]->GetExpressionClass() == ExpressionClass::STAR) {
+            auto &star = select.select_list[0]->Cast<StarExpression>();
+            if (!star.IsColumns() && !star.Expression() && star.ExcludeList().empty() &&
+                star.ReplaceList().empty() && star.RenameList().empty()) {
+                bool found_measure = PivotSourceColumnIsMeasure(*select.from_table, column,
+                                                                visible, visible.size(), origin);
+                if (found_measure && origin) {
+                    origin->inherited = true;
+                    origin->removes_rows |= removes_rows;
+                }
+                return found_measure;
+            }
+        }
+        ExpandNativeMeasureProjectionStars(select, visible);
+        for (idx_t i = 0; i < select.select_list.size(); i++) {
+            auto &projection = select.select_list[i];
+            auto name = i < column_aliases.size() ? column_aliases[i] : projection->GetName();
+            if (name != column || projection->GetExpressionClass() != ExpressionClass::COLUMN_REF) continue;
+            auto &reference = projection->Cast<ColumnRefExpression>();
+            bool found_measure = PivotSourceColumnIsMeasure(*select.from_table, reference.GetColumnName(),
+                                                            visible, visible.size(), origin);
+            if (found_measure && origin) {
+                origin->inherited = true;
+                origin->removes_rows |= removes_rows;
+            }
+            return found_measure;
+        }
+        return false;
+    };
+    if (source.type == TableReferenceType::SUBQUERY) {
+        return from_projection(*source.Cast<SubqueryRef>().subquery->node, source.column_name_alias, scope_limit);
+    }
+    if (source.type != TableReferenceType::BASE_TABLE) return false;
+    auto &base = source.Cast<BaseTableRef>();
+    if (base.GetQualifiedName().Schema().empty()) {
+        for (idx_t i = scope_limit; i > 0; i--) {
+            auto found = scopes[i - 1]->cte_map.map.find(base.Table());
+            if (found == scopes[i - 1]->cte_map.map.end()) continue;
+            return from_projection(*found->second->query_node, found->second->aliases, i - 1);
+        }
+    }
+    auto name = base.Table().GetIdentifierName();
+    auto column_name = column.GetIdentifierName();
+    bool found_measure = yardstick_is_measure_column(name.c_str(), column_name.c_str());
+    if (found_measure && origin) {
+        origin->view = base.Table();
+        origin->column = column;
+    }
+    return found_measure;
+}
 } // namespace
+
+extern "C" char *yardstick_resolve_measure_reference(const char *relation, const char *column,
+    const char *const *binding_ctes, size_t binding_cte_count, char **error) {
+    if (error) *error = nullptr;
+    auto *options = CurrentNativeYardstickParserOptions();
+    if (!options || !relation || !column) return nullptr;
+    try {
+        vector<string> declarations;
+        for (size_t i = 0; i < binding_cte_count; i++) declarations.emplace_back(binding_ctes[i]);
+        NativeYardstickCteBindScope binding_scope(declarations, *options);
+        vector<QueryNode *> scopes;
+        if (auto bindings = CurrentNativeYardstickCteBindings()) {
+            for (auto &scope : *bindings) scopes.push_back(scope.get());
+        }
+        auto source = make_uniq<BaseTableRef>();
+        source->SetTable(Identifier(relation));
+        PivotMeasureOrigin origin;
+        if (!PivotSourceColumnIsMeasure(*source, Identifier(column), scopes, scopes.size(), &origin)) {
+            for (auto *scope : scopes) {
+                if (scope->cte_map.map.find(Identifier(relation)) != scope->cte_map.map.end()) {
+                    throw BinderException("Measure %s is not exposed by CTE %s", column, relation);
+                }
+            }
+            return nullptr;
+        }
+        auto reference = make_uniq<ColumnRefExpression>(origin.column, origin.view)->ToString();
+        if (origin.removes_rows && error) {
+            // Returned together with the origin: window lowering carries row
+            // lineage and honors the removal, while grouped lowering
+            // recomputes from the defining view and must refuse instead.
+            *error = strdup(StringUtil::Format(
+                "Measure %s is read through %s, which filters, groups, or limits its rows. "
+                "Apply that filter in the querying SELECT's WHERE instead", column, relation).c_str());
+        }
+        return strdup(reference.c_str());
+    } catch (const std::exception &exception) {
+        if (error) *error = strdup(exception.what());
+        return nullptr;
+    }
+}
 
 YardstickQueryScopeList *FindNativeYardstickQueryScopes(const char *sql_p) {
     if (!sql_p || !active_parse_scope || !active_parse_scope->available) {
@@ -1210,7 +1349,7 @@ YardstickAggregateCallList *FindNativeYardstickAggregates(const char *sql_p) {
                         !extend_operand(aggregate.start, aggregate.end, clause.start)) {
                         throw ParserException("Invalid Yardstick AT source range");
                     }
-                    aggregate.modifiers.insert(aggregate.modifiers.end(), clause.modifiers.begin(),
+                    aggregate.modifiers.insert(aggregate.modifiers.begin(), clause.modifiers.begin(),
                                                clause.modifiers.end());
                     aggregate.end = clause.end;
                 }

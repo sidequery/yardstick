@@ -152,6 +152,28 @@ On DuckDB 1.5+, queries containing `AGGREGATE()` are automatically intercepted b
 | `AT (WHERE cond)` | Pre-aggregation filter | `AGGREGATE(revenue) AT (WHERE region = 'US')` |
 | `AT (VISIBLE)` | Use query's WHERE clause | `AGGREGATE(revenue) AT (VISIBLE)` |
 
+Modifiers within one `AT (...)` transform the context in written order.
+Separate `AT` clauses compose from the outside inward: `m AT (A B)` is
+equivalent to `m AT (B) AT (A)`. `WHERE` replaces the context, while `VISIBLE`
+adds the query's filters. A join does not restrict a measure by itself; a
+filter on a joined column applies to the rows it matches.
+
+To retain unrelated query filters while shifting a dimension with `SET`, include
+`VISIBLE` explicitly:
+
+```sql
+SELECT year,
+       AGGREGATE(revenue) AT (VISIBLE SET year = year - 1) AS prior_revenue
+FROM sales_v
+WHERE year = 2024 AND region = 'North';
+-- 2024, 37000.00
+```
+
+`SET` replaces the visible year restriction while retaining the North filter.
+Without `VISIBLE`, an `AT (SET ...)` expression uses the grouping context rather
+than carrying over filters on ungrouped dimensions. Yardstick warns when that
+drops a filter, as it does for `AT (ALL ...)`.
+
 ## Building
 
 On DuckDB builds with grammar-extension support, Yardstick recognizes `AS MEASURE`, `AT (...)`, and `CURRENT dimension` / `CURRENT(dimension)` through native PEG grammar rules. `LOAD yardstick` enables this adapter without setting `active_grammar_extensions`. Native references retain their expression spans and local relation scope, including quoted identifiers and CTE shadowing. `CURRENT` belongs to an AT SET or WHERE expression; ordinary SQL aliases and nested queries keep their own scope. Measure registration and context semantics remain shared with DuckDB 1.5.5.
