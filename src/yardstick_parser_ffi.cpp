@@ -3233,6 +3233,33 @@ extern "C" char* yardstick_rewrite_visible_filter(const char* expression, const 
                 throw ParserException("Invalid joined visibility context");
             }
             auto &select = YsSubquery(expressions[0]->Cast<SubqueryExpression>())->node->Cast<SelectNode>();
+            // A join does not restrict a measure by itself: the measure evaluates
+            // against its defining view's rows and only WHERE removes any. Keep
+            // every source row through the joins, so an unmatched row fails a
+            // predicate on a joined column instead of disappearing with the join.
+            auto source_qualifier = NormalizeAliasName(visible_source);
+            std::function<bool(TableRef &)> preserve_source = [&](TableRef &table) -> bool {
+                if (table.type != TableReferenceType::JOIN) {
+                    TableQualifierSet qualifiers;
+                    CollectTableQualifiers(&table, qualifiers);
+                    return qualifiers.count(source_qualifier) > 0;
+                }
+                auto &join = table.Cast<JoinRef>();
+                bool in_left = preserve_source(*join.left);
+                bool in_right = !in_left && preserve_source(*join.right);
+                if (!in_left && !in_right) return false;
+                if (join.ref_type == JoinRefType::CROSS) {
+                    join.ref_type = JoinRefType::REGULAR;
+                    join.type = JoinType::INNER;
+                    join.condition = YsConstant(Value::BOOLEAN(true));
+                }
+                if (join.type == JoinType::INNER &&
+                    (join.ref_type == JoinRefType::REGULAR || join.ref_type == JoinRefType::NATURAL)) {
+                    join.type = in_left ? JoinType::LEFT : JoinType::RIGHT;
+                }
+                return true;
+            };
+            if (select.from_table) preserve_source(*select.from_table);
             DropContextDimensions(select.where_clause, excluded, visible_source);
             std::function<void(TableRef &)> prune_joins = [&](TableRef &table) {
                 if (table.type != TableReferenceType::JOIN) return;

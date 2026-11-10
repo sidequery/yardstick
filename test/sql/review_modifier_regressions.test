@@ -103,33 +103,41 @@ FROM modifier_review_v;
 ----
 30
 
-# Replacing year retains the independent JOIN restriction on region.
+# A join does not restrict a measure by itself, so replacing year leaves every
+# region of the prior year visible, whatever the join matches.
 query II
 SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
 FROM modifier_review_v JOIN (VALUES ('N')) regions(r) USING(r) WHERE y=2024;
 ----
-2024	10
+2024	30
 
 query II
 SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
 FROM modifier_review_v JOIN (VALUES (2024,'N')) allowed(y,r) USING(y,r) WHERE y=2024;
 ----
-2024	10
+2024	30
 
 query II
 SELECT v.y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
 FROM modifier_review_v v JOIN (VALUES (2024,'N')) allowed(y,r)
 ON v.y=allowed.y AND v.r=allowed.r WHERE v.y=2024;
 ----
+2024	30
+
+# A filter on a joined column is part of VISIBLE and survives replacing year.
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v JOIN (VALUES ('N',1),('S',0)) regions(r,keep) USING(r) WHERE y=2024 AND keep=1;
+----
 2024	10
 
-# VISIBLE includes join restrictions even when no WHERE is present. Duplicate
-# matches select a base row once rather than multiplying the measure's inputs.
+# VISIBLE covers WHERE, not the join: duplicate matches do not multiply the
+# measure's rows and unmatched rows are not removed.
 query I
 SELECT AGGREGATE(review_m) AT (VISIBLE)
 FROM modifier_review_v JOIN (VALUES ('N'),('N')) regions(r) USING(r);
 ----
-50
+150
 
 # These predicates are separable after De Morgan and distributive absorption.
 query II

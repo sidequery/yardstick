@@ -3206,6 +3206,46 @@ fn source_dimension_names(source_view: &str) -> HashSet<String> {
     dims
 }
 
+/// Whole-row correlation for a view defined as `SELECT *, measures`: its row
+/// is the base row followed by one column per measure, in order. The view's own
+/// measure values are appended to the base row, so only the base columns decide.
+const STAR_VIEW_ROW: &str = "struct_insert(_inner, ";
+
+fn star_view_row_correlation(view_name: &str, source_alias: &str) -> Option<String> {
+    let view = get_measure_view(view_name)?;
+    let query = extract_view_query(&view.base_query).unwrap_or_else(|| view.base_query.clone());
+    let select_end = find_top_level_keyword(&query, "SELECT", 0)? + "SELECT".len();
+    let from = find_top_level_keyword(&query, "FROM", select_end)?;
+    let mut items = Vec::new();
+    let mut depth = 0i32;
+    let mut item_start = select_end;
+    for (offset, c) in query[select_end..from].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(query[item_start..select_end + offset].trim());
+                item_start = select_end + offset + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(query[item_start..from].trim());
+    // Any other projection (a second star, EXCLUDE, an extra column) changes
+    // the row's shape, and the comparison would no longer line up.
+    if items.first() != Some(&"*") || items.len() != view.measures.len() + 1 {
+        return None;
+    }
+    let measure_columns = view.measures.iter()
+        .map(|measure| {
+            let column = format!("\"{}\"", measure.column_name.replace('"', "\"\""));
+            format!("{column} := {source_alias}.{column}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{source_alias} IS NOT DISTINCT FROM {STAR_VIEW_ROW}{measure_columns})"))
+}
+
 fn visible_join_filter(
     sql: &str,
     outer_where: Option<&str>,
@@ -3227,14 +3267,16 @@ fn visible_join_filter(
         .filter(|dimension| parse_simple_measure_ref(dimension).is_some())
         .collect::<Vec<_>>();
     dimensions.sort();
-    if dimensions.is_empty() {
-        return None;
-    }
-    let correlations = dimensions.iter().map(|dimension| {
-        let dimension = format!("\"{}\"", dimension.replace('"', "\"\""));
-        let (inner, _) = correlation_exprs_for_dim(&dimension, &resolved.dimension_exprs, None);
-        format!("{source_alias}.{dimension} IS NOT DISTINCT FROM {inner}")
-    }).collect::<Vec<_>>();
+    let correlations = if dimensions.is_empty() {
+        // A `SELECT *, measures` view records no column list to correlate on.
+        vec![star_view_row_correlation(&resolved.source_view, &source_alias)?]
+    } else {
+        dimensions.iter().map(|dimension| {
+            let dimension = format!("\"{}\"", dimension.replace('"', "\"\""));
+            let (inner, _) = correlation_exprs_for_dim(&dimension, &resolved.dimension_exprs, None);
+            format!("{source_alias}.{dimension} IS NOT DISTINCT FROM {inner}")
+        }).collect::<Vec<_>>()
+    };
     // Joined columns are not available in the measure's base relation, and
     // correlating them after grouping loses their row context. Test visibility
     // against the original join for each base row instead. EXISTS prevents a
@@ -4283,6 +4325,16 @@ fn native_visible_filter_excluding(
     dimension_exprs: &HashMap<String, String>,
     excluded_dimensions: &[String],
 ) -> Option<String> {
+    if !excluded_dimensions.is_empty() && condition.contains(STAR_VIEW_ROW) {
+        // The row comparison constrains every column at once, so one dimension
+        // cannot be released from the join's visibility.
+        FILTER_REWRITE_ERROR.with(|current| {
+            current.borrow_mut().get_or_insert_with(|| {
+                "AT (VISIBLE SET ...) across a join needs the measure view to list its columns \
+                 instead of SELECT *".to_string()
+            });
+        });
+    }
     parser_ffi::rewrite_visible_filter(condition, local_alias, dimension_exprs, excluded_dimensions).map(|result| {
         result.unwrap_or_else(|error| {
             // Lowering helpers return SQL strings. Carry native failures to the

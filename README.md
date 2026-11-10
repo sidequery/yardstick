@@ -155,7 +155,8 @@ On DuckDB 1.5+, queries containing `AGGREGATE()` are automatically intercepted b
 Modifiers within one `AT (...)` transform the context in written order.
 Separate `AT` clauses compose from the outside inward: `m AT (A B)` is
 equivalent to `m AT (B) AT (A)`. `WHERE` replaces the context, while `VISIBLE`
-adds the query's filters and join restrictions.
+adds the query's filters. A join does not restrict a measure by itself; a
+filter on a joined column applies to the rows it matches.
 
 To retain unrelated query filters while shifting a dimension with `SET`, include
 `VISIBLE` explicitly:

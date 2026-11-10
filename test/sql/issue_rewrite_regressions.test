@@ -124,6 +124,45 @@ WHERE amount>avg_amount HAVING cnt>=1;
 2023	1
 2024	3
 
+# A join does not restrict a measure by itself; only WHERE does. The South and
+# East rows have no match in the join and still count.
+query II rowsort
+SELECT year, AGGREGATE(issue_count) FROM issue_sales_v
+JOIN (SELECT 'North' AS region) r ON r.region=issue_sales_v.region
+WHERE amount>20 GROUP BY year;
+----
+2023	1
+2024	4
+
+# The same holds for a `SELECT *` measure view, whose columns are not recorded:
+# its rows are compared whole.
+statement ok
+CREATE VIEW issue_star_v AS SELECT *, SUM(amount) AS MEASURE star_revenue, COUNT(*) AS MEASURE star_count FROM issue_sales;
+
+query II rowsort
+SELECT year, AGGREGATE(star_count) FROM issue_star_v
+JOIN (SELECT 'North' AS region) r ON r.region=issue_star_v.region
+WHERE amount>20 GROUP BY year;
+----
+2023	1
+2024	4
+
+# A filter on a joined column applies to the rows it matches.
+query III rowsort
+WITH step1 AS (SELECT region, AVG(amount) AS avg_amount FROM issue_sales GROUP BY ALL)
+SELECT year, AGGREGATE(star_count), AGGREGATE(star_revenue) FROM issue_star_v
+INNER JOIN step1 ON step1.region=issue_star_v.region
+WHERE amount>avg_amount GROUP BY year;
+----
+2023	1	22
+2024	3	82
+
+statement error
+SELECT * FROM yardstick($$SELECT year, AGGREGATE(star_revenue) AT (VISIBLE SET year=year-1) FROM issue_star_v
+JOIN (SELECT 'North' AS region) r ON r.region=issue_star_v.region GROUP BY year$$);
+----
+needs the measure view to list its columns
+
 # #54: VISIBLE retains independent filters when SET changes the year.
 query II rowsort
 SELECT year, AGGREGATE(issue_revenue) AT (VISIBLE SET year=year-1)
