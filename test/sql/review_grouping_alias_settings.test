@@ -113,6 +113,15 @@ SELECT * FROM yardstick('WITH c AS (SELECT * FROM review_alias_v) SELECT year, A
 2023	30
 2024	20
 
+# #63 as reported: a trailing comma after the CTE list keeps the consumer's context.
+query II
+WITH step1 AS (SELECT region, AVG(amount) AS avg_amount FROM review_alias_sales GROUP BY ALL),
+SELECT year, AGGREGATE(revenue) AS total FROM review_alias_v
+INNER JOIN step1 ON step1.region = review_alias_v.region
+WHERE amount > avg_amount HAVING total >= 1;
+----
+2024	20
+
 # A CTE that removes rows cannot feed a grouped measure, which recomputes from
 # the defining view. The same filter in the consuming query is visible.
 statement error

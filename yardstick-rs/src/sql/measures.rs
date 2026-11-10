@@ -3867,6 +3867,77 @@ fn resolve_current_in_expr(
     resolve_current_in_expr_fallback(expr, group_by_cols, outer_where, default_qualifier)
 }
 
+/// CURRENT references in an AT expression. The native grammar finds them when
+/// it is available; without it, scan for `CURRENT dim` and `CURRENT(dim)`.
+fn current_references(expression: &str) -> std::result::Result<Vec<parser_ffi::CurrentReference>, String> {
+    parser_ffi::find_current_references(expression)
+        .unwrap_or_else(|| Ok(scan_current_references(expression)))
+}
+
+fn scan_current_references(expression: &str) -> Vec<parser_ffi::CurrentReference> {
+    let bytes = expression.as_bytes();
+    let mut references = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'\'' || byte == b'"' {
+            // Skip a string literal or quoted identifier, including doubled quotes.
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == byte {
+                    if bytes.get(i + 1) != Some(&byte) {
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if !(byte.is_ascii_alphabetic() || byte == b'_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let is_member = start > 0 && bytes[start - 1] == b'.';
+        if is_member || !expression[start..i].eq_ignore_ascii_case("CURRENT") {
+            continue;
+        }
+        let mut dimension_start = skip_ws_and_comments(expression, i);
+        let parenthesized = bytes.get(dimension_start) == Some(&b'(');
+        if parenthesized {
+            dimension_start = skip_ws_and_comments(expression, dimension_start + 1);
+        }
+        let Some(dimension_end) = parse_qualified_name_span(expression, dimension_start) else {
+            continue;
+        };
+        let dimension = &expression[dimension_start..dimension_end];
+        let end = if parenthesized {
+            let close = skip_ws_and_comments(expression, dimension_end);
+            if bytes.get(close) != Some(&b')') {
+                continue;
+            }
+            close + 1
+        } else if dimension.eq_ignore_ascii_case("ROW") {
+            // CURRENT ROW is a window frame bound.
+            continue;
+        } else {
+            dimension_end
+        };
+        references.push(parser_ffi::CurrentReference {
+            dimension: dimension.to_string(),
+            start_pos: start,
+            end_pos: end,
+        });
+        i = end;
+    }
+    references
+}
+
 fn replace_current_references(
     expr: &str,
     references: &[parser_ffi::CurrentReference],
@@ -3908,7 +3979,7 @@ fn resolve_current_in_at_where(
     outer_alias: Option<&str>,
     qualify: impl FnOnce(&str) -> String,
 ) -> String {
-    let Some(Ok(references)) = parser_ffi::find_current_references(condition) else {
+    let Ok(references) = current_references(condition) else {
         return qualify(condition);
     };
     if references.is_empty() {
@@ -6127,7 +6198,7 @@ fn resolve_context_current(
     outer_alias: Option<&str>,
     qualify: impl FnOnce(&str) -> String,
 ) -> String {
-    let Some(Ok(references)) = parser_ffi::find_current_references(expression) else {
+    let Ok(references) = current_references(expression) else {
         return qualify(expression);
     };
     let mut prefix = "__yardstick_context_current_".to_string();
@@ -7645,9 +7716,45 @@ fn expand_window_measure_query(
     })
 }
 
+/// ROLLUP, CUBE, and GROUPING SETS evaluate a measure in several grouping
+/// contexts. Only the AST rewrite can separate them, so such queries carry
+/// grouping markers even without native query scopes. A false positive only
+/// adds markers that the rewrite removes again.
+fn group_by_has_grouping_sets(sql: &str) -> bool {
+    let Some(position) = find_top_level_keyword(sql, "GROUP BY", 0) else {
+        return false;
+    };
+    let start = position + "GROUP BY".len();
+    let end = find_first_top_level_keyword(
+        sql,
+        start,
+        &["HAVING", "QUALIFY", "WINDOW", "ORDER BY", "LIMIT", "UNION", "INTERSECT", "EXCEPT"],
+    )
+    .unwrap_or(sql.len());
+    let clause = sql[start..end].to_ascii_uppercase();
+    ["ROLLUP", "CUBE", "GROUPING SETS"].iter().any(|keyword| clause.contains(keyword))
+}
+
+/// Unwrap grouping markers that the AST rewrite did not consume, leaving the
+/// plain grouped context.
+fn strip_grouping_markers(sql: &str) -> String {
+    let mut result = sql.to_string();
+    for marker in ["__yardstick_grouping_context", "__yardstick_grouping_correlation"] {
+        while let Some(position) = result.find(marker) {
+            let open = position + marker.len();
+            let Some(close) = find_matching_paren_sql(&result, open) else {
+                break;
+            };
+            let inner = result[open + 1..close].to_string();
+            result.replace_range(position..=close, &format!("({inner})"));
+        }
+    }
+    result
+}
+
 fn expand_aggregate_query(sql: &str, native_scope: bool) -> AggregateExpandResult {
     let _filter_scope = FilterRewriteGuard::enter();
-    let _grouping_scope = GroupingCorrelationGuard::enter(native_scope);
+    let _grouping_scope = GroupingCorrelationGuard::enter(native_scope || group_by_has_grouping_sets(sql));
     let mut expanded = expand_aggregate_query_impl(sql, native_scope);
     if let Some(error) = FILTER_REWRITE_ERROR.with(|error| error.take()) {
         expanded.error = Some(error);
@@ -7862,7 +7969,7 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
                 || matches!(m, ContextModifier::All(_))
                 || matches!(m, ContextModifier::Visible)
                 || matches!(m, ContextModifier::Where(condition)
-                    if matches!(parser_ffi::find_current_references(condition), Some(Ok(refs)) if !refs.is_empty()))
+                    if matches!(current_references(condition), Ok(refs) if !refs.is_empty()))
         })
     });
 
@@ -8083,7 +8190,7 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
                 &eval_group_by_cols,
             )
         };
-        let expanded = if native_scope {
+        let expanded = if MARK_GROUPING_CORRELATIONS.with(Cell::get) {
             format!("__yardstick_grouping_context({expanded})")
         } else { expanded };
         result_sql = format!("{}{}{}", &result_sql[..start], expanded, &result_sql[end..]);
@@ -8244,7 +8351,7 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
         } else {
             format!("{}({measure_name})", resolved.agg_fn)
         };
-        let expanded = if native_scope {
+        let expanded = if MARK_GROUPING_CORRELATIONS.with(Cell::get) {
             format!("__yardstick_grouping_context({expanded})")
         } else { expanded };
         result_sql = format!(
@@ -8297,6 +8404,11 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
             .flatten()
     {
         result_sql = rewritten_sql;
+    }
+    // Without native scopes the rewrite sees the whole statement and skips
+    // forms it cannot parse as one SELECT; those keep the plain grouped context.
+    if !native_scope && result_sql.contains("__yardstick_grouping_") {
+        result_sql = strip_grouping_markers(&result_sql);
     }
 
     AggregateExpandResult {
@@ -8639,6 +8751,31 @@ fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
         items.push(current.trim().to_string());
     }
 
+    // An expression over an aggregate's alias, such as `r / o`, is computed
+    // from those aggregates and is not a grouping dimension. An input column of
+    // the same name takes precedence over the alias, as it does in DuckDB.
+    let input_columns = extract_from_clause_info(sql)
+        .primary_table
+        .map(|table| source_dimension_names(&table.name))
+        .unwrap_or_default();
+    let aggregate_aliases: Vec<String> = items
+        .iter()
+        .filter_map(|item| {
+            let (expression, alias) = split_item_expr_and_alias(item);
+            if !has_aggregate_function(item) && !looks_like_sql_aggregate_expr(expression) {
+                return None;
+            }
+            let alias = alias?.trim();
+            let alias = if alias.len() > 2 && alias[..2].eq_ignore_ascii_case("AS") {
+                alias[2..].trim()
+            } else {
+                alias
+            };
+            let name = normalize_dimension_key(alias);
+            (!name.is_empty() && !input_columns.contains(&name)).then_some(name)
+        })
+        .collect();
+
     // Filter out AGGREGATE() calls, literal constants, and extract column names
     for item in items {
         if has_aggregate_function(&item) {
@@ -8647,6 +8784,9 @@ fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
         // Handle SELECT aliases without truncating nested CAST(... AS ...).
         let (col, _) = split_item_expr_and_alias(&item);
         if looks_like_sql_aggregate_expr(col) {
+            continue;
+        }
+        if aggregate_aliases.iter().any(|alias| expr_mentions_identifier(col, alias)) {
             continue;
         }
         if is_star_select_expression(col) {

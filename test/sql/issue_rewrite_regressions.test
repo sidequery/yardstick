@@ -116,7 +116,7 @@ SELECT year, UPPER(region) AS a FROM issue_sales_v GROUP BY ALL HAVING AGGREGATE
 
 # #63: a grouped CTE does not supply the consumer's GROUP BY.
 query II
-WITH step1 AS (SELECT region, AVG(amount) AS avg_amount FROM issue_sales GROUP BY ALL),
+WITH step1 AS (SELECT region, AVG(amount) AS avg_amount FROM issue_sales GROUP BY ALL)
 SELECT year, AGGREGATE(issue_count) AS cnt FROM issue_sales_v
 INNER JOIN step1 ON step1.region=issue_sales_v.region
 WHERE amount>avg_amount HAVING cnt>=1;

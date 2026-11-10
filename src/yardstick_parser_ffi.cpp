@@ -16,12 +16,7 @@
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
-#include "duckdb/parser/query_node/set_operation_node.hpp"
-#include "duckdb/parser/query_node/recursive_cte_node.hpp"
 #include "duckdb/parser/tableref/list.hpp"
-#include "duckdb/parser/tableref/table_function_ref.hpp"
-#include "duckdb/parser/tableref/expressionlistref.hpp"
-#include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/planner/bound_statement.hpp"
@@ -29,6 +24,13 @@
 
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
+#include "duckdb/parser/common_table_expression_info.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
@@ -94,6 +96,45 @@ static ParserOptions YardstickParserOptions() {
 inline const std::string &YsName(const Identifier &id) { return id.GetIdentifierName(); }
 #endif
 inline const std::string &YsName(const std::string &s) { return s; }
+
+// Parsed-expression accessors that differ between DuckDB releases. The context
+// and grouping rewrites serve builds with and without the native grammar, so
+// they reach the AST through these.
+#if YARDSTICK_NEW_EXPR_API
+using YsIdent = Identifier;
+inline bool YsSameName(const Identifier &name, const std::string &other) { return name == Identifier(other); }
+inline decltype(auto) YsColumnNames(ColumnRefExpression &c) { return c.ColumnNamesMutable(); }
+inline decltype(auto) YsColumnNames(const ColumnRefExpression &c) { return c.ColumnNames(); }
+inline decltype(auto) YsSubquery(SubqueryExpression &s) { return s.SubqueryMutable(); }
+inline ProjectionIndex YsGroupIndex(idx_t index) { return ProjectionIndex(index); }
+inline unique_ptr<ParsedExpression> YsConstant(Value value) { return ConstantExpression::FromValue(std::move(value)); }
+inline decltype(auto) YsCaseElse(CaseExpression &c) { return c.ElseMutable(); }
+inline QueryNode *YsCteNode(CommonTableExpressionInfo &cte) { return cte.query_node.get(); }
+template <class T> decltype(auto) YsConstChildren(const T &e) { return e.GetChildren(); }
+inline std::string YsStringLiteral(const ConstantExpression &c) { return c.GetLiteral().text; }
+inline Value YsConstantValue(const ConstantExpression &c) { return c.GetLiteral().ToValue(); }
+inline void YsClearAlias(ParsedExpression &e) { e.ClearAlias(); }
+inline bool YsIsKeywordLambda(const LambdaExpression &l) {
+    return l.GetLambdaSyntaxType() == LambdaSyntaxType::LAMBDA_KEYWORD;
+}
+inline decltype(auto) YsLambdaBody(LambdaExpression &l) { return l.RightMutable(); }
+#else
+using YsIdent = std::string;
+inline bool YsSameName(const std::string &name, const std::string &other) { return StringUtil::CIEquals(name, other); }
+inline vector<string> &YsColumnNames(ColumnRefExpression &c) { return c.column_names; }
+inline const vector<string> &YsColumnNames(const ColumnRefExpression &c) { return c.column_names; }
+inline unique_ptr<SelectStatement> &YsSubquery(SubqueryExpression &s) { return s.subquery; }
+inline idx_t YsGroupIndex(idx_t index) { return index; }
+inline unique_ptr<ParsedExpression> YsConstant(Value value) { return make_uniq<ConstantExpression>(std::move(value)); }
+inline unique_ptr<ParsedExpression> &YsCaseElse(CaseExpression &c) { return c.else_expr; }
+inline QueryNode *YsCteNode(CommonTableExpressionInfo &cte) { return cte.query ? cte.query->node.get() : nullptr; }
+template <class T> const vector<unique_ptr<ParsedExpression>> &YsConstChildren(const T &e) { return e.children; }
+inline std::string YsStringLiteral(const ConstantExpression &c) { return c.value.ToString(); }
+inline Value YsConstantValue(const ConstantExpression &c) { return c.value; }
+inline void YsClearAlias(ParsedExpression &e) { e.alias.clear(); }
+inline bool YsIsKeywordLambda(const LambdaExpression &l) { return l.syntax_type == LambdaSyntaxType::LAMBDA_KEYWORD; }
+inline unique_ptr<ParsedExpression> &YsLambdaBody(LambdaExpression &l) { return l.expr; }
+#endif
 
 inline const std::string &YsFuncName(const FunctionExpression &f) {
 #if YARDSTICK_NEW_EXPR_API
@@ -1634,12 +1675,13 @@ static std::unordered_set<string> SelectInputColumns(SelectNode &select) {
     for (auto &name : bound.names) names.insert(StringUtil::Lower(name.GetIdentifierName()));
     return names;
 }
+#endif
 
 static unique_ptr<ParsedExpression> ResolveGroupingDimension(
     SelectNode &select, const ParsedExpression &dimension, const std::unordered_set<string> &input_columns) {
     const ParsedExpression *resolved = &dimension;
     if (dimension.GetExpressionClass() == ExpressionClass::CONSTANT) {
-        auto value = dimension.Cast<ConstantExpression>().GetLiteral().ToValue();
+        auto value = YsConstantValue(dimension.Cast<ConstantExpression>());
         if (!value.IsNull() && value.type().IsIntegral()) {
             auto ordinal = value.GetValue<int64_t>();
             if (ordinal > 0 && idx_t(ordinal) <= select.select_list.size()) {
@@ -1659,9 +1701,11 @@ static unique_ptr<ParsedExpression> ResolveGroupingDimension(
         }
     }
     auto result = resolved->Copy();
-    result->ClearAlias();
+    YsClearAlias(*result);
     return result;
 }
+
+#if YARDSTICK_GRAMMAR_EXTENSION
 
 // Resolve only lexical ownership here. An unqualified column below a sourced
 // query needs schema binding; do not guess that it belongs to the outer query.
@@ -2356,7 +2400,6 @@ extern "C" bool yardstick_requires_select_alias_binding(const char* sql) {
 // FFI Implementation: yardstick_inline_order_by_subquery_aliases
 //=============================================================================
 
-#if YARDSTICK_GRAMMAR_EXTENSION
 static unique_ptr<ParsedExpression> GroupingContextExpression(const ParsedExpression &expression,
                                                              bool unqualify_columns = false) {
     auto result = expression.Copy();
@@ -2368,7 +2411,7 @@ static unique_ptr<ParsedExpression> GroupingContextExpression(const ParsedExpres
     }
     std::function<void(ParsedExpression &)> unqualify = [&](ParsedExpression &node) {
         if (node.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-            auto &names = node.Cast<ColumnRefExpression>().ColumnNamesMutable();
+            auto &names = YsColumnNames(node.Cast<ColumnRefExpression>());
             if (names.size() > 1) {
                 auto name = names.back();
                 names = {name};
@@ -2402,21 +2445,21 @@ static bool RewriteGroupingCorrelations(unique_ptr<ParsedExpression> &expression
                         [&](const ParsedExpression &column) {
                             qualified |= column.Cast<ColumnRefExpression>().IsQualified();
                         });
-                    auto outer_dimension = GroupingContextExpression(comparison.Right(), !qualified);
-                    if (!grouping_set->count(ProjectionIndex(i)) && outer_dimension->Equals(*dimensions[i])) {
+                    auto outer_dimension = GroupingContextExpression(*YsRight(comparison), !qualified);
+                    if (!grouping_set->count(YsGroupIndex(i)) && outer_dimension->Equals(*dimensions[i])) {
                         removed = true;
                         break;
                     }
                 }
             }
-            expression = removed ? ConstantExpression::FromValue(Value::BOOLEAN(true)) : std::move(condition);
+            expression = removed ? YsConstant(Value::BOOLEAN(true)) : std::move(condition);
             return removed;
         }
     }
     if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
         auto &subquery = expression->Cast<SubqueryExpression>();
-        if (subquery.Subquery() && subquery.Subquery()->node->type == QueryNodeType::SELECT_NODE) {
-            auto &select = subquery.SubqueryMutable()->node->Cast<SelectNode>();
+        if (YsSubquery(subquery) && YsSubquery(subquery)->node->type == QueryNodeType::SELECT_NODE) {
+            auto &select = YsSubquery(subquery)->node->Cast<SelectNode>();
             return RewriteGroupingCorrelations(select.where_clause, dimensions, grouping_set);
         }
         return false;
@@ -2430,7 +2473,12 @@ static bool RewriteGroupingCorrelations(unique_ptr<ParsedExpression> &expression
 
 static bool RewriteGroupingSetContexts(SelectNode &select) {
     vector<unique_ptr<ParsedExpression>> dimensions;
-    auto input_columns = SelectInputColumns(select);
+    // Without a bind context the FROM schema is unknown and SELECT aliases
+    // cannot be told apart from input columns.
+    std::unordered_set<string> input_columns;
+#if YARDSTICK_GRAMMAR_EXTENSION
+    input_columns = SelectInputColumns(select);
+#endif
     for (auto &dimension : select.groups.group_expressions) {
         auto resolved = ResolveGroupingDimension(select, *dimension, input_columns);
         dimensions.push_back(GroupingContextExpression(*resolved));
@@ -2456,22 +2504,22 @@ static bool RewriteGroupingSetContexts(SelectNode &select) {
                             auto grouping = make_uniq<OperatorExpression>(ExpressionType::GROUPING_FUNCTION,
                                                                           std::move(arguments));
                             conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
-                                std::move(grouping), ConstantExpression::FromValue(
-                                    Value::BIGINT(grouping_set.count(ProjectionIndex(i)) ? 0 : 1))));
+                                std::move(grouping), YsConstant(
+                                    Value::BIGINT(grouping_set.count(YsGroupIndex(i)) ? 0 : 1))));
                         }
                         auto condition = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
                                                                           std::move(conditions));
-                        result->CaseChecksMutable().push_back({std::move(condition), std::move(value)});
+                        YsCaseChecks(*result).push_back({std::move(condition), std::move(value)});
                     }
                 }
                 RewriteGroupingCorrelations(original, dimensions, nullptr);
-                if (result->CaseChecks().empty()) {
+                if (YsCaseChecks(*result).empty()) {
                     expression = std::move(original);
                 } else {
                     // GROUPING executes in the outer grouped query. Moving it
                     // into a correlated subquery is rejected by DuckDB, and
                     // checking NULL would confuse real NULLs with subtotals.
-                    result->ElseMutable() = std::move(original);
+                    YsCaseElse(*result) = std::move(original);
                     expression = std::move(result);
                 }
                 expression->SetAlias(alias);
@@ -2517,7 +2565,6 @@ static bool RewriteGroupingSetContexts(SelectNode &select) {
         [&](unique_ptr<ParsedExpression> &expression) { rewrite(expression, true); });
     return changed;
 }
-#endif
 
 extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
     if (!sql) {
@@ -2543,9 +2590,7 @@ extern "C" char* yardstick_inline_order_by_subquery_aliases(const char* sql) {
 
         auto* select_node = static_cast<SelectNode*>(select_stmt->node.get());
         bool changed = false;
-#if YARDSTICK_GRAMMAR_EXTENSION
         changed = RewriteGroupingSetContexts(*select_node);
-#endif
         TableQualifierSet from_qualifiers;
         CollectTableQualifiers(select_node->from_table.get(), from_qualifiers);
         std::unordered_set<string> input_columns;
@@ -2702,7 +2747,6 @@ extern "C" int32_t yardstick_expressions_equal(const char* left, const char* rig
     }
 }
 
-#if YARDSTICK_GRAMMAR_EXTENSION
 namespace {
 struct VisibleFilterScope {
     bool unqualified_is_local = true;
@@ -2725,22 +2769,22 @@ public:
             return;
         }
         if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-            auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
-            if (scope.lambda_parameters.count(StringUtil::Lower(names[0].GetIdentifierName()))) {
+            auto &names = YsColumnNames(expression->Cast<ColumnRefExpression>());
+            if (scope.lambda_parameters.count(StringUtil::Lower(YsName(names[0])))) {
                 return;
             }
             bool local = names.size() == 1 ? scope.unqualified_is_local &&
-                    !scope.aliases.count(StringUtil::Lower(names[0].GetIdentifierName()))
+                    !scope.aliases.count(StringUtil::Lower(YsName(names[0])))
                 : names.size() >= 2 && scope.alias_is_local && !local_alias.empty() &&
-                  names[names.size() - 2] == Identifier(local_alias);
+                  YsSameName(names[names.size() - 2], local_alias);
             if (local) {
                 if (scope.inner_alias_shadowed) {
                     throw ParserException("Conflicting recomputation alias in visible filter");
                 }
                 auto alias = expression->GetAlias();
-                auto entry = dimensions.find(StringUtil::Lower(names.back().GetIdentifierName()));
+                auto entry = dimensions.find(StringUtil::Lower(YsName(names.back())));
                 if (entry == dimensions.end()) {
-                    expression = make_uniq<ColumnRefExpression>(names.back(), Identifier("_inner"));
+                    expression = make_uniq<ColumnRefExpression>(names.back(), YsIdent("_inner"));
                 } else {
                     expression = entry->second->Copy();
                 }
@@ -2750,16 +2794,16 @@ public:
         }
         if (expression->GetExpressionClass() == ExpressionClass::LAMBDA) {
             auto &lambda = expression->Cast<LambdaExpression>();
-            if (lambda.GetLambdaSyntaxType() == LambdaSyntaxType::LAMBDA_KEYWORD) {
+            if (YsIsKeywordLambda(lambda)) {
                 string error;
                 auto parameters = lambda.ExtractColumnRefExpressions(error);
                 if (!error.empty()) throw ParserException(error);
                 for (auto &parameter : parameters) {
-                    auto &names = parameter.get().Cast<ColumnRefExpression>().ColumnNames();
+                    auto &names = YsColumnNames(parameter.get().Cast<ColumnRefExpression>());
                     if (names.size() != 1) throw ParserException("Invalid lambda parameter in visible filter");
-                    scope.lambda_parameters.insert(StringUtil::Lower(names[0].GetIdentifierName()));
+                    scope.lambda_parameters.insert(StringUtil::Lower(YsName(names[0])));
                 }
-                Expression(lambda.RightMutable(), scope);
+                Expression(YsLambdaBody(lambda), scope);
                 return;
             }
             // Arrow expressions also represent JSON access. Only explicit
@@ -2768,8 +2812,8 @@ public:
         if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
             auto &subquery = expression->Cast<SubqueryExpression>();
             // IN/ANY's left operand belongs to the containing expression scope.
-            Expression(subquery.GetChildMutable(), scope);
-            Query(*subquery.SubqueryMutable()->node, scope);
+            Expression(YsChildRef(subquery), scope);
+            Query(*YsSubquery(subquery)->node, scope);
             return;
         }
         ParsedExpressionIterator::EnumerateChildren(*expression,
@@ -2783,9 +2827,9 @@ public:
         }
         ParsedExpressionIterator::VisitExpressionClassMutable(*expressions[0], ExpressionClass::COLUMN_REF,
             [](ParsedExpression &expression) {
-                auto &names = expression.Cast<ColumnRefExpression>().ColumnNamesMutable();
+                auto &names = YsColumnNames(expression.Cast<ColumnRefExpression>());
                 auto column = names.back();
-                names = {Identifier("_inner"), std::move(column)};
+                names = {YsIdent("_inner"), std::move(column)};
             });
         dimensions.emplace(StringUtil::Lower(name), std::move(expressions[0]));
     }
@@ -2822,10 +2866,10 @@ private:
     void Query(QueryNode &query, VisibleFilterScope outer) {
         // CTE bodies cannot see the containing SELECT's FROM bindings.
         for (auto &entry : query.cte_map.map) {
-            if (!entry.second->query_node) {
+            if (!YsCteNode(*entry.second)) {
                 throw ParserException("Unsupported CTE in visible filter");
             }
-            Query(*entry.second->query_node, outer);
+            Query(*YsCteNode(*entry.second), outer);
         }
         auto scope = outer;
         switch (query.type) {
@@ -2899,23 +2943,21 @@ private:
     }
 };
 } // namespace
-#endif
 
-#if YARDSTICK_GRAMMAR_EXTENSION
 // De Morgan, distributivity, idempotence, and absorption hold for SQL's
 // three-valued AND/OR/NOT. Normalize before separating dimension predicates so
 // equivalent NOT and factorable OR forms retain the same independent filters.
 static unique_ptr<ParsedExpression> ContextNegationNormalForm(const ParsedExpression &expression, bool negate = false) {
     auto type = expression.GetExpressionType();
     if (type == ExpressionType::OPERATOR_NOT) {
-        auto &children = expression.Cast<OperatorExpression>().GetChildren();
+        auto &children = YsConstChildren(expression.Cast<OperatorExpression>());
         if (children.size() == 1) return ContextNegationNormalForm(*children[0], !negate);
     }
     if (type == ExpressionType::CONJUNCTION_AND || type == ExpressionType::CONJUNCTION_OR) {
         if (negate) type = type == ExpressionType::CONJUNCTION_AND
             ? ExpressionType::CONJUNCTION_OR : ExpressionType::CONJUNCTION_AND;
         vector<unique_ptr<ParsedExpression>> children;
-        for (auto &child : expression.Cast<ConjunctionExpression>().GetChildren()) {
+        for (auto &child : YsConstChildren(expression.Cast<ConjunctionExpression>())) {
             children.push_back(ContextNegationNormalForm(*child, negate));
         }
         return make_uniq<ConjunctionExpression>(type, std::move(children));
@@ -2931,6 +2973,7 @@ using ContextConjunction = vector<ContextClause>;
 static bool ContextExpressionCanRepeat(const ParsedExpression &expression) {
     if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) return false;
     if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+#if YARDSTICK_GRAMMAR_EXTENSION
         auto *context = CurrentNativeYardstickClientContext();
         if (!context) return false;
         try {
@@ -2944,6 +2987,9 @@ static bool ContextExpressionCanRepeat(const ParsedExpression &expression) {
         } catch (const std::exception &) {
             return false; // No catalog proof permits no evaluation-changing rewrite.
         }
+#else
+        return false; // No bind context, so no catalog proof that the call is stable.
+#endif
     }
     bool repeatable = true;
     ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
@@ -2963,7 +3009,7 @@ static ContextConjunction ContextConjunctiveNormalForm(const ParsedExpression &e
         return result;
     }
     ContextConjunction result;
-    for (auto &child : expression.Cast<ConjunctionExpression>().GetChildren()) {
+    for (auto &child : YsConstChildren(expression.Cast<ConjunctionExpression>())) {
         auto next = ContextConjunctiveNormalForm(*child);
         if (result.empty()) {
             result = std::move(next);
@@ -2996,10 +3042,10 @@ static unique_ptr<ParsedExpression> ContextDimensionReference(const ParsedExpres
     auto result = expression.Copy();
     ParsedExpressionIterator::VisitExpressionClassMutable(*result, ExpressionClass::COLUMN_REF,
         [&](ParsedExpression &column) {
-            auto &names = column.Cast<ColumnRefExpression>().ColumnNamesMutable();
-            if (names.size() == 1 || (names.size() == 2 && names[0] == Identifier(source_alias))) {
+            auto &names = YsColumnNames(column.Cast<ColumnRefExpression>());
+            if (names.size() == 1 || (names.size() == 2 && YsSameName(names[0], source_alias))) {
                 auto name = names.back();
-                names = {Identifier("_inner"), std::move(name)};
+                names = {YsIdent("_inner"), std::move(name)};
             }
         });
     return result;
@@ -3105,9 +3151,9 @@ static void DropContextDimensions(unique_ptr<ParsedExpression> &expression,
                         bool removed = false;
                         for (auto &dimension : excluded) removed |= canonical->Equals(*dimension);
                         if (removed) return;
-                        auto &names = column.Cast<ColumnRefExpression>().ColumnNames();
+                        auto &names = YsColumnNames(column.Cast<ColumnRefExpression>());
                         other_source_dimension |= names.size() == 1 ||
-                            (names.size() == 2 && (names[0] == Identifier(source_alias) || names[0] == Identifier("_inner")));
+                            (names.size() == 2 && (YsSameName(names[0], source_alias) || YsSameName(names[0], "_inner")));
                     });
                 if (!other_source_dimension) atom_other = false;
             }
@@ -3122,11 +3168,10 @@ static void DropContextDimensions(unique_ptr<ParsedExpression> &expression,
         if (clauses[i].size() == 1) remaining.push_back(std::move(clauses[i][0]));
         else remaining.push_back(make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(clauses[i])));
     }
-    if (remaining.empty()) expression = ConstantExpression::FromValue(Value::BOOLEAN(true));
+    if (remaining.empty()) expression = YsConstant(Value::BOOLEAN(true));
     else if (remaining.size() == 1) expression = std::move(remaining[0]);
     else expression = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(remaining));
 }
-#endif
 
 #if YARDSTICK_GRAMMAR_EXTENSION
 void duckdb::RemoveNativeContextDimensions(unique_ptr<ParsedExpression> &expression,
@@ -3147,9 +3192,15 @@ extern "C" char* yardstick_rewrite_visible_filter(const char* expression, const 
                                                   const char* const* excluded_dimensions,
                                                   size_t excluded_count, char** error) {
     if (error) *error = nullptr;
+    if (!expression) return nullptr;
 #if YARDSTICK_GRAMMAR_EXTENSION
-    auto *options = CurrentNativeYardstickParserOptions();
-    if (!options || !expression) return nullptr;
+    auto *native_options = CurrentNativeYardstickParserOptions();
+    if (!native_options) return nullptr;
+    auto parser_options = *native_options;
+#else
+    auto parser_options = YardstickParserOptions();
+#endif
+    auto *options = &parser_options;
     try {
         auto expressions = YardstickParseExpressionList(expression, *options);
         if (expressions.size() != 1) throw ParserException("Expected one expression in visible filter");
@@ -3160,7 +3211,7 @@ extern "C" char* yardstick_rewrite_visible_filter(const char* expression, const 
             auto arguments = YsArgs(function);
             if (YsFuncName(function) == "__yardstick_visible_join" && arguments.size() == 2 &&
                 arguments[0]->GetExpressionClass() == ExpressionClass::CONSTANT) {
-                visible_source = arguments[0]->Cast<ConstantExpression>().GetLiteral().text;
+                visible_source = YsStringLiteral(arguments[0]->Cast<ConstantExpression>());
                 expressions[0] = arguments[1]->Copy();
                 joined_visibility = true;
             }
@@ -3178,10 +3229,10 @@ extern "C" char* yardstick_rewrite_visible_filter(const char* expression, const 
         }
         if (joined_visibility) {
             if (expressions[0]->GetExpressionClass() != ExpressionClass::SUBQUERY ||
-                expressions[0]->Cast<SubqueryExpression>().Subquery()->node->type != QueryNodeType::SELECT_NODE) {
+                YsSubquery(expressions[0]->Cast<SubqueryExpression>())->node->type != QueryNodeType::SELECT_NODE) {
                 throw ParserException("Invalid joined visibility context");
             }
-            auto &select = expressions[0]->Cast<SubqueryExpression>().SubqueryMutable()->node->Cast<SelectNode>();
+            auto &select = YsSubquery(expressions[0]->Cast<SubqueryExpression>())->node->Cast<SelectNode>();
             DropContextDimensions(select.where_clause, excluded, visible_source);
             std::function<void(TableRef &)> prune_joins = [&](TableRef &table) {
                 if (table.type != TableReferenceType::JOIN) return;
@@ -3199,7 +3250,7 @@ extern "C" char* yardstick_rewrite_visible_filter(const char* expression, const 
                     } else i++;
                 }
                 if (removed_using_dimension && join.using_columns.empty() && !join.condition) {
-                    join.condition = ConstantExpression::FromValue(Value::BOOLEAN(true));
+                    join.condition = YsConstant(Value::BOOLEAN(true));
                 }
                 prune_joins(*join.left);
                 prune_joins(*join.right);
@@ -3213,7 +3264,6 @@ extern "C" char* yardstick_rewrite_visible_filter(const char* expression, const 
         if (error) *error = safe_strdup(exception.what());
         return nullptr;
     }
-#endif
     return nullptr;
 }
 
