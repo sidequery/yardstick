@@ -2218,6 +2218,13 @@ public:
     struct TemporaryCatalogCleanup {
         TemporaryCatalogSnapshots snapshots;
         bool applied = false;
+
+        explicit TemporaryCatalogCleanup(TemporaryCatalogSnapshots snapshots_p) : snapshots(std::move(snapshots_p)) {}
+        // The snapshots own view definitions and cannot be copied. Declaring
+        // the moves removes the implicit copies, which std::vector otherwise
+        // selects on growth where std::map's move constructor is not noexcept.
+        TemporaryCatalogCleanup(TemporaryCatalogCleanup &&) = default;
+        TemporaryCatalogCleanup &operator=(TemporaryCatalogCleanup &&) = default;
     };
     TemporaryViews temporary_views;
     std::unique_ptr<TemporaryViews> pending_temporary;
@@ -2294,7 +2301,7 @@ public:
                 temporary_views[name] = previous->second;
             }
         }
-        catalog_cleanups.push_back({std::move(batch_original_catalog), false});
+        catalog_cleanups.emplace_back(std::move(batch_original_catalog));
         batch_original_catalog.clear();
         temporary_batch.reset();
         batch_original_temporary.reset();
