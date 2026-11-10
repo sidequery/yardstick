@@ -9,6 +9,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -210,18 +211,39 @@ unique_ptr<FunctionData> BindCombine(BindScalarFunctionInput &input) {
 } // namespace
 
 void RegisterYardstickAggregateStateFunctions(ExtensionLoader &loader) {
+	auto register_function = [&](ScalarFunction function, vector<string> names, const string &description,
+	                             const string &example) {
+		for (idx_t index = 0; index < names.size(); index++) {
+			function.GetSignature().GetParameter(index).SetName(Identifier(names[index]));
+		}
+		FunctionDescription documentation;
+		documentation.parameter_names = std::move(names);
+		documentation.description = description;
+		documentation.examples = {example};
+		documentation.categories = {"aggregate"};
+		CreateScalarFunctionInfo info(std::move(function));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		info.descriptions.push_back(std::move(documentation));
+		loader.RegisterFunction(std::move(info));
+	};
 	ScalarFunction state("yardstick_state", {LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY, nullptr, BindState);
 	state.SetBindExpressionCallback(ReplaceStateExpression);
 	state.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(state);
+	register_function(std::move(state), {"formula", "states"},
+	                  "Attach a scalar finalization formula to a STRUCT of exported aggregate states named s0, s1, and so on.",
+	                  "SELECT yardstick_state('s0', struct_pack(s0 := sum(i) EXPORT_STATE)) FROM range(3) t(i);");
 	ScalarFunction finalize("yardstick_finalize", {LogicalType::ANY}, LogicalType::ANY, nullptr, BindFinalize);
 	finalize.SetBindExpressionCallback(ReplaceStateExpression);
 	finalize.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(finalize);
+	register_function(std::move(finalize), {"state"},
+	                  "Finalize a native aggregate state or evaluate a Yardstick composite state's formula.",
+	                  "SELECT yardstick_finalize(avg(i) EXPORT_STATE) FROM range(6) t(i);");
 	ScalarFunction combine("yardstick_combine", {LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, nullptr, BindCombine);
 	combine.SetBindExpressionCallback(ReplaceStateExpression);
 	combine.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(combine);
+	register_function(std::move(combine), {"left_state", "right_state"},
+	                  "Combine aggregate states with matching formulas and aggregate types for later finalization.",
+	                  "WITH s AS (SELECT sum(i) EXPORT_STATE AS state FROM range(3) t(i)) SELECT yardstick_finalize(yardstick_combine(state, state)) FROM s;");
 }
 } // namespace duckdb
 #else
