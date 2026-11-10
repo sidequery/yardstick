@@ -91,6 +91,12 @@ char* yardstick_decorate_measure(
     const char* const* qualifiers, size_t qualifier_count,
     const char* const* binding_ctes, size_t binding_cte_count, char** error);
 char* yardstick_window_marker(const char* call_sql, const char* marker_name, char** error);
+/* Trace a measure column through a CTE to the view that defines it. Returns
+ * "view.column", or NULL when the relation is not a CTE. A result together with
+ * an error means a relation on the path removed rows. */
+char* yardstick_resolve_measure_reference(const char* relation, const char* column,
+                                         const char* const* binding_ctes, size_t binding_cte_count,
+                                         char** error);
 char* yardstick_rewrite_measure_windows(
     const char* sql, const YardstickWindowSource* sources, size_t source_count,
     const YardstickWindowCall* calls, size_t call_count,

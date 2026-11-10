@@ -79,9 +79,6 @@ void RemoveNativeContextDimensions(unique_ptr<ParsedExpression> &expression,
                                     const vector<unique_ptr<ParsedExpression>> &dimensions,
                                     const string &source_alias);
 
-extern "C" char *yardstick_resolve_measure_reference(const char *relation, const char *column,
-    const char *const *binding_ctes, size_t binding_cte_count, char **error);
-
 // Returns a complete native result or recognized semantic error, freed with
 // yardstick_free_aggregate_list. nullptr retains compatibility for unavailable
 // native grammar or source forms outside the native adapter.

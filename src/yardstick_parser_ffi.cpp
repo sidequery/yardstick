@@ -1526,6 +1526,15 @@ extern "C" char* yardstick_decorate_measure(
     return nullptr;
 }
 
+#if !YARDSTICK_GRAMMAR_EXTENSION
+// CTE lineage needs the native frontend; without it no relation is traced.
+extern "C" char* yardstick_resolve_measure_reference(const char*, const char*, const char* const*, size_t,
+                                                    char** error) {
+    if (error) *error = nullptr;
+    return nullptr;
+}
+#endif
+
 extern "C" char* yardstick_window_marker(const char* call_sql, const char* marker_name, char** error) {
     if (error) *error = nullptr;
 #if YARDSTICK_GRAMMAR_EXTENSION
