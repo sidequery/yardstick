@@ -7982,6 +7982,27 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
 
     // Extract GROUP BY columns for AT (ALL dim) correlation
     let group_by_cols = extract_group_by_columns(context_sql);
+    // DuckDB resolves a GROUP BY name to an input column first and to a SELECT
+    // alias otherwise. Native scopes bind that against the schema; without
+    // them the measure view's own columns stand in for it, when they are known.
+    let group_by_cols = if native_scope {
+        group_by_cols
+    } else {
+        let select_aliases = extract_dimension_exprs_from_query(context_sql);
+        let input_columns = source_dimension_names(&primary_table_name);
+        group_by_cols
+            .into_iter()
+            .map(|column| {
+                let name = normalize_dimension_key(&column);
+                match select_aliases.get(&name) {
+                    Some(expression) if !input_columns.is_empty() && !input_columns.contains(&name) => {
+                        expression.clone()
+                    }
+                    _ => column,
+                }
+            })
+            .collect()
+    };
 
     let default_set_qualifier = if let Some(alias) = existing_alias.as_deref() {
         Some(alias)
@@ -8450,12 +8471,23 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
         );
     }
 
-    if let Some(rewritten_sql) =
-        std::panic::catch_unwind(|| parser_ffi::inline_order_by_subquery_aliases(&result_sql))
+    let inline_aliases = |sql: &str| {
+        std::panic::catch_unwind(|| parser_ffi::inline_order_by_subquery_aliases(sql))
             .ok()
             .flatten()
-    {
+    };
+    if let Some(rewritten_sql) = inline_aliases(&result_sql) {
         result_sql = rewritten_sql;
+    } else if !native_scope {
+        // The AST pass takes one SELECT. Without native scopes the statement
+        // may wrap its query (CREATE TABLE AS, INSERT), so pass the query body.
+        let body = top_level_create_as_query_body_range(&result_sql)
+            .or_else(|| top_level_parenthesized_insert_query_body_range(&result_sql));
+        if let Some((start, end)) = body {
+            if let Some(rewritten_body) = inline_aliases(&result_sql[start..end]) {
+                result_sql.replace_range(start..end, &rewritten_body);
+            }
+        }
     }
     // Without native scopes the rewrite sees the whole statement and skips
     // forms it cannot parse as one SELECT; those keep the plain grouped context.

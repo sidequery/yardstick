@@ -107,6 +107,39 @@ East	2
 North	3
 South	2
 
+# GROUP BY may name the SELECT alias of an expression dimension.
+query TII rowsort
+SELECT UPPER(region) AS a, year, AGGREGATE(issue_revenue) FROM issue_sales_v GROUP BY a, year;
+----
+EAST	2024	62
+NORTH	2023	37
+NORTH	2024	28
+SOUTH	2023	18
+SOUTH	2024	21
+
+# Subtotals and alias arithmetic lower the same way inside CREATE TABLE AS.
+statement ok
+CREATE TABLE issue_rollup AS
+SELECT region, AGGREGATE(issue_count) AS n FROM issue_sales_v GROUP BY ROLLUP(region);
+
+query TI rowsort
+SELECT * FROM issue_rollup;
+----
+East	2
+NULL	7
+North	3
+South	2
+
+statement ok
+CREATE TABLE issue_ratio AS
+SELECT year, AGGREGATE(issue_revenue) AS r, AGGREGATE(issue_count) AS o, r/o AS ratio FROM issue_sales_v;
+
+query IR rowsort
+SELECT year, ROUND(ratio, 2) FROM issue_ratio;
+----
+2023	18.33
+2024	27.75
+
 # HAVING evaluates the measure at the same expression grain.
 query IT rowsort
 SELECT year, UPPER(region) AS a FROM issue_sales_v GROUP BY ALL HAVING AGGREGATE(issue_count)>1;
