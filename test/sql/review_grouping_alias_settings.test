@@ -140,6 +140,45 @@ SELECT DISTINCT region, AGGREGATE(revenue) OVER (PARTITION BY region) FROM c;
 ----
 North	20
 
+# A plain view or derived table hides how its rows were selected, so a grouped
+# measure cannot be recomputed through it, whether or not it filters.
+statement ok
+CREATE VIEW review_alias_filtered AS SELECT * FROM review_alias_v WHERE amount > 15;
+
+statement error
+SELECT region, AGGREGATE(revenue) FROM review_alias_filtered GROUP BY region;
+----
+is read through review_alias_filtered, which does not define it
+
+statement error
+SELECT region, AGGREGATE(revenue) FROM (SELECT * FROM review_alias_v WHERE amount > 15) GROUP BY region;
+----
+is read through a derived table, which does not define it
+
+statement error
+SELECT region, AGGREGATE(t.revenue) FROM (SELECT * FROM review_alias_v) AS t GROUP BY region;
+----
+is read through t, which does not define it
+
+# A join that reads the defining view still resolves an unqualified measure,
+# even when a derived table comes first in FROM.
+query TI
+SELECT r.region, AGGREGATE(revenue)
+FROM (SELECT 'North' AS region) r JOIN review_alias_v v ON v.region = r.region
+GROUP BY r.region;
+----
+North	50
+
+# Defining the measure in the filtering view makes its WHERE part of the rows.
+statement ok
+CREATE VIEW review_alias_defined AS
+SELECT year, region, SUM(amount) AS MEASURE revenue FROM review_alias_sales WHERE amount > 15;
+
+query TI
+SELECT region, AGGREGATE(revenue) FROM review_alias_defined GROUP BY region;
+----
+North	20
+
 # Session search_path and its schema alias live outside the generic settings.
 statement ok
 CREATE SCHEMA review_foo;

@@ -56,7 +56,7 @@ restriction. Use `AT (WHERE ...)` to state the intended filter explicitly.
 Normalization that could duplicate or merge volatile function calls is rejected
 as well; independent predicates retain their original calls.
 
-### 3. Grouped Measures Read Through a Filtering CTE
+### 3. Grouped Measures Read Through Another Relation
 
 A CTE or derived table that passes a measure through while removing rows
 (`WHERE`, `GROUP BY`, `HAVING`, `QUALIFY`, `DISTINCT`, `LIMIT`, or sampling)
@@ -74,4 +74,20 @@ SELECT year, AGGREGATE(revenue) FROM f;
 -- Works
 WITH f AS (SELECT * FROM sales_v)
 SELECT year, AGGREGATE(revenue) FROM f WHERE region = 'East';
+```
+
+A plain view or derived table over a measure view is rejected for the grouped
+form whether or not it filters, because its definition is not visible when the
+query is rewritten. Query the measure view directly or through a CTE, or define
+the measure in the filtering view itself:
+
+```sql
+-- Error: measure revenue is read through east_v, which does not define it
+CREATE VIEW east_v AS SELECT * FROM sales_v WHERE region = 'East';
+SELECT year, AGGREGATE(revenue) FROM east_v;
+
+-- Works: the view's WHERE is part of the measure's rows
+CREATE VIEW east_v AS
+SELECT year, region, SUM(amount) AS MEASURE revenue FROM sales WHERE region = 'East';
+SELECT year, AGGREGATE(revenue) FROM east_v;
 ```

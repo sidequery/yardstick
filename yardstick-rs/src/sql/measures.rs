@@ -5512,11 +5512,25 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMe
     }
 }
 
+/// How a measure reference will be lowered, which decides what the relation it
+/// is read from must provide.
+#[derive(Clone, Copy)]
+enum MeasureLowering<'a> {
+    /// Text-based lowering without native query scopes; relations are not traced.
+    Legacy,
+    /// Recomputes from the defining view, so the relation must lead back to
+    /// that view without removing rows. Holds the relations in the SELECT's own
+    /// FROM clause, in order; tables nested in derived tables are not among them.
+    Grouped(&'a [parser_ffi::TableRef]),
+    /// Carries row lineage through the relation it reads.
+    Window,
+}
+
 fn resolve_query_measure(
     reference: &str,
     default_table: &str,
     from_info: &FromClauseInfo,
-    keeps_row_lineage: bool,
+    lowering: MeasureLowering<'_>,
 ) -> ResolvedMeasure {
     let column = strip_measure_qualifier(reference);
     let qualifier = parse_simple_measure_ref(reference).and_then(|(qualifier, _)| qualifier);
@@ -5533,21 +5547,63 @@ fn resolve_query_measure(
     if let Some(view) = get_measure_view(relation) {
         return resolve_measure_source(&column, &view.view_name);
     }
-    match parser_ffi::resolve_measure_reference(relation, &column) {
-        Some(Ok(origin)) => {
-            if let (false, Some(error)) = (keeps_row_lineage, origin.row_loss) {
-                FILTER_REWRITE_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
-            }
-            if let Some((Some(view), measure)) = parse_simple_measure_ref(&origin.reference) {
-                if let Some(view) = get_measure_view(&view) {
-                    return resolve_measure_source(&measure, &view.view_name);
+    // Follow a CTE back to the view that defines the measure it passes through.
+    let through_cte = |cte: &str, report_missing: bool| -> Option<ResolvedMeasure> {
+        match parser_ffi::resolve_measure_reference(cte, &column) {
+            Some(Ok(origin)) => {
+                if let (MeasureLowering::Grouped(_), Some(error)) = (lowering, origin.row_loss) {
+                    FILTER_REWRITE_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
                 }
+                let (view, measure) = match parse_simple_measure_ref(&origin.reference) {
+                    Some((Some(view), measure)) => (view, measure),
+                    _ => return None,
+                };
+                get_measure_view(&view).map(|view| resolve_measure_source(&measure, &view.view_name))
             }
+            Some(Err(error)) => {
+                if report_missing {
+                    FILTER_REWRITE_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
+                }
+                None
+            }
+            None => None,
         }
-        Some(Err(error)) => FILTER_REWRITE_ERROR.with(|slot| *slot.borrow_mut() = Some(error)),
-        None => {}
+    };
+    if let Some(resolved) = through_cte(relation, true) {
+        return resolved;
     }
-    resolve_measure_source(&column, relation)
+    let MeasureLowering::Grouped(from_relations) = lowering else {
+        return resolve_measure_source(&column, relation);
+    };
+    // An unqualified measure may belong to another relation in the join. Search
+    // only what this SELECT reads, so a same-named measure elsewhere in the
+    // session cannot be picked up.
+    for joined in from_relations {
+        let resolved = if joined.is_subquery {
+            through_cte(&joined.table_name, false)
+        } else {
+            get_measure_view(&joined.table_name)
+                .filter(|view| view.measures.iter().any(|measure| measure.column_name.eq_ignore_ascii_case(&column)))
+                .map(|view| resolve_measure_source(&column, &view.view_name))
+        };
+        if let Some(resolved) = resolved {
+            return resolved;
+        }
+    }
+    let resolved = resolve_measure_source(&column, relation);
+    // The name matched a view this query does not read: the measure arrived
+    // through a plain view or derived table whose filters and projection are
+    // unknown here, so recomputing from the defining view could silently
+    // return rows that relation removed.
+    if !resolved.source_view.eq_ignore_ascii_case(relation) {
+        let through = if relation == "(subquery)" { "a derived table" } else { relation };
+        // The name match may come from an unrelated view, so do not name it.
+        FILTER_REWRITE_ERROR.with(|slot| *slot.borrow_mut() = Some(format!(
+            "Measure {column} is read through {through}, which does not define it. \
+             Query the view that defines the measure directly or through a CTE"
+        )));
+    }
+    resolved
 }
 
 /// Find the alias used for a view in the FROM clause
@@ -7486,7 +7542,7 @@ fn expand_window_measure_query(
                     })
                 })
                 .unwrap_or(primary);
-            let resolved = resolve_query_measure(&call.measure_name, &relation.name, &from, true);
+            let resolved = resolve_query_measure(&call.measure_name, &relation.name, &from, MeasureLowering::Window);
             let view = get_measure_view(&resolved.source_view)
                 .ok_or_else(|| format!("Unknown window measure {}", call.measure_name))?;
             let source_alias = if relation.name.eq_ignore_ascii_case(&resolved.source_view)
@@ -7738,6 +7794,17 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
         (table_name, alias)
     };
 
+    // A measure matched by name must come from a relation in this SELECT's own
+    // FROM clause. Text-based FROM extraction also sees tables nested inside
+    // derived tables, so ask the parser; without it, relations are not traced.
+    let from_relations = if native_scope {
+        parser_ffi::parse_select(context_sql).ok().map(|info| info.tables)
+    } else {
+        None
+    };
+    let lowering = from_relations.as_deref()
+        .map_or(MeasureLowering::Legacy, MeasureLowering::Grouped);
+
     // Extract outer WHERE clause for VISIBLE semantics
     let outer_where = extract_where_clause(context_sql);
     let outer_where_ref = outer_where.as_deref();
@@ -7822,7 +7889,7 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
             .find(|call| call.start_pos as usize == start && call.has_decorations && !call.is_window);
         let measure_lookup_name = strip_measure_qualifier(&measure_name);
         // Look up which view contains this measure (for JOIN support)
-        let resolved = resolve_query_measure(&measure_name, &primary_table_name, &from_info, false);
+        let resolved = resolve_query_measure(&measure_name, &primary_table_name, &from_info, lowering);
         let joined_visibility = visible_join_filter(&join_context_sql, outer_where_ref, &resolved, &from_info);
         let outer_where_ref = joined_visibility.as_deref().or(outer_where_ref);
         let mut measure_group_by_cols = filter_group_by_cols_for_measure(
@@ -8023,7 +8090,7 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
             replacement_end = end + leading_ws + DEFAULT_CONTEXT_MARKER.len();
         }
 
-        let resolved = resolve_query_measure(&measure_name, &primary_table_name, &from_info, false);
+        let resolved = resolve_query_measure(&measure_name, &primary_table_name, &from_info, lowering);
         let joined_visibility = visible_join_filter(&join_context_sql, outer_where_ref, &resolved, &from_info);
         let outer_where_ref = joined_visibility.as_deref().or(outer_where_ref);
         let mut measure_group_by_cols = filter_group_by_cols_for_measure(
