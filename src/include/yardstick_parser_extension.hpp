@@ -37,8 +37,21 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
                                                 ParserOptions &options);
 
 // Operator extension: handles binding after parsing
+#if YARDSTICK_GRAMMAR_EXTENSION
+struct YardstickOperatorInfo : public OperatorExtensionInfo {
+    explicit YardstickOperatorInfo(shared_ptr<ParserExtensionInfo> parser_info)
+        : parser_info(std::move(parser_info)) {}
+    shared_ptr<ParserExtensionInfo> parser_info;
+};
+#endif
+
 struct YardstickOperatorExtension : public OperatorExtension {
-    YardstickOperatorExtension() : OperatorExtension() { Bind = yardstick_bind; }
+    explicit YardstickOperatorExtension(shared_ptr<ParserExtensionInfo> parser_info = nullptr) : OperatorExtension() {
+        Bind = yardstick_bind;
+#if YARDSTICK_GRAMMAR_EXTENSION
+        operator_info = make_shared_ptr<YardstickOperatorInfo>(std::move(parser_info));
+#endif
+    }
     std::string GetName() override { return "yardstick"; }
     unique_ptr<LogicalExtensionOperator>
     Deserialize(Deserializer &deserializer) override {

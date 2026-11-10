@@ -843,8 +843,18 @@ ORDER BY region;
 EU	33.3
 US	66.7
 
-query TR
+# The outer SET runs first; the inner ALL removes it and warns about year.
+statement error
 SELECT region, AGGREGATE(revenue) AT (ALL year) AT (SET year = 2023) AS region_total
+FROM sales_v
+WHERE year = 2023
+GROUP BY region
+ORDER BY region;
+----
+does not preserve outer WHERE
+
+query TR
+SELECT region, AGGREGATE(revenue) AT (SET year = 2023) AT (ALL year) AS region_total
 FROM sales_v
 WHERE year = 2023
 GROUP BY region
@@ -870,12 +880,15 @@ WHERE year = 2023
 GROUP BY region;
 ----
 
-statement error
+# ALL removes region; VISIBLE restores only year, so CURRENT(region) is NULL.
+query TR rowsort
 SELECT region, AGGREGATE(revenue) AT (ALL region VISIBLE SET region = CURRENT(region)) AS region_total
 FROM sales_v
 WHERE year = 2023
 GROUP BY region;
 ----
+EU	NULL
+US	NULL
 
 statement ok
 CREATE TABLE alias_warning_sales (fiscal_year INT, region TEXT, amount DOUBLE);
@@ -939,12 +952,14 @@ WHERE year = 2023
 GROUP BY year, region;
 ----
 
-statement error
+query ITR rowsort
 SELECT year, region, AGGREGATE(revenue) AT (SET year = 2023) AT (ALL year) AS region_total
 FROM sales_v
 WHERE year = 2023
 GROUP BY year, region;
 ----
+2023	EU	75.0
+2023	US	150.0
 
 statement error
 CREATE TABLE ctas_warning_result AS
@@ -1754,11 +1769,11 @@ query IRR rowsort
 SEMANTIC SELECT
     year,
     AGGREGATE(revenue) AT (SET year = year - 1) as prior_year,
-    AGGREGATE(revenue) AT (SET year = year - 1) AT (ALL year) as prior_grand
+    AGGREGATE(revenue) AT (SET year = year - 1) AT (ALL year) as prior_after_all
 FROM sales_yearly;
 ----
-2022	NULL	375.0
-2023	150.0	375.0
+2022	NULL	NULL
+2023	150.0	150.0
 
 # =============================================================================
 # Test: Negative and zero values
@@ -3294,7 +3309,7 @@ GROUP BY ROLLUP(o.prodName)
 ORDER BY o.prodName;
 ----
 Happy	2	13	13	17
-NULL	3	NULL	NULL	NULL
+NULL	3	16	16	20
 Whizz	1	3	3	3
 
 # Measures/CSEs should be valid in HAVING, and respect context semantics.

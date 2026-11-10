@@ -1,0 +1,73 @@
+# name: test/sql/review_temporary_alias_batches.test
+# description: Alias-dependent consumers preserve the temporary measure batch lifecycle.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE review_batch_sales(year INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO review_batch_sales VALUES (2023, 15), (2023, 15), (2024, 20);
+
+statement ok
+CREATE TEMP VIEW review_batch_temp AS
+SELECT year, SUM(amount) AS MEASURE batch_revenue FROM review_batch_sales;
+CREATE TABLE review_batch_result AS
+SELECT year, AGGREGATE(batch_revenue) AS r, r + 1 AS next
+FROM review_batch_temp GROUP BY year;
+
+query III rowsort
+SELECT * FROM review_batch_result;
+----
+2023	30	31
+2024	20	21
+
+# The consumer needs bind-time alias handling, but its temporary measure
+# definition still expires when semantic lowering of this batch finishes.
+statement error
+SELECT year, AGGREGATE(batch_revenue) FROM review_batch_temp GROUP BY year;
+----
+Table with name review_batch_temp does not exist
+
+statement ok
+CREATE VIEW review_batch_shadow AS
+SELECT year, SUM(amount) AS MEASURE shadow_revenue FROM review_batch_sales;
+
+statement ok
+CREATE TEMP VIEW review_batch_shadow AS
+SELECT year, SUM(amount * 10) AS MEASURE shadow_revenue FROM review_batch_sales;
+CREATE TABLE review_batch_shadow_result AS
+SELECT year, AGGREGATE(shadow_revenue) AS r, r + 1 AS next
+FROM review_batch_shadow GROUP BY year;
+
+query III rowsort
+SELECT * FROM review_batch_shadow_result;
+----
+2023	300	301
+2024	200	201
+
+query II rowsort
+SELECT year, AGGREGATE(shadow_revenue) FROM review_batch_shadow GROUP BY year;
+----
+2023	30
+2024	20
+
+statement error
+CREATE TEMP VIEW review_batch_unused AS
+SELECT year, SUM(amount) AS MEASURE unused_revenue FROM review_batch_sales;
+CREATE TABLE review_batch_unused_result AS
+SELECT year, AGGREGATE(shadow_revenue) AS r, r + 1 AS next
+FROM review_batch_shadow GROUP BY year;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE\(\)|Parser Error).*
+
+statement error
+CREATE TEMP VIEW review_batch_direct AS
+SELECT year, SUM(amount) AS MEASURE direct_revenue FROM review_batch_sales;
+SELECT year, AGGREGATE(direct_revenue) AS r, r + 1 AS next
+FROM review_batch_direct GROUP BY year;
+----
+<REGEX>:.*(TEMPORARY AS MEASURE views|Parser Error).*

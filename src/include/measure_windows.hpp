@@ -9,6 +9,12 @@
 
 namespace duckdb {
 
+class SelectNode;
+class QueryNode;
+
+// Expand visible projection stars before adding hidden provenance columns.
+void ExpandNativeMeasureProjectionStars(SelectNode &select, const vector<QueryNode *> &scopes = {});
+
 enum class WindowContextType { ALL, ALL_GLOBAL, SET, WHERE, VISIBLE };
 
 struct WindowContextModifier {

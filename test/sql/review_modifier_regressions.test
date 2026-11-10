@@ -1,0 +1,224 @@
+# name: test/sql/review_modifier_regressions.test
+# description: Modifier composition follows Measures in SQL §3.5, preserving separable visible predicates.
+# group: [yardstick]
+
+require yardstick
+
+statement ok
+CREATE TABLE modifier_review_sales(y INTEGER, r VARCHAR, a INTEGER);
+
+statement ok
+INSERT INTO modifier_review_sales VALUES (2023,'N',10),(2023,'S',20),(2024,'N',40),(2024,'S',80);
+
+statement ok
+CREATE VIEW modifier_review_v AS
+SELECT y,r,SUM(a) AS MEASURE review_m,COUNT(*) AS MEASURE review_n FROM modifier_review_sales;
+
+statement ok
+SET enable_logging=true;
+
+statement ok
+SET warnings_as_errors=true;
+
+# ALL followed by VISIBLE restores filters and must not emit a loss warning.
+query I
+SELECT AGGREGATE(review_m) AT (ALL VISIBLE) FROM modifier_review_v WHERE r='N';
+----
+50
+
+statement error
+SELECT * FROM yardstick($$SELECT AGGREGATE(review_m) AT (VISIBLE ALL)
+FROM modifier_review_v WHERE r='N'$$);
+----
+does not preserve outer WHERE
+
+statement ok
+SET warnings_as_errors=false;
+
+# Combined clauses run in written order; chained clauses run outside inward.
+query IIII
+SELECT AGGREGATE(review_m) AT (WHERE r='N' VISIBLE),
+       AGGREGATE(review_m) AT (VISIBLE WHERE r='N'),
+       AGGREGATE(review_m) AT (WHERE r='N') AT (VISIBLE),
+       AGGREGATE(review_m) AT (VISIBLE) AT (WHERE r='N')
+FROM modifier_review_v WHERE y=2023;
+----
+10	50	50	10
+
+# WHERE resets the grouping context as well as explicit predicates.
+query II rowsort
+SELECT y,AGGREGATE(review_m) AT (WHERE r='N') FROM modifier_review_v GROUP BY y;
+----
+2023	50
+2024	50
+
+# ALL is a reset at its position, and SET replaces the existing target terms.
+query IIIIII
+SELECT AGGREGATE(review_m) AT (WHERE r='N' ALL),
+       AGGREGATE(review_m) AT (ALL WHERE r='N'),
+       AGGREGATE(review_m) AT (ALL SET y=2023),
+       AGGREGATE(review_m) AT (SET y=2023 ALL),
+       AGGREGATE(review_m) AT (SET y=2023 SET y=2024),
+       AGGREGATE(review_m) AT (WHERE r='N' SET y=2024)
+FROM modifier_review_v;
+----
+150	50	30	150	120	40
+
+query IIII
+SELECT AGGREGATE(review_m) AT (SET y=2024 WHERE r='N'),
+       AGGREGATE(review_m) AT (VISIBLE ALL y),
+       AGGREGATE(review_m) AT (VISIBLE ALL r),
+       AGGREGATE(review_m) AT (VISIBLE ALL)
+FROM modifier_review_v WHERE y=2023 AND r='N';
+----
+50	50	30	150
+
+query II
+SELECT AGGREGATE(review_m) AT (ALL VISIBLE),
+       AGGREGATE(review_m) AT (VISIBLE SET y=2024)
+FROM modifier_review_v WHERE y=2023;
+----
+30	120
+
+# VISIBLE adds its predicates, so it can constrain a dimension after SET.
+query I
+SELECT AGGREGATE(review_m) AT (SET y=2024 VISIBLE)
+FROM modifier_review_v WHERE y=2023;
+----
+NULL
+
+# CURRENT observes preceding transformations, not only the original query.
+query IIII
+SELECT AGGREGATE(review_m) AT (SET y=2024 SET y=CURRENT y-1),
+       AGGREGATE(review_m) AT (WHERE y=2024 SET y=CURRENT y-1),
+       AGGREGATE(review_m) AT (SET y=CURRENT y-1) AT (SET y=2024),
+       AGGREGATE(review_m) AT (SET y=2024 WHERE y=CURRENT y-1)
+FROM modifier_review_v;
+----
+30	30	30	30
+
+query I
+SELECT AGGREGATE(review_m) AT (SET y=2024 ALL SET y=COALESCE(CURRENT y,2023))
+FROM modifier_review_v;
+----
+30
+
+# Replacing year retains the independent JOIN restriction on region.
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v JOIN (VALUES ('N')) regions(r) USING(r) WHERE y=2024;
+----
+2024	10
+
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v JOIN (VALUES (2024,'N')) allowed(y,r) USING(y,r) WHERE y=2024;
+----
+2024	10
+
+query II
+SELECT v.y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v v JOIN (VALUES (2024,'N')) allowed(y,r)
+ON v.y=allowed.y AND v.r=allowed.r WHERE v.y=2024;
+----
+2024	10
+
+# VISIBLE includes join restrictions even when no WHERE is present. Duplicate
+# matches select a base row once rather than multiplying the measure's inputs.
+query I
+SELECT AGGREGATE(review_m) AT (VISIBLE)
+FROM modifier_review_v JOIN (VALUES ('N'),('N')) regions(r) USING(r);
+----
+50
+
+# These predicates are separable after De Morgan and distributive absorption.
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v WHERE NOT (y<>2024 OR r<>'N');
+----
+2024	10
+
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v WHERE (y=2024 AND r='N') OR (y=2025 AND r='N');
+----
+2024	10
+
+# Normalization retains SQL NULL semantics.
+statement ok
+INSERT INTO modifier_review_sales VALUES (2023,NULL,2),(2024,NULL,5);
+
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v WHERE NOT (y<>2024 OR r<>'N');
+----
+2024	10
+
+query II
+SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v WHERE NOT (y<>2024 OR r IS DISTINCT FROM NULL);
+----
+2024	2
+
+# An inseparable disjunction still requires an explicit context choice.
+statement error
+SELECT * FROM yardstick($$SELECT y,AGGREGATE(review_m) AT (VISIBLE SET y=y-1)
+FROM modifier_review_v WHERE y=2024 OR r='N'$$);
+----
+mixed VISIBLE predicate
+
+# Repeated volatile calls are distinct evaluations, even when their parsed
+# expressions are identical. Disable optimizer rewrites to test Yardstick alone.
+statement ok
+PRAGMA disable_optimizer;
+
+statement ok
+CREATE TABLE volatile_review_sales(y INTEGER,r VARCHAR,a INTEGER);
+
+statement ok
+INSERT INTO volatile_review_sales VALUES (2024,'N',40),(2024,'S',80);
+
+statement ok
+CREATE VIEW volatile_review_v AS SELECT y,r,SUM(a) AS MEASURE volatile_review_m FROM volatile_review_sales;
+
+statement ok
+CREATE SEQUENCE volatile_review_expected START 1;
+
+statement ok
+CREATE SEQUENCE volatile_review_actual START 1;
+
+query I
+SELECT SUM(a) FROM volatile_review_sales
+WHERE y=2024 AND (nextval('volatile_review_expected')%3=0 OR nextval('volatile_review_expected')%3=0);
+----
+40
+
+query I
+SELECT AGGREGATE(volatile_review_m) AT (
+    WHERE y=2023 AND (nextval('volatile_review_actual')%3=0 OR nextval('volatile_review_actual')%3=0)
+    SET y=2024
+) FROM volatile_review_v;
+----
+40
+
+query II
+SELECT currval('volatile_review_expected'),currval('volatile_review_actual');
+----
+4	4
+
+statement error
+SELECT * FROM yardstick($$SELECT AGGREGATE(volatile_review_m) AT (
+    WHERE (y=2023 AND nextval('volatile_review_actual')%3=0)
+       OR (y=2025 AND nextval('volatile_review_actual')%3=0)
+    SET y=2024
+) FROM volatile_review_v$$);
+----
+cannot safely normalize
+
+query I
+SELECT currval('volatile_review_actual');
+----
+4
+
+statement ok
+PRAGMA enable_optimizer;

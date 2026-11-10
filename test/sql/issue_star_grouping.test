@@ -1,0 +1,49 @@
+# name: test/sql/issue_star_grouping.test
+# description: Explicit grouping retains dimensions omitted from the projection of star measure views (#64).
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE issue64_sales(id INTEGER, year INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO issue64_sales VALUES (1, 2023, 'North', 15), (2, 2023, 'North', 22),
+(3, 2023, 'South', 18), (4, 2023, 'East', 25), (5, 2024, 'North', 28);
+
+statement ok
+CREATE VIEW issue64_star AS
+SELECT *, SUM(amount) AS MEASURE revenue, COUNT(*) AS MEASURE order_count
+FROM issue64_sales;
+
+statement ok
+CREATE VIEW issue64_explicit AS
+SELECT id, year, region, amount, SUM(amount) AS MEASURE revenue, COUNT(*) AS MEASURE order_count
+FROM issue64_sales;
+
+# The selected year repeats once for each region, although region is not selected.
+query II rowsort
+SELECT year, AGGREGATE(revenue) AT (VISIBLE)
+FROM issue64_star WHERE year = 2023 GROUP BY region, year;
+----
+2023	18
+2023	25
+2023	37
+
+query II rowsort
+SELECT year, AGGREGATE(revenue) AT (VISIBLE)
+FROM issue64_explicit WHERE year = 2023 GROUP BY region, year;
+----
+2023	18
+2023	25
+2023	37
+
+query III rowsort
+SELECT s.year, AGGREGATE(s.revenue), AGGREGATE(s.order_count)
+FROM issue64_star s WHERE s.year = 2023 GROUP BY s.region, s.year;
+----
+2023	18	1
+2023	25	1
+2023	37	2

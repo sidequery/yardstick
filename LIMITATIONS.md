@@ -43,3 +43,35 @@ SELECT AGGREGATE(running_total) AT (WHERE year = 2024) FROM v;
 -- Error: AT context produced multiple distinct window values
 SELECT year, AGGREGATE(running_total) AT (ALL) FROM v GROUP BY year;
 ```
+
+### 2. SET with Mixed VISIBLE Predicates
+
+`AT (VISIBLE SET year = year - 1)` preserves independent visible predicates,
+such as `year = 2024 AND region = 'North'`, while replacing the year restriction.
+Separable boolean expressions are normalized first, including negated
+disjunctions and factored predicates. If a predicate still combines the shifted
+dimension with another dimension, such as `year = 2024 OR region = 'North'`,
+Yardstick rejects the rewrite because it cannot remove just the year
+restriction. Use `AT (WHERE ...)` to state the intended filter explicitly.
+Normalization that could duplicate or merge volatile function calls is rejected
+as well; independent predicates retain their original calls.
+
+### 3. Grouped Measures Read Through a Filtering CTE
+
+A CTE or derived table that passes a measure through while removing rows
+(`WHERE`, `GROUP BY`, `HAVING`, `QUALIFY`, `DISTINCT`, `LIMIT`, or sampling)
+cannot feed a grouped `AGGREGATE()`. The grouped form recomputes from the
+measure's defining view, and `VISIBLE` covers only the consuming query's own
+`WHERE`, so the removed rows would silently return. Yardstick rejects the query;
+apply the filter in the consuming query instead. Window measures carry row
+lineage and honor the CTE's rows.
+
+```sql
+-- Error: measure is read through f, which filters its rows
+WITH f AS (SELECT * FROM sales_v WHERE region = 'East')
+SELECT year, AGGREGATE(revenue) FROM f;
+
+-- Works
+WITH f AS (SELECT * FROM sales_v)
+SELECT year, AGGREGATE(revenue) FROM f WHERE region = 'East';
+```

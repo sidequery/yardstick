@@ -127,11 +127,12 @@ FROM native_sales_v;
 2022	150.0
 2023	150.0
 
+# WHERE replaces the preceding grouping context after ALL region.
 query IR rowsort
 SELECT year, "AGGREGATE"(native_revenue) AT (ALL region/* compound trivia */WHERE year = 2023)
 FROM native_sales_v;
 ----
-2022	NULL
+2022	225.0
 2023	225.0
 
 query R

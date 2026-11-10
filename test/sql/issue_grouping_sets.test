@@ -1,0 +1,84 @@
+# name: test/sql/issue_grouping_sets.test
+# description: Measure subtotals follow actual grouping sets, including real NULL dimensions (#56).
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE issue56_sales(year INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO issue56_sales VALUES (2023, 'North', 15), (2023, 'North', 22),
+(2023, 'East', 25), (2024, 'North', 28), (2023, NULL, 10);
+
+statement ok
+CREATE VIEW issue56_v AS
+SELECT year, region, SUM(amount) AS MEASURE revenue, COUNT(*) AS MEASURE order_count
+FROM issue56_sales;
+
+# GROUPING distinguishes a real NULL region from the grand-total row.
+query TIIII rowsort
+SELECT region, year, AGGREGATE(order_count), GROUPING(region), GROUPING(year)
+FROM issue56_v GROUP BY ROLLUP(region, year);
+----
+East	2023	1	0	0
+East	NULL	1	0	1
+NULL	2023	1	0	0
+NULL	NULL	1	0	1
+NULL	NULL	5	1	1
+North	2023	2	0	0
+North	2024	1	0	0
+North	NULL	3	0	1
+
+query TIII rowsort
+SELECT region, year, AGGREGATE(revenue), AGGREGATE(order_count)
+FROM issue56_v GROUP BY GROUPING SETS ((region), (year), ());
+----
+East	NULL	25	1
+NULL	2023	72	4
+NULL	2024	28	1
+NULL	NULL	10	1
+NULL	NULL	100	5
+North	NULL	65	3
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, year, AGGREGATE(order_count) AS orders
+    FROM issue56_v GROUP BY CUBE(region, year)
+) totals WHERE orders > 0;
+----
+10
+
+query TII rowsort
+SELECT region, year, AGGREGATE(order_count) AS orders
+FROM issue56_v GROUP BY ROLLUP(region, year) HAVING orders > 1;
+----
+NULL	NULL	5
+North	2023	2
+North	NULL	3
+
+# Same-named dimensions from different relations retain their identities.
+query IIIII rowsort
+SELECT s.year, y.year, AGGREGATE(s.order_count), GROUPING(s.year), GROUPING(y.year)
+FROM issue56_v s JOIN (SELECT DISTINCT year FROM issue56_sales) y ON s.year = y.year
+GROUP BY GROUPING SETS ((s.year), (y.year), ());
+----
+2023	NULL	4	0	1
+2024	NULL	1	0	1
+NULL	2023	4	1	0
+NULL	2024	1	1	0
+NULL	NULL	5	1	1
+
+# JOIN predicates run before grouping; internal context markers must be removed
+# without inserting GROUPING calls into the ON clause.
+query I rowsort
+SELECT s.year
+FROM issue56_v s JOIN (SELECT 1 AS minimum) threshold
+ON threshold.minimum < AGGREGATE(s.revenue) AT (WHERE region = 'North')
+GROUP BY ROLLUP(s.year);
+----
+2023
+2024
+NULL

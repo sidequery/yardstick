@@ -1,0 +1,226 @@
+# name: test/sql/review_grouping_alias_settings.test
+# description: Grouping dimensions, alias precedence, and query namespace match DuckDB.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE review_grouping_sales(region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO review_grouping_sales VALUES ('East', 10), ('North', 20), (NULL, 5);
+
+statement ok
+CREATE VIEW review_grouping_v AS SELECT region, amount, SUM(amount) AS MEASURE revenue FROM review_grouping_sales;
+
+query TII
+SELECT region AS r, AGGREGATE(revenue), GROUPING(region)
+FROM review_grouping_v GROUP BY ROLLUP(r) ORDER BY GROUPING(region), r NULLS LAST;
+----
+East	10	0
+North	20	0
+NULL	5	0
+NULL	35	1
+
+# A slice span includes its source operand, while preserving its SELECT alias
+# and the neighboring projection.
+query TTI
+SELECT 'kept' AS tag, region[1:1] AS initial, AGGREGATE(revenue)
+FROM review_grouping_v GROUP BY ROLLUP(region[1:1])
+ORDER BY GROUPING(region[1:1]), initial NULLS LAST;
+----
+kept	E	10
+kept	N	20
+kept	NULL	5
+kept	NULL	35
+
+query TII
+SELECT region, AGGREGATE(revenue), GROUPING(region)
+FROM review_grouping_v GROUP BY ROLLUP(1) ORDER BY GROUPING(region), region NULLS LAST;
+----
+East	10	0
+North	20	0
+NULL	5	0
+NULL	35	1
+
+# The input column wins over a SELECT alias in GROUP BY, even when the
+# projection applies a scalar function to that same input column.
+query TII
+SELECT upper(region) AS region, AGGREGATE(revenue), GROUPING(region)
+FROM review_grouping_v GROUP BY ROLLUP(region) ORDER BY GROUPING(region), region NULLS LAST;
+----
+EAST	10	0
+NORTH	20	0
+NULL	5	0
+NULL	35	1
+
+statement ok
+CREATE TABLE review_alias_sales(year INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO review_alias_sales VALUES (2023, 'North', 15), (2023, 'North', 15), (2024, 'North', 20);
+
+statement ok
+CREATE VIEW review_alias_v AS SELECT year, region, amount, SUM(amount) AS MEASURE revenue FROM review_alias_sales;
+
+query III rowsort
+SELECT year, AGGREGATE(revenue) AS amount, amount + 1 AS next
+FROM review_alias_v GROUP BY year, amount HAVING amount >= 15;
+----
+2023	30	16
+2024	20	21
+
+query II
+SELECT year, AGGREGATE(revenue) AS amount
+FROM review_alias_v GROUP BY year, amount ORDER BY amount + 1;
+----
+2024	20
+2023	30
+
+query II
+SELECT year, AGGREGATE(revenue) AS amount
+FROM review_alias_v GROUP BY year, amount HAVING amount = 15;
+----
+2023	30
+
+# Source-schema probes must retain CTE bindings while alias precedence is resolved.
+query II rowsort
+WITH c AS (SELECT * FROM review_alias_v)
+SELECT year, AGGREGATE(revenue) AS r FROM c GROUP BY year;
+----
+2023	30
+2024	20
+
+query III rowsort
+WITH c AS (SELECT * FROM review_alias_v)
+SELECT year, AGGREGATE(revenue) AS amount, amount + 1 AS next
+FROM c GROUP BY year, amount;
+----
+2023	30	16
+2024	20	21
+
+query II
+WITH c AS (SELECT * FROM review_alias_v)
+SELECT year, AGGREGATE(revenue) AS amount FROM c GROUP BY year, amount HAVING amount = 15;
+----
+2023	30
+
+query II rowsort
+SELECT * FROM yardstick('WITH c AS (SELECT * FROM review_alias_v) SELECT year, AGGREGATE(revenue) FROM c GROUP BY year');
+----
+2023	30
+2024	20
+
+# A CTE that removes rows cannot feed a grouped measure, which recomputes from
+# the defining view. The same filter in the consuming query is visible.
+statement error
+WITH c AS (SELECT * FROM review_alias_v WHERE amount > 15)
+SELECT region, AGGREGATE(revenue) FROM c GROUP BY region;
+----
+which filters, groups, or limits its rows
+
+statement error
+WITH c AS (SELECT * FROM review_alias_v LIMIT 1)
+SELECT region, AGGREGATE(revenue) FROM c GROUP BY region;
+----
+which filters, groups, or limits its rows
+
+query TI
+WITH c AS (SELECT * FROM review_alias_v)
+SELECT region, AGGREGATE(revenue) FROM c WHERE amount > 15 GROUP BY region;
+----
+North	20
+
+# Window measures carry row lineage and honor the CTE's filter.
+query TI
+WITH c AS (SELECT * FROM review_alias_v WHERE amount > 15)
+SELECT DISTINCT region, AGGREGATE(revenue) OVER (PARTITION BY region) FROM c;
+----
+North	20
+
+# Session search_path and its schema alias live outside the generic settings.
+statement ok
+CREATE SCHEMA review_foo;
+
+statement ok
+CREATE SCHEMA review_bar;
+
+statement ok
+CREATE TABLE review_foo.only_foo AS SELECT 9 AS value;
+
+statement ok
+CREATE TABLE review_foo.same_name AS SELECT 1 AS value;
+
+statement ok
+CREATE TABLE review_bar.same_name AS SELECT 2 AS value;
+
+statement ok
+SET search_path='review_foo,review_bar';
+
+query II
+SELECT (SELECT value FROM only_foo), (SELECT * FROM yardstick('SELECT value FROM only_foo'));
+----
+9	9
+
+query I
+SELECT * FROM yardstick('SELECT value FROM same_name');
+----
+1
+
+statement ok
+SET search_path='review_bar,review_foo';
+
+query I
+SELECT * FROM yardstick('SELECT value FROM same_name');
+----
+2
+
+statement ok
+SET schema='review_foo';
+
+query I
+SELECT * FROM yardstick('SELECT value FROM only_foo');
+----
+9
+
+statement ok
+ATTACH ':memory:' AS review_catalog;
+
+statement ok
+CREATE TABLE review_catalog.main.catalog_value AS SELECT 7 AS value;
+
+statement ok
+USE review_catalog;
+
+query I
+SELECT * FROM yardstick('SELECT value FROM catalog_value');
+----
+7
+
+statement ok
+USE memory;
+
+statement ok
+RESET search_path;
+
+query TI
+SELECT region[1:1], AGGREGATE(revenue)
+FROM review_grouping_v GROUP BY ROLLUP(region[1:1])
+ORDER BY GROUPING(region[1:1]), region[1:1] NULLS LAST;
+----
+E	10
+N	20
+NULL	5
+NULL	35
+
+query TII
+SELECT region[1:1], AGGREGATE(revenue), GROUPING(region[1:1])
+FROM review_grouping_v GROUP BY ROLLUP(region[1:1])
+ORDER BY GROUPING(region[1:1]), region[1:1] NULLS LAST;
+----
+E	10	0
+N	20	0
+NULL	5	0
+NULL	35	1
