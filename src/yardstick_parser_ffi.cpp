@@ -2009,6 +2009,55 @@ extern "C" YardstickSelectInfo* yardstick_parse_select(const char* sql) {
                 return found;
             };
         for (auto& expr : select_node->select_list) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+            // A projection star supplies grouping dimensions that only the FROM
+            // schema can name. With a bind context, replace it by one star item
+            // per column; without one the star stays and its columns are unknown.
+            if (result->native_parsed && expr->GetExpressionClass() == ExpressionClass::STAR &&
+                !expr->Cast<StarExpression>().IsColumns() && CurrentNativeYardstickClientContext() &&
+                select_node->from_table && select_node->from_table->type != TableReferenceType::EMPTY_FROM) {
+                vector<YardstickSelectItem> columns;
+                try {
+                    auto probe = select_node->Copy();
+                    auto &layout = probe->Cast<SelectNode>();
+                    layout.select_list.clear();
+                    layout.select_list.push_back(expr->Copy());
+                    layout.groups = GroupByNode();
+                    layout.where_clause.reset();
+                    layout.having.reset();
+                    layout.qualify.reset();
+                    layout.modifiers.clear();
+                    layout.aggregate_handling = AggregateHandling::STANDARD_HANDLING;
+                    std::vector<YardstickTableRef> sources;
+                    CollectTablesFromTableRef(select_node->from_table.get(), sources, nullptr);
+                    auto bound = BindNativeYardstickProbe(*probe);
+                    for (auto &name : bound.names) {
+                        auto &column = name.GetIdentifierName();
+                        bool measure_column = false;
+                        for (auto &source : sources) {
+                            // A measure's placeholder column is not a dimension.
+                            measure_column |= yardstick_is_measure_column(source.table_name, column.c_str());
+                        }
+                        if (measure_column) continue;
+                        // Still a star item, now naming one of its columns.
+                        // Only callers that ask for star columns read it.
+                        YardstickSelectItem column_item {};
+                        column_item.expression_sql = safe_strdup(make_uniq<ColumnRefExpression>(name)->ToString());
+                        column_item.reference_column = safe_strdup(column);
+                        column_item.is_star = true;
+                        columns.push_back(column_item);
+                    }
+                    for (auto &source : sources) {
+                        free(const_cast<char *>(source.table_name));
+                        free(const_cast<char *>(source.alias));
+                    }
+                    items.insert(items.end(), columns.begin(), columns.end());
+                    continue;
+                } catch (const std::exception &) {
+                    // The star could not be bound here; DuckDB reports it later.
+                }
+            }
+#endif
             YardstickSelectItem item {};
             item.expression_sql = safe_strdup(expr->ToString());
             item.alias = expr->HasAlias() ? safe_strdup(YsName(expr->GetAlias())) : nullptr;
@@ -2369,6 +2418,11 @@ extern "C" bool yardstick_requires_select_alias_binding(const char* sql) {
         auto &select = statement.node->Cast<SelectNode>();
         TableQualifierSet qualifiers;
         CollectTableQualifiers(select.from_table.get(), qualifiers);
+        // A projection star names its columns only through the FROM schema.
+        for (auto &expression : select.select_list) {
+            if (expression->GetExpressionClass() == ExpressionClass::STAR &&
+                !expression->Cast<StarExpression>().IsColumns()) return true;
+        }
         SelectAliasMap aliases;
         std::function<bool(const ParsedExpression &)> references_alias = [&](const ParsedExpression &expression) {
             SelectAliasMap::const_iterator entry;

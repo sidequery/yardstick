@@ -140,6 +140,17 @@ SELECT year, ROUND(ratio, 2) FROM issue_ratio;
 2023	18.33
 2024	27.75
 
+# A projection star next to a grand total keeps its grouping.
+query ITI rowsort
+SELECT * EXCLUDE (amount, issue_revenue, issue_count), AGGREGATE(issue_revenue) AT (ALL)
+FROM issue_sales_v GROUP BY ALL;
+----
+2023	North	166
+2023	South	166
+2024	East	166
+2024	North	166
+2024	South	166
+
 # HAVING evaluates the measure at the same expression grain.
 query IT rowsort
 SELECT year, UPPER(region) AS a FROM issue_sales_v GROUP BY ALL HAVING AGGREGATE(issue_count)>1;
@@ -189,12 +200,6 @@ WHERE amount>avg_amount GROUP BY year;
 ----
 2023	1	22
 2024	3	82
-
-statement error
-SELECT * FROM yardstick($$SELECT year, AGGREGATE(star_revenue) AT (VISIBLE SET year=year-1) FROM issue_star_v
-JOIN (SELECT 'North' AS region) r ON r.region=issue_star_v.region GROUP BY year$$);
-----
-needs the measure view to list its columns
 
 # #54: VISIBLE retains independent filters when SET changes the year.
 query II rowsort

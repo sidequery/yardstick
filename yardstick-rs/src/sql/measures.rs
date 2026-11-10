@@ -5404,7 +5404,37 @@ fn extract_dimension_columns_from_select_info(info: &SelectInfo) -> Vec<String> 
 
 fn is_star_select_expression(expr: &str) -> bool {
     let trimmed = expr.trim();
-    trimmed == "*" || trimmed.ends_with(".*") || trimmed.starts_with("* ")
+    trimmed == "*" || trimmed.ends_with(".*") || trimmed.starts_with("* ") || trimmed.contains(".* ")
+}
+
+/// Whether the SELECT list has a projection star whose columns the parser did
+/// not list. Listing them needs the FROM schema, which only bind time has.
+fn projection_has_unlisted_star(sql: &str) -> bool {
+    if let Ok(info) = parser_ffi::parse_select(sql) {
+        return info.items.iter().any(|item| item.is_star && item.reference_column.is_none());
+    }
+    let query = sql.trim().trim_end_matches(';').trim();
+    let Some(select) = find_top_level_keyword(query, "SELECT", 0) else {
+        return false;
+    };
+    let start = select + "SELECT".len();
+    let end = find_top_level_keyword(query, "FROM", start).unwrap_or(query.len());
+    let mut depth = 0i32;
+    let mut item_start = start;
+    let mut items = Vec::new();
+    for (offset, c) in query[start..end].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(&query[item_start..start + offset]);
+                item_start = start + offset + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&query[item_start..end]);
+    items.iter().any(|item| is_star_select_expression(split_item_expr_and_alias(item).0))
 }
 
 // Native AST rendering may quote an identifier that its AT source leaves
@@ -7896,8 +7926,12 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
     if let Some(group_position) = group_position {
         if let Some(content_start) = advance_after_group_by(&sql, group_position) {
             let all_start = skip_ws_and_comments(&sql, content_start);
-            if matches_keyword_at(&sql.to_ascii_uppercase(), all_start, "ALL") {
-                let dimensions = extract_dimension_columns_from_select(&sql);
+            // GROUP BY ALL stays when a projection star's columns are unknown:
+            // an explicit list would leave them out of the grouping.
+            if matches_keyword_at(&sql.to_ascii_uppercase(), all_start, "ALL")
+                && !projection_has_unlisted_star(&sql)
+            {
+                let dimensions = query_dimension_columns(&sql);
                 let explicit_grouping = if dimensions.is_empty() {
                     "()".to_string()
                 } else {
@@ -7981,7 +8015,7 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
     let outer_where_ref = outer_where.as_deref();
 
     // Extract GROUP BY columns for AT (ALL dim) correlation
-    let group_by_cols = extract_group_by_columns(context_sql);
+    let group_by_cols = query_group_by_columns(context_sql);
     // DuckDB resolves a GROUP BY name to an input column first and to a SELECT
     // alias otherwise. Native scopes bind that against the schema; without
     // them the measure view's own columns stand in for it, when they are known.
@@ -8026,7 +8060,7 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
 
     // Extract dimension columns from original SQL for implicit GROUP BY
     // (must be done before expansion since expanded SQL has SUM() etc)
-    let original_dim_cols = extract_dimension_columns_from_select(context_sql);
+    let original_dim_cols = query_dimension_columns(context_sql);
     let effective_group_by_cols = if group_by_cols.is_empty() {
         original_dim_cols.clone()
     } else {
@@ -8576,11 +8610,20 @@ pub fn get_measure_aggregation(column_name: &str) -> Option<(String, String)> {
     None
 }
 
+#[cfg(test)]
 fn extract_group_by_columns(sql: &str) -> Vec<String> {
+    group_by_columns(sql, false)
+}
+
+fn query_group_by_columns(sql: &str) -> Vec<String> {
+    group_by_columns(sql, true)
+}
+
+fn group_by_columns(sql: &str, star_columns: bool) -> Vec<String> {
     if let Ok(info) = parser_ffi::parse_select(sql) {
         if info.has_group_by {
             if info.group_by_all {
-                return extract_dimension_columns_from_select(sql);
+                return select_dimension_columns(sql, star_columns);
             }
             if !info.group_by_cols.is_empty() {
                 let parser_group_by_cols: Vec<String> = info
@@ -8618,7 +8661,7 @@ fn extract_group_by_columns(sql: &str) -> Vec<String> {
         let group_by_query = format!("SELECT 1 GROUP BY {group_by_content}\n");
         if let Ok(info) = parser_ffi::parse_select(&group_by_query) {
             if info.group_by_all {
-                return extract_dimension_columns_from_select(sql);
+                return select_dimension_columns(sql, star_columns);
             }
             let parsed_columns: Vec<String> = info.group_by_cols.into_iter()
                 .map(|column| column.trim().to_string())
@@ -8639,7 +8682,7 @@ fn extract_group_by_columns(sql: &str) -> Vec<String> {
 
     // If no GROUP BY, infer dimension columns from SELECT (non-AGGREGATE columns)
     if columns.is_empty() {
-        columns = extract_dimension_columns_from_select(sql);
+        columns = select_dimension_columns(sql, star_columns);
     }
 
     columns
@@ -8768,10 +8811,22 @@ fn looks_like_sql_aggregate_expr(expr: &str) -> bool {
 }
 
 fn extract_dimension_columns_from_select(sql: &str) -> Vec<String> {
+    select_dimension_columns(sql, false)
+}
+
+/// Dimensions of the querying SELECT, including the columns of a projection
+/// star when the parser could list them. A view definition keeps its star
+/// opaque, so it goes through `extract_dimension_columns_from_select`.
+fn query_dimension_columns(sql: &str) -> Vec<String> {
+    select_dimension_columns(sql, true)
+}
+
+fn select_dimension_columns(sql: &str, star_columns: bool) -> Vec<String> {
     if let Ok(info) = parser_ffi::parse_select(sql) {
         if info.native_parsed {
             return info.items.into_iter()
-                .filter(|item| !item.is_aggregate && !item.is_star && !item.is_measure_ref && !item.contains_window)
+                .filter(|item| !item.is_aggregate && !item.is_measure_ref && !item.contains_window)
+                .filter(|item| !item.is_star || (star_columns && item.reference_column.is_some()))
                 .filter(|item| !is_literal_constant(&item.expression_sql))
                 .flat_map(|item| {
                     if item.contains_subquery {

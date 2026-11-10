@@ -122,6 +122,44 @@ WHERE amount > avg_amount HAVING total >= 1;
 ----
 2024	20
 
+# A projection star supplies grouping dimensions. Its columns are listed from
+# the FROM schema before GROUP BY ALL becomes explicit, and they partition the
+# measure like named columns do.
+query ITI rowsort
+SELECT * EXCLUDE (amount, revenue), AGGREGATE(revenue) AT (ALL) FROM review_alias_v GROUP BY ALL;
+----
+2023	North	50
+2024	North	50
+
+query ITI rowsort
+SELECT * EXCLUDE (amount, revenue), AGGREGATE(revenue) FROM review_alias_v GROUP BY ALL;
+----
+2023	North	30
+2024	North	20
+
+query ITI rowsort
+SELECT v.* EXCLUDE (amount, revenue), AGGREGATE(revenue) FROM review_alias_v v;
+----
+2023	North	30
+2024	North	20
+
+# A `SELECT *` measure view records no column list, so one dimension cannot be
+# released from a join's visibility. Both entry points say so.
+statement ok
+CREATE VIEW review_alias_star_v AS SELECT *, SUM(amount) AS MEASURE star_revenue FROM review_alias_sales;
+
+statement error
+SELECT year, AGGREGATE(star_revenue) AT (VISIBLE SET year=year-1) FROM review_alias_star_v
+JOIN (SELECT 'North' AS region) r ON r.region=review_alias_star_v.region GROUP BY year;
+----
+needs the measure view to list its columns
+
+statement error
+SELECT * FROM yardstick($$SELECT year, AGGREGATE(star_revenue) AT (VISIBLE SET year=year-1) FROM review_alias_star_v
+JOIN (SELECT 'North' AS region) r ON r.region=review_alias_star_v.region GROUP BY year$$);
+----
+needs the measure view to list its columns
+
 # A CTE that removes rows cannot feed a grouped measure, which recomputes from
 # the defining view. The same filter in the consuming query is visible.
 statement error
