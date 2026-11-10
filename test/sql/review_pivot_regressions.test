@@ -1,0 +1,178 @@
+# name: test/sql/review_pivot_regressions.test
+# description: PIVOT cells retain actual input lineage through renamed projections, filters, and computed axes.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE review_pivot_rows(y INTEGER, r VARCHAR, a INTEGER);
+
+statement ok
+INSERT INTO review_pivot_rows VALUES (2023, 'N', 10), (2023, 'S', 20), (2024, 'N', 40), (2024, 'S', 80);
+
+statement ok
+CREATE VIEW review_pivot_v AS
+SELECT y, r, SUM(a) AS MEASURE m, COUNT(*) AS MEASURE n,
+       AVG(a) AS MEASURE mean_a
+FROM review_pivot_rows;
+
+# Renamed exposed dimensions retain their original context. Unused renamed
+# measures are not added to the implicit grouping set.
+query III rowsort
+WITH input AS (SELECT y AS yr, r AS region, m AS measure, n AS orders FROM review_pivot_v)
+PIVOT input ON region USING AGGREGATE(measure);
+----
+2023	10	20
+2024	40	80
+
+query III rowsort
+WITH input(yr, region, measure, orders) AS (SELECT y, r, m, n FROM review_pivot_v)
+PIVOT input ON region USING AGGREGATE(measure);
+----
+2023	10	20
+2024	40	80
+
+# A derived input is a real source, with the same measure lineage as a CTE.
+query III rowsort
+PIVOT (SELECT * FROM review_pivot_v) ON r USING AGGREGATE(m) GROUP BY y;
+----
+2023	10	20
+2024	40	80
+
+query III rowsort
+PIVOT (SELECT y AS yr, r AS region, m AS measure FROM review_pivot_v) AS input
+ON region USING AGGREGATE(measure) GROUP BY yr;
+----
+2023	10	20
+2024	40	80
+
+# The computed axis is part of each cell context, even though lower(r) is not
+# an exposed dimension name in the registered definition.
+query III rowsort
+PIVOT review_pivot_v ON lower(r) USING AGGREGATE(m) GROUP BY y;
+----
+2023	10	20
+2024	40	80
+
+# Rows merged by a computed key recompute non-additive measures from the full
+# underlying population; they do not average already aggregated values.
+statement ok
+INSERT INTO review_pivot_rows VALUES (2023, 'n', 30), (2023, 'n', 50);
+
+query IRR rowsort
+PIVOT review_pivot_v ON lower(r) USING AGGREGATE(mean_a) GROUP BY y;
+----
+2023	30	20
+2024	40	80
+
+statement ok
+CREATE VIEW review_pivot_raw_v AS
+SELECT y, r, a, SUM(a) AS MEASURE m, COUNT(*) AS MEASURE n,
+       AVG(a) AS MEASURE mean_a
+FROM review_pivot_rows;
+
+statement ok
+INSERT INTO review_pivot_rows VALUES (2023, 'N', 5), (2023, 'N', 10);
+
+# The five-dollar row is excluded by the actual input filter. Identical
+# original ten-dollar rows retain distinct identities and both contribute.
+query III rowsort
+WITH input AS (SELECT * FROM review_pivot_raw_v WHERE a > 8 AND r IN ('N', 'S'))
+PIVOT input ON r USING AGGREGATE(m) GROUP BY y;
+----
+2023	20	20
+2024	40	80
+
+query IIIII rowsort
+WITH input AS (
+    SELECT y AS yr, r AS region, m AS total, n AS orders
+    FROM review_pivot_raw_v WHERE a > 8 AND r IN ('N', 'S')
+)
+PIVOT input ON region USING AGGREGATE(total) AS total, AGGREGATE(orders) AS orders GROUP BY yr;
+----
+2023	20	2	20	1
+2024	40	1	80	1
+
+# Row selection in a derived source is retained rather than replaced with the
+# full catalog view while preparing the cell's measure population.
+query III
+PIVOT (SELECT * FROM review_pivot_raw_v WHERE a > 8 AND r = 'N' ORDER BY a DESC LIMIT 1)
+ON r IN ('N', 'S') USING AGGREGATE(m) GROUP BY y;
+----
+2024	40	NULL
+
+# Explicit resets discard the input filter; dimension removal retains its
+# independent terms and VISIBLE can reintroduce removed restrictions later.
+query III rowsort
+WITH input AS (SELECT * FROM review_pivot_raw_v WHERE a > 8 AND r IN ('N', 'S'))
+PIVOT input ON r USING AGGREGATE(m) AT (ALL) GROUP BY y;
+----
+2023	245	245
+2024	245	245
+
+query III rowsort
+WITH input AS (SELECT * FROM review_pivot_raw_v WHERE a > 8 AND r IN ('N', 'S'))
+PIVOT input ON r USING AGGREGATE(m) AT (WHERE a < 8) GROUP BY y;
+----
+2023	5	5
+2024	5	5
+
+query III rowsort
+WITH input AS (SELECT * FROM review_pivot_raw_v WHERE a > 8 AND r IN ('N', 'S'))
+PIVOT input ON r USING AGGREGATE(m) AT (ALL r) GROUP BY y;
+----
+2023	120	120
+2024	120	120
+
+query III rowsort
+WITH input AS (SELECT * FROM review_pivot_raw_v WHERE a > 8 AND r IN ('N', 'S'))
+PIVOT input ON r USING AGGREGATE(m) AT (ALL r VISIBLE) GROUP BY y;
+----
+2023	40	40
+2024	120	120
+
+statement ok
+CREATE TABLE review_pivot_context_rows(y INTEGER, r VARCHAR, a INTEGER);
+
+statement ok
+INSERT INTO review_pivot_context_rows VALUES (2023, 'N', 10), (2023, 'S', 20), (2024, 'N', 40), (2024, 'S', 80);
+
+statement ok
+CREATE VIEW review_pivot_context_v AS
+SELECT y, r, SUM(a) AS MEASURE m FROM review_pivot_context_rows;
+
+# Window and PIVOT modifiers share ordered predicate application. CURRENT reads
+# the intermediate context rather than the original frame on every step.
+query III
+SELECT AGGREGATE(v.m) OVER () AT (SET y=2024 SET y=CURRENT y-1),
+       AGGREGATE(v.m) OVER () AT (WHERE y=2024 SET y=CURRENT y-1),
+       AGGREGATE(v.m) OVER () AT (SET y=CURRENT y-1) AT (SET y=2024)
+FROM review_pivot_context_v v LIMIT 1;
+----
+30	30	30
+
+query IIII
+SELECT AGGREGATE(v.m) OVER () AT (WHERE r='N' VISIBLE),
+       AGGREGATE(v.m) OVER () AT (VISIBLE WHERE r='N'),
+       AGGREGATE(v.m) OVER () AT (VISIBLE SET y=2024),
+       AGGREGATE(v.m) OVER () AT (SET y=2024 VISIBLE)
+FROM review_pivot_context_v v WHERE y=2023 AND r='N' LIMIT 1;
+----
+10	50	40	NULL
+
+query III
+SELECT AGGREGATE(v.m) OVER () AT (VISIBLE ALL y),
+       AGGREGATE(v.m) OVER () AT (ALL VISIBLE),
+       AGGREGATE(v.m) OVER () AT (ALL SET y=2023)
+FROM review_pivot_context_v v WHERE y=2023 AND r='N' LIMIT 1;
+----
+50	10	30
+
+query III rowsort
+PIVOT review_pivot_context_v ON r
+USING AGGREGATE(m) AT (SET y=2024 SET y=CURRENT y-1) GROUP BY y;
+----
+2023	10	20
+2024	10	20

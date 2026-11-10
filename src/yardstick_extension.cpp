@@ -17,11 +17,16 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
 #if YARDSTICK_GRAMMAR_EXTENSION
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/multi_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/operator/logical_create.hpp"
 #include <atomic>
@@ -182,6 +187,9 @@ static unique_ptr<FunctionData> YardstickQueryBind(ClientContext &context,
 #endif
     auto data = make_uniq<YardstickQueryData>();
     data->original_sql = input.inputs[0].GetValue<string>();
+#if YARDSTICK_GRAMMAR_EXTENSION
+    data->original_sql = RewriteNativeMeasurePivots(data->original_sql);
+#endif
     if (input.inputs.size() > 1) {
         HandleAggregateWarnings(context, input.inputs[1].GetValue<string>());
     }
@@ -765,6 +773,10 @@ static std::string SelectPortionForTableAnalysis(const std::string &sql) {
         if (depth == 0 && ConsumeKeyword(sql, pos, "SELECT")) {
             return sql.substr(i);
         }
+        pos = i;
+        if (depth == 0 && (i == 0 || !IsIdentifierChar(sql[i - 1])) && ConsumeKeyword(sql, pos, "PIVOT")) {
+            return sql.substr(i);
+        }
     }
 
     return sql;
@@ -943,7 +955,7 @@ static bool StatementTextReadsFromView(const std::string &sql,
         if (from_keyword && IsExtractFromKeyword(sql, i)) {
             continue;
         }
-        if (!from_keyword && !ConsumeKeyword(sql, pos, "JOIN")) {
+        if (!from_keyword && !ConsumeKeyword(sql, pos, "JOIN") && !ConsumeKeyword(sql, pos, "PIVOT")) {
             continue;
         }
 
@@ -988,8 +1000,12 @@ static bool StatementReadsFromView(const std::string &sql,
 
     size_t select_pos = SkipWhitespaceAndComments(select_sql, 0);
     bool starts_with_with = ConsumeKeyword(select_sql, select_pos, "WITH");
+    select_pos = SkipWhitespaceAndComments(select_sql, 0);
+    bool starts_with_pivot = ConsumeKeyword(select_sql, select_pos, "PIVOT");
     yardstick_free_select_info(info);
-    return found || ((qualified_permanent || starts_with_with || has_subquery) &&
+    // Dynamic top-level PIVOT starts with a generated enum declaration, so
+    // SELECT inspection can return no root table even though its source is read.
+    return found || ((qualified_permanent || starts_with_with || starts_with_pivot || has_subquery) &&
                      StatementTextReadsFromView(select_sql, view_name, qualified_permanent));
 }
 
@@ -1891,6 +1907,9 @@ static vector<unique_ptr<SQLStatement>> DeferMeasureColumnListBatch(const string
         if (StartsWithSemantic(sql, semantic_stripped)) {
             sql = std::move(semantic_stripped);
         }
+        bool measure_pivot = RequiresNativeMeasurePivotBinding(sql);
+        requires_binding |= measure_pivot;
+        requires_structural_binding |= measure_pivot;
         auto inspect_calls = [&](const string &scope_sql) {
             bool inspect_nested_scopes = false;
             if (auto *calls = FindNativeYardstickAggregates(scope_sql.c_str())) {
@@ -1942,13 +1961,64 @@ static vector<unique_ptr<SQLStatement>> DeferMeasureColumnListBatch(const string
     if (!requires_binding || (!batch_temporary_declarations.empty() && !requires_structural_binding)) {
         return {};
     }
+    shared_ptr<YardstickTemporaryBatch> temporary_batch;
+    if (!batch_temporary_declarations.empty()) {
+        temporary_batch = make_shared_ptr<YardstickTemporaryBatch>();
+        for (auto &declaration : batch_temporary_declarations) {
+            bool used = false;
+            for (idx_t i = declaration.second + 1; i < statements.size(); i++) {
+                DropViewInfo drop;
+                if (ExtractDropViewInfoFromSql(statements[i], drop) && drop.targets_temporary_view &&
+                    StringUtil::CIEquals(drop.view_name, declaration.first)) {
+                    used = true;
+                    break;
+                }
+                if (!yardstick_has_aggregate(statements[i].c_str()) ||
+                    !StatementReadsFromView(statements[i], declaration.first)) continue;
+                if (StartsWithSelectStatement(statements[i])) {
+                    throw ParserException("TEMPORARY AS MEASURE views cannot be returned directly from a statement batch");
+                }
+                used = true;
+            }
+            if (!used) {
+                throw ParserException("TEMPORARY AS MEASURE views must be used in the same statement batch as AGGREGATE()");
+            }
+            if (!ContainsCaseInsensitive(temporary_batch->view_names, declaration.first)) {
+                temporary_batch->view_names.push_back(declaration.first);
+            }
+        }
+    }
     vector<unique_ptr<SQLStatement>> deferred;
+    vector<YardstickDeferredParseData *> batch_statements;
     auto options = *CurrentNativeYardstickParserOptions();
     for (auto &sql : statements) {
         StringUtil::Trim(sql);
         if (sql.empty()) {
             continue;
         }
+        auto pivot_binding = PrepareNativeMeasurePivotBinding(sql);
+        sql = std::move(pivot_binding.sql);
+        auto append_statement = [&](unique_ptr<SQLStatement> statement) {
+            if (pivot_binding.preparations.empty()) {
+                deferred.push_back(std::move(statement));
+                return;
+            }
+            // DuckDB executes dynamic pivot enum preparation before binding
+            // the final query, in the same transaction as the user statement.
+            auto multi = make_uniq<MultiStatement>();
+            for (auto &preparation : pivot_binding.preparations) {
+                auto preparation_sql = preparation->query.empty() ? preparation->ToString() : preparation->query;
+                if (yardstick_has_aggregate(preparation_sql.c_str())) {
+                    // A domain query may read a subquery that computes measures.
+                    // Lower those calls in the same session before enum binding.
+                    preparation = make_uniq<ExtensionStatement>(YardstickParserExtension(),
+                        make_uniq_base<ParserExtensionParseData, YardstickDeferredParseData>(preparation_sql, options));
+                }
+                multi->statements.push_back(std::move(preparation));
+            }
+            multi->statements.push_back(std::move(statement));
+            deferred.push_back(std::move(multi));
+        };
         // Transaction and setting statements must retain their engine-visible
         // types so statement preprocessing preserves session semantics.
         Parser parser(options);
@@ -1960,25 +2030,28 @@ static vector<unique_ptr<SQLStatement>> DeferMeasureColumnListBatch(const string
              parser.statements[0]->type == StatementType::SET_STATEMENT ||
              parser.statements[0]->type == StatementType::PRAGMA_STATEMENT ||
              parser.statements[0]->type == StatementType::EXECUTE_STATEMENT)) {
-            deferred.push_back(std::move(parser.statements[0]));
+            append_statement(std::move(parser.statements[0]));
         } else if (parser.statements.size() == 1 &&
-                   parser.statements[0]->type == StatementType::SELECT_STATEMENT) {
+                   parser.statements[0]->type == StatementType::SELECT_STATEMENT && !temporary_batch) {
             Parser wrapper_parser(options);
             wrapper_parser.ParseQuery("SELECT * FROM yardstick_scoped('" + EscapeSqlStringLiteral(sql) + "')");
             auto statement = std::move(wrapper_parser.statements[0]);
             statement->named_param_map = parser.statements[0]->named_param_map;
             statement->has_anonymous_parameters = parser.statements[0]->has_anonymous_parameters;
-            deferred.push_back(std::move(statement));
+            append_statement(std::move(statement));
         } else {
+            auto data = make_uniq<YardstickDeferredParseData>(sql, options, temporary_batch);
+            if (temporary_batch) batch_statements.push_back(data.get());
             auto statement = make_uniq<ExtensionStatement>(YardstickParserExtension(),
-                make_uniq_base<ParserExtensionParseData, YardstickDeferredParseData>(sql, options));
+                std::move(data));
             if (parser.statements.size() == 1) {
                 statement->named_param_map = parser.statements[0]->named_param_map;
                 statement->has_anonymous_parameters = parser.statements[0]->has_anonymous_parameters;
             }
-            deferred.push_back(std::move(statement));
+            append_statement(std::move(statement));
         }
     }
+    if (!batch_statements.empty()) batch_statements.back()->completes_temporary_batch = true;
     return deferred;
 }
 #endif
@@ -2137,9 +2210,23 @@ ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
 class DeferredMeasureCatalogState : public ClientContextState {
 public:
     using TemporaryViews = std::map<string, std::shared_ptr<void>>;
+    struct TemporaryCatalogSnapshot {
+        optional_idx original_oid;
+        unique_ptr<CreateViewInfo> original_view;
+    };
+    using TemporaryCatalogSnapshots = std::map<string, TemporaryCatalogSnapshot>;
+    struct TemporaryCatalogCleanup {
+        TemporaryCatalogSnapshots snapshots;
+        bool applied = false;
+    };
     TemporaryViews temporary_views;
     std::unique_ptr<TemporaryViews> pending_temporary;
     std::unique_ptr<TemporaryViews> transaction_temporary;
+    shared_ptr<YardstickTemporaryBatch> temporary_batch;
+    std::unique_ptr<TemporaryViews> batch_original_temporary;
+    TemporaryCatalogSnapshots batch_original_catalog;
+    vector<TemporaryCatalogCleanup> catalog_cleanups;
+    bool completes_temporary_batch = false;
     bool counted = false;
     std::vector<MeasureViewSnapshot> pending;
     std::vector<MeasureViewSnapshot> transaction_snapshots;
@@ -2174,6 +2261,75 @@ public:
             counted = needed;
         }
     }
+    void EnterTemporaryBatch(ClientContext &context, const YardstickDeferredParseData &data) {
+        if (!data.temporary_batch) return;
+        if (temporary_batch.get() != data.temporary_batch.get()) {
+            RestoreTemporaryBatch();
+            temporary_batch = data.temporary_batch;
+            batch_original_temporary = std::make_unique<TemporaryViews>(temporary_views);
+            for (auto &name : temporary_batch->view_names) {
+                EntryLookupInfo lookup(CatalogType::VIEW_ENTRY, QualifiedName(TEMP_CATALOG, DEFAULT_SCHEMA, Identifier(name)));
+                auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
+                TemporaryCatalogSnapshot snapshot;
+                if (entry) {
+                    snapshot.original_oid = entry->oid;
+                    if (entry->type == CatalogType::VIEW_ENTRY) {
+                        snapshot.original_view = unique_ptr_cast<CreateInfo, CreateViewInfo>(entry->GetInfo());
+                    }
+                }
+                batch_original_catalog.emplace(name, std::move(snapshot));
+            }
+        }
+        completes_temporary_batch = data.completes_temporary_batch;
+    }
+    void RestoreTemporaryBatch() {
+        if (!temporary_batch) return;
+        // Header/star TEMP declarations keep their session lifetime. Restore
+        // only the simple TEMP names belonging to this statement batch.
+        for (auto &name : temporary_batch->view_names) {
+            auto previous = batch_original_temporary->find(name);
+            if (previous == batch_original_temporary->end()) {
+                temporary_views.erase(name);
+            } else {
+                temporary_views[name] = previous->second;
+            }
+        }
+        catalog_cleanups.push_back({std::move(batch_original_catalog), false});
+        batch_original_catalog.clear();
+        temporary_batch.reset();
+        batch_original_temporary.reset();
+        completes_temporary_batch = false;
+    }
+    void QueryBegin(ClientContext &context) override {
+        // QueryEnd has already committed or rolled back. Use the next query's
+        // owning transaction, before binding, instead of reentering the context
+        // or exposing leaked placeholder views to SELECT/duckdb_views().
+        if (ValidChecker::IsInvalidated(context.ActiveTransaction())) return;
+        for (auto &cleanup : catalog_cleanups) {
+            if (cleanup.applied) continue;
+            for (auto &saved : cleanup.snapshots) {
+                auto qualified = QualifiedName(TEMP_CATALOG, DEFAULT_SCHEMA, Identifier(saved.first));
+                EntryLookupInfo lookup(CatalogType::VIEW_ENTRY, qualified);
+                auto current = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
+                auto &snapshot = saved.second;
+                if (snapshot.original_oid.IsValid()) {
+                    if (!snapshot.original_view || (current && current->oid == snapshot.original_oid.GetIndex()) ||
+                        (current && current->type != CatalogType::VIEW_ENTRY)) continue;
+                    auto restored = snapshot.original_view->Copy();
+                    auto &view = restored->Cast<CreateViewInfo>();
+                    view.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
+                    Catalog::GetCatalog(context, TEMP_CATALOG).CreateView(context, view);
+                } else if (current && current->type == CatalogType::VIEW_ENTRY) {
+                    DropInfo drop;
+                    drop.type = CatalogType::VIEW_ENTRY;
+                    drop.SetQualifiedName(std::move(qualified));
+                    drop.if_not_found = OnEntryNotFound::RETURN_NULL;
+                    Catalog::GetCatalog(context, TEMP_CATALOG).DropEntry(context, drop);
+                }
+            }
+            cleanup.applied = true;
+        }
+    }
     void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
         if (error && error->HasError()) {
             RestoreMeasureViewSnapshots(pending);
@@ -2188,6 +2344,9 @@ public:
         } else {
             FreeMeasureViewSnapshots(pending);
         }
+        if ((error && error->HasError()) || completes_temporary_batch) {
+            RestoreTemporaryBatch();
+        }
         pending_temporary.reset();
         RefreshTemporaryRouting();
     }
@@ -2196,6 +2355,13 @@ public:
         FreeMeasureViewSnapshots(transaction_snapshots);
         pending_temporary.reset();
         transaction_temporary.reset();
+        for (auto cleanup = catalog_cleanups.begin(); cleanup != catalog_cleanups.end();) {
+            if (cleanup->applied) {
+                cleanup = catalog_cleanups.erase(cleanup);
+            } else {
+                ++cleanup;
+            }
+        }
         RefreshTemporaryRouting();
     }
     void TransactionRollback(MetaTransaction &, ClientContext &) override {
@@ -2204,6 +2370,8 @@ public:
         if (transaction_temporary) {
             temporary_views = *transaction_temporary;
         }
+        RestoreTemporaryBatch();
+        for (auto &cleanup : catalog_cleanups) cleanup.applied = false;
         pending_temporary.reset();
         transaction_temporary.reset();
         RefreshTemporaryRouting();
@@ -2248,6 +2416,7 @@ static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binde
     NativeYardstickBindScope bind_scope(context);
     NativeYardstickParseScope parse_scope(nullptr, data.options);
     auto state = context.registered_state->GetOrCreate<DeferredMeasureCatalogState>("yardstick_deferred_catalog");
+    state->EnterTemporaryBatch(context, data);
     DeferredTemporaryMeasureScope temporary_scope(*state);
     string sql = data.sql;
     string semantic_stripped;
@@ -2256,6 +2425,7 @@ static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binde
     }
     try {
         SelectDeferredMeasureNamespace(sql, *state, temporary_scope);
+        sql = RewriteNativeMeasurePivots(sql);
         Parser original_parser(*CurrentNativeYardstickParserOptions());
         ParseNativeYardstickQuery(sql, original_parser);
         bool explain_only = original_parser.statements.size() == 1 &&
@@ -2374,6 +2544,7 @@ static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binde
             state->temporary_views = *state->pending_temporary;
             state->pending_temporary.reset();
         }
+        if (data.temporary_batch) state->RestoreTemporaryBatch();
         state->RefreshTemporaryRouting();
         throw;
     }
@@ -2387,6 +2558,7 @@ static unique_ptr<TableRef> DeferredMeasureSelectBindReplace(ClientContext &cont
     DeferredTemporaryMeasureScope temporary_scope(*state);
     string sql = input.inputs[0].GetValue<string>();
     SelectDeferredMeasureNamespace(sql, *state, temporary_scope);
+    sql = RewriteNativeMeasurePivots(sql);
     if (yardstick_has_aggregate(sql.c_str())) {
         auto expanded = yardstick_expand_aggregate(sql.c_str());
         string error = expanded.error ? expanded.error : "";

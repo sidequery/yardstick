@@ -1,0 +1,156 @@
+# name: test/sql/review_temporary_pivot_batches.test
+# description: Catalog-bound PIVOT consumers preserve simple TEMP measure batch lifetimes.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+CREATE TABLE review_temp_pivot_rows(y INTEGER, r VARCHAR, a INTEGER);
+
+statement ok
+INSERT INTO review_temp_pivot_rows VALUES (2023, 'N', 10), (2023, 'S', 20);
+
+# Domain preparation and the PIVOT bind run after the temporary declaration.
+query III
+CREATE TEMP VIEW review_temp_pivot_v AS
+SELECT y, r, SUM(a) AS MEASURE m FROM review_temp_pivot_rows;
+CREATE TABLE review_temp_pivot_result AS
+PIVOT review_temp_pivot_v ON r USING AGGREGATE(m) GROUP BY y;
+SELECT * FROM review_temp_pivot_result;
+----
+2023	10	20
+
+statement error
+SELECT * FROM review_temp_pivot_v;
+----
+Table with name review_temp_pivot_v does not exist
+
+# A failed read rolls back its transaction. Cleanup must retry before this
+# catalog inspection, then commit without exposing the expired view.
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name = 'review_temp_pivot_v';
+----
+0
+
+statement error
+SELECT AGGREGATE(m) FROM review_temp_pivot_v;
+----
+Table with name review_temp_pivot_v does not exist
+
+# Errors before the last statement also restore the batch namespace.
+statement error
+CREATE TEMP VIEW review_temp_pivot_failed AS
+SELECT y, r, SUM(a) AS MEASURE failed_m FROM review_temp_pivot_rows;
+CREATE TABLE review_temp_pivot_failed_result AS
+PIVOT review_temp_pivot_failed ON r USING AGGREGATE(failed_m) GROUP BY missing_group;
+SELECT 1;
+----
+missing_group
+
+statement error
+SELECT * FROM review_temp_pivot_failed;
+----
+Table with name review_temp_pivot_failed does not exist
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name = 'review_temp_pivot_failed';
+----
+0
+
+statement error
+SELECT AGGREGATE(failed_m) FROM review_temp_pivot_failed;
+----
+Table with name review_temp_pivot_failed does not exist
+
+statement ok
+CREATE VIEW review_temp_pivot_shadow AS
+SELECT y, r, SUM(a) AS MEASURE shadow_m FROM review_temp_pivot_rows;
+
+query III
+CREATE TEMP VIEW review_temp_pivot_shadow AS
+SELECT y, r, SUM(a * 10) AS MEASURE shadow_m FROM review_temp_pivot_rows;
+CREATE TABLE review_temp_pivot_shadow_result AS
+PIVOT review_temp_pivot_shadow ON r USING AGGREGATE(shadow_m) GROUP BY y;
+SELECT * FROM review_temp_pivot_shadow_result;
+----
+2023	100	200
+
+query I
+SELECT AGGREGATE(shadow_m) FROM review_temp_pivot_shadow;
+----
+30
+
+query II
+SELECT count(*) FILTER (WHERE temporary), count(*) FILTER (WHERE NOT temporary)
+FROM duckdb_views() WHERE view_name = 'review_temp_pivot_shadow';
+----
+0	1
+
+# A session-local header view keeps native routing active after batch cleanup.
+statement ok
+CREATE TEMP VIEW review_temp_session_view(yr, region, total) AS
+SELECT y, r, SUM(a) AS MEASURE m FROM review_temp_pivot_rows;
+
+query I
+SELECT AGGREGATE(total) FROM review_temp_session_view;
+----
+30
+
+query III
+CREATE TEMP VIEW review_temp_coexisting AS
+SELECT y, r, SUM(a) AS MEASURE coexisting_m FROM review_temp_pivot_rows;
+CREATE TABLE review_temp_coexisting_result AS
+PIVOT review_temp_coexisting ON r USING AGGREGATE(coexisting_m) GROUP BY y;
+SELECT * FROM review_temp_coexisting_result;
+----
+2023	10	20
+
+statement error
+SELECT * FROM review_temp_coexisting;
+----
+Table with name review_temp_coexisting does not exist
+
+statement error
+SELECT AGGREGATE(coexisting_m) FROM review_temp_coexisting;
+----
+Table with name review_temp_coexisting does not exist
+
+query II
+SELECT count(*) FILTER (WHERE view_name = 'review_temp_coexisting'),
+       count(*) FILTER (WHERE view_name = 'review_temp_session_view')
+FROM duckdb_views() WHERE view_name IN ('review_temp_coexisting', 'review_temp_session_view');
+----
+0	1
+
+query I
+SELECT AGGREGATE(total) FROM review_temp_session_view;
+----
+30
+
+# Replacing an existing session TEMP name in a batch restores its original
+# physical definition as well as its measure metadata.
+query III
+CREATE OR REPLACE TEMP VIEW review_temp_session_view AS
+SELECT y + 100 AS yr, r AS region, SUM(a * 10) AS MEASURE total FROM review_temp_pivot_rows;
+CREATE TABLE review_temp_session_shadow_result AS
+PIVOT review_temp_session_view ON region USING AGGREGATE(total) GROUP BY yr;
+SELECT * FROM review_temp_session_shadow_result;
+----
+2123	100	200
+
+query II
+SELECT min(yr), max(yr) FROM review_temp_session_view;
+----
+2023	2023
+
+query I
+SELECT AGGREGATE(total) FROM review_temp_session_view;
+----
+30
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name = 'review_temp_session_view' AND temporary;
+----
+1
