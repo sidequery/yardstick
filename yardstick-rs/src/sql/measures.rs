@@ -5442,6 +5442,9 @@ pub struct ResolvedMeasure {
     pub view_group_by_cols: Vec<String>,
     /// The original measure expression (e.g., "COUNT(DISTINCT user_id)")
     pub expression: String,
+    /// Why a grouped AGGREGATE() cannot recompute this measure through the
+    /// relation it was read from.
+    pub unreadable: Option<String>,
 }
 
 /// Look up which view contains a measure and return resolved measure info
@@ -5473,6 +5476,7 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMe
             dimension_exprs: v.dimension_exprs.clone(),
             view_group_by_cols: v.group_by_cols.clone(),
             expression: m.expression.clone(),
+            unreadable: None,
         }
     };
 
@@ -5509,7 +5513,15 @@ fn resolve_measure_source(measure_name: &str, default_table: &str) -> ResolvedMe
         dimension_exprs: HashMap::new(),
         view_group_by_cols: Vec::new(),
         expression: String::new(),
+        unreadable: None,
     }
+}
+
+/// A relation's definition is not known while rewriting, so an unreadable
+/// measure is reported when the query runs. A relation that does not exist
+/// then still fails with DuckDB's own binder error.
+fn unreadable_measure_sql(reason: &str) -> String {
+    format!("error('{}')", reason.replace('\'', "''"))
 }
 
 /// How a measure reference will be lowered, which decides what the relation it
@@ -5590,7 +5602,7 @@ fn resolve_query_measure(
             return resolved;
         }
     }
-    let resolved = resolve_measure_source(&column, relation);
+    let mut resolved = resolve_measure_source(&column, relation);
     // The name matched a view this query does not read: the measure arrived
     // through a plain view or derived table whose filters and projection are
     // unknown here, so recomputing from the defining view could silently
@@ -5598,10 +5610,10 @@ fn resolve_query_measure(
     if !resolved.source_view.eq_ignore_ascii_case(relation) {
         let through = if relation == "(subquery)" { "a derived table" } else { relation };
         // The name match may come from an unrelated view, so do not name it.
-        FILTER_REWRITE_ERROR.with(|slot| *slot.borrow_mut() = Some(format!(
+        resolved.unreadable = Some(format!(
             "Measure {column} is read through {through}, which does not define it. \
              Query the view that defines the measure directly or through a CTE"
-        )));
+        ));
     }
     resolved
 }
@@ -7890,6 +7902,10 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
         let measure_lookup_name = strip_measure_qualifier(&measure_name);
         // Look up which view contains this measure (for JOIN support)
         let resolved = resolve_query_measure(&measure_name, &primary_table_name, &from_info, lowering);
+        if let Some(reason) = &resolved.unreadable {
+            result_sql = format!("{}{}{}", &result_sql[..start], unreadable_measure_sql(reason), &result_sql[end..]);
+            continue;
+        }
         let joined_visibility = visible_join_filter(&join_context_sql, outer_where_ref, &resolved, &from_info);
         let outer_where_ref = joined_visibility.as_deref().or(outer_where_ref);
         let mut measure_group_by_cols = filter_group_by_cols_for_measure(
@@ -8091,6 +8107,15 @@ fn expand_aggregate_query_impl(sql: &str, native_scope: bool) -> AggregateExpand
         }
 
         let resolved = resolve_query_measure(&measure_name, &primary_table_name, &from_info, lowering);
+        if let Some(reason) = &resolved.unreadable {
+            result_sql = format!(
+                "{}{}{}",
+                &result_sql[..start],
+                unreadable_measure_sql(reason),
+                &result_sql[replacement_end..]
+            );
+            continue;
+        }
         let joined_visibility = visible_join_filter(&join_context_sql, outer_where_ref, &resolved, &from_info);
         let outer_where_ref = joined_visibility.as_deref().or(outer_where_ref);
         let mut measure_group_by_cols = filter_group_by_cols_for_measure(
