@@ -204,8 +204,7 @@ void CaptureSpan(ParseResult &first, ParseResult &last, bool measure = false) {
     if (!active_capture) {
         throw ParserException("Yardstick syntax must be processed by the Yardstick parser override");
     }
-    active_capture->spans.push_back({first.offset.GetIndex(),
-                                    last.offset.GetIndex() + last.length.GetIndex(), measure});
+    active_capture->spans.push_back({first.GetLocation().Start(), last.GetLocation().End(), measure});
 }
 
 ParseResult &UnwrapModifier(ParseResult &result) {
@@ -237,8 +236,9 @@ string DimensionSource(ParseResult &result) {
     // Dimension matching shares the outer query's spelling. Keep its source
     // expression, with boundaries supplied by PEG rather than a text scanner.
     auto &sql = *active_capture->source;
-    auto start = result.offset.GetIndex();
-    auto length = result.length.GetIndex();
+    auto location = result.GetLocation();
+    auto start = location.Start();
+    auto length = location.length;
     if (start > sql.size() || length > sql.size() - start) {
         throw ParserException("Yardstick dimension source location is out of range");
     }
@@ -316,7 +316,7 @@ arena_ptr<TransformResultValue> TransformAt(PEGTransformer &transformer, ParseRe
     unique_ptr<ParsedExpression> expression =
         make_uniq<FunctionExpression>("__yardstick_at", vector<unique_ptr<ParsedExpression>> {});
     if (active_capture->source) {
-        NativeAtClause clause {result.offset.GetIndex(), result.offset.GetIndex() + result.length.GetIndex(), {},
+        NativeAtClause clause {result.GetLocation().Start(), result.GetLocation().End(), {},
                                expression.get()};
         auto &list = result.Cast<ListParseResult>();
         for (auto &child : list.Child<RepeatParseResult>(2).GetChildren()) {
@@ -341,8 +341,7 @@ arena_ptr<TransformResultValue> TransformMeasure(PEGTransformer &transformer, Pa
             auto &source_alias = list.GetChild(3);
             active_capture->measures.push_back({DimensionSource(source_expression),
                                                expression->GetAlias().GetIdentifierName(), DimensionSource(source_alias),
-                                               source_expression.offset.GetIndex(),
-                                               source_alias.offset.GetIndex() + source_alias.length.GetIndex(),
+                                               source_expression.GetLocation().Start(), source_alias.GetLocation().End(),
                                                expression.get()});
         }
     }
@@ -359,8 +358,8 @@ arena_ptr<TransformResultValue> TransformCurrentDimension(PEGTransformer &transf
     vector<unique_ptr<ParsedExpression>> children;
     children.push_back(transformer.Transform<unique_ptr<ParsedExpression>>(list.GetChild(dimension_index)));
     if (active_capture) {
-        active_capture->current_references.push_back({children[0]->ToString(), result.offset.GetIndex(),
-                                                      result.offset.GetIndex() + result.length.GetIndex()});
+        active_capture->current_references.push_back({children[0]->ToString(), result.GetLocation().Start(),
+                                                      result.GetLocation().End()});
     }
     unique_ptr<ParsedExpression> expression = make_uniq<FunctionExpression>("current", std::move(children));
     return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(expression));
