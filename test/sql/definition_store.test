@@ -1,0 +1,420 @@
+# name: test/sql/definition_store.test
+# description: A configurable attachment table is the sole source of semantic view definitions.
+# group: [yardstick]
+
+require yardstick
+
+statement ok
+ATTACH ':memory:' AS definition_store;
+
+statement ok
+ATTACH ':memory:' AS other_definition_store;
+
+statement ok
+CREATE TABLE definition_sales(region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO definition_sales VALUES ('N', 10), ('N', 20), ('S', 40);
+
+statement ok
+SET yardstick_definition_table='definition_store.main.views';
+
+# Selecting an empty store does not stop ordinary SQL from working.
+query I
+SELECT 42;
+----
+42
+
+statement ok
+CREATE VIEW stored_sales AS SELECT region, SUM(amount) AS MEASURE revenue FROM definition_sales;
+
+query I
+SELECT count(*) FROM definition_store.main.views WHERE view_name='stored_sales';
+----
+1
+
+# No second native view definition is written to any catalog.
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name='stored_sales';
+----
+0
+
+query TI rowsort
+SELECT region, AGGREGATE(revenue) FROM stored_sales;
+----
+N	30
+S	40
+
+query TI rowsort
+SELECT region, revenue FROM stored_sales;
+----
+N	30
+S	40
+
+query I
+SELECT AGGREGATE(revenue) AT (ALL) FROM stored_sales;
+----
+70
+
+statement error
+CREATE VIEW stored_sales AS SELECT SUM(amount) AS MEASURE revenue FROM definition_sales;
+----
+already exists
+
+statement ok
+CREATE VIEW IF NOT EXISTS stored_sales AS SELECT SUM(missing) AS MEASURE ignored FROM missing_table;
+
+query I
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+70
+
+statement ok
+CREATE OR REPLACE VIEW stored_sales AS SELECT region, SUM(amount * 2) AS MEASURE revenue FROM definition_sales;
+
+query I
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+140
+
+# A prepared query must re-read definition rows after replacements.
+statement ok
+PREPARE stored_query AS SELECT AGGREGATE(revenue) FROM stored_sales;
+
+query I
+EXECUTE stored_query;
+----
+140
+
+statement ok
+CREATE OR REPLACE VIEW stored_sales AS SELECT region, SUM(amount * 4) AS MEASURE revenue FROM definition_sales;
+
+query I
+EXECUTE stored_query;
+----
+280
+
+statement ok
+CREATE OR REPLACE VIEW stored_sales AS SELECT region, SUM(amount * 2) AS MEASURE revenue FROM definition_sales;
+
+statement ok
+PREPARE stored_parameter AS SELECT AGGREGATE(revenue) FROM stored_sales WHERE region=$1;
+
+query I
+EXECUTE stored_parameter('N');
+----
+60
+
+query I
+SELECT * FROM yardstick('SELECT AGGREGATE(revenue) FROM stored_sales');
+----
+140
+
+statement error
+CREATE OR REPLACE VIEW stored_sales AS SELECT region, SUM(missing) AS MEASURE revenue FROM definition_sales;
+----
+missing
+
+query I
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+140
+
+# Metadata DML and reads use the caller's transaction.
+statement ok
+BEGIN;
+
+statement ok
+CREATE OR REPLACE VIEW stored_sales AS SELECT region, SUM(amount * 3) AS MEASURE revenue FROM definition_sales;
+
+query I
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+210
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+140
+
+statement ok
+BEGIN;
+
+statement ok
+DROP VIEW stored_sales;
+
+query I
+SELECT count(*) FROM definition_store.main.views WHERE view_name<>'';
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+140
+
+# A different connection resolves the same store without any import call.
+statement ok reader
+SET yardstick_definition_table='definition_store.main.views';
+
+query I reader
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+140
+
+statement ok
+SET yardstick_definition_table='other_definition_store.main.views';
+
+statement ok
+CREATE VIEW stored_sales AS SELECT SUM(amount * 5) AS MEASURE revenue FROM definition_sales;
+
+query I
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+350
+
+query I reader
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+140
+
+statement ok
+DROP VIEW stored_sales;
+
+statement error
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+stored_sales
+
+query I reader
+SELECT AGGREGATE(revenue) FROM stored_sales;
+----
+140
+
+statement ok
+SET yardstick_definition_table='definition_store.main.views';
+
+statement ok
+CREATE SCHEMA definition_a;
+
+statement ok
+CREATE SCHEMA definition_b;
+
+statement ok
+/* Keep the declaration in the selected table even with a leading comment. */
+CREATE VIEW definition_a.same_name AS SELECT SUM(amount) AS MEASURE total FROM definition_sales;
+
+statement ok
+CREATE VIEW definition_b.same_name AS SELECT SUM(amount * 3) AS MEASURE total FROM definition_sales;
+
+query I
+SELECT AGGREGATE(total) FROM definition_a.same_name;
+----
+70
+
+query I
+SELECT AGGREGATE(total) FROM definition_b.same_name;
+----
+210
+
+statement ok
+CREATE VIEW "stored.dot""quote" AS
+SELECT region AS area, SUM(amount) AS MEASURE total FROM definition_sales;
+
+query TI rowsort
+SELECT area, AGGREGATE(total) FROM "stored.dot""quote";
+----
+N	30
+S	40
+
+statement ok
+DROP VIEW "stored.dot""quote";
+
+statement ok
+DROP VIEW definition_a.same_name;
+
+statement ok
+DROP VIEW definition_b.same_name;
+
+statement ok
+CREATE VIEW stored_derived AS
+SELECT region, SUM(amount) AS MEASURE revenue,
+       COUNT(*) AS MEASURE n, revenue / n AS MEASURE average
+FROM definition_sales;
+
+query TR rowsort
+SELECT region, AGGREGATE(average) FROM stored_derived;
+----
+N	15.0
+S	40.0
+
+statement ok
+DROP VIEW stored_derived;
+
+# Ordinary replacement of a managed semantic view stays in the same store.
+statement ok
+CREATE OR REPLACE VIEW stored_sales AS SELECT 17 AS value;
+
+query I
+SELECT value FROM stored_sales;
+----
+17
+
+statement ok
+DROP VIEW stored_sales;
+
+query I
+SELECT count(*) FROM definition_store.main.views WHERE view_name<>'';
+----
+0
+
+statement ok
+DROP VIEW IF EXISTS stored_sales;
+
+statement error
+SET yardstick_definition_table='main.views';
+----
+catalog.schema.table
+
+statement ok
+RESET yardstick_definition_table;
+
+# Competing sessions must not commit duplicate keys, including case variants.
+statement ok
+SET threads=1;
+
+statement ok
+SET yardstick_definition_table='definition_store.main.guarded_views';
+
+statement ok
+CREATE VIEW guard_seed AS SELECT SUM(amount) AS MEASURE total FROM definition_sales;
+
+statement ok guard_one
+SET yardstick_definition_table='definition_store.main.guarded_views';
+
+statement ok guard_two
+SET yardstick_definition_table='definition_store.main.guarded_views';
+
+statement ok guard_one
+BEGIN;
+
+query I guard_one
+SELECT count(*) FROM definition_store.main.guarded_views WHERE view_name<>'';
+----
+1
+
+statement ok guard_two
+BEGIN;
+
+query I guard_two
+SELECT count(*) FROM definition_store.main.guarded_views WHERE view_name<>'';
+----
+1
+
+statement ok guard_one
+CREATE VIEW GuardRace AS SELECT SUM(amount) AS MEASURE total FROM definition_sales;
+
+statement error guard_two
+CREATE VIEW guardrace AS SELECT SUM(amount * 2) AS MEASURE total FROM definition_sales;
+----
+Conflict
+
+statement ok guard_one
+COMMIT;
+
+statement ok guard_two
+ROLLBACK;
+
+query I
+SELECT count(*) FROM definition_store.main.guarded_views WHERE lower(view_name)='guardrace';
+----
+1
+
+query I
+SELECT AGGREGATE(total) FROM guardrace;
+----
+70
+
+# An old snapshot cannot insert a duplicate after the winning writer commits.
+statement ok guard_two
+BEGIN;
+
+query I guard_two
+SELECT count(*) FROM definition_store.main.guarded_views WHERE view_name<>'';
+----
+2
+
+statement ok
+CREATE VIEW GuardStale AS SELECT SUM(amount) AS MEASURE total FROM definition_sales;
+
+statement error guard_two
+CREATE VIEW guardstale AS SELECT SUM(amount * 3) AS MEASURE total FROM definition_sales;
+----
+Conflict
+
+statement ok guard_two
+ROLLBACK;
+
+query I
+SELECT AGGREGATE(total) FROM guard_seed;
+----
+70
+
+# Guard changes also roll back, allowing subsequent mutations to succeed.
+statement ok
+BEGIN;
+
+statement ok
+CREATE OR REPLACE VIEW guard_seed AS SELECT SUM(amount * 2) AS MEASURE total FROM definition_sales;
+
+statement ok
+DROP VIEW guard_seed;
+
+statement ok
+CREATE VIEW guard_seed AS SELECT SUM(amount * 3) AS MEASURE total FROM definition_sales;
+
+statement ok
+ROLLBACK;
+
+statement ok
+CREATE OR REPLACE VIEW guard_seed AS SELECT SUM(amount * 4) AS MEASURE total FROM definition_sales;
+
+query I
+SELECT AGGREGATE(total) FROM guard_seed;
+----
+280
+
+statement ok
+RESET threads;
+
+statement ok
+RESET yardstick_definition_table;
+
+# The same table-backed path can be entirely session-local.
+statement ok
+SET yardstick_definition_table='temp.main.session_views';
+
+statement ok
+CREATE VIEW session_only AS SELECT SUM(amount) AS MEASURE total FROM definition_sales;
+
+query I
+SELECT AGGREGATE(total) FROM session_only;
+----
+70
+
+query I
+SELECT count(*) FROM temp.main.session_views WHERE view_name<>'';
+----
+1
+
+statement ok
+DROP VIEW session_only;
+
+statement ok
+RESET yardstick_definition_table;

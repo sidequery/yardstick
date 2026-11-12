@@ -137,6 +137,75 @@ SELECT
 FROM view_name;
 ```
 
+### Choosing Where Definitions Are Stored
+
+Set a fully qualified table name to keep semantic view definitions in any writable
+DuckDB attachment:
+
+```sql
+-- Attach your database or lake using its normal DuckDB extension first.
+SET yardstick_definition_table = 'lake.semantic.yardstick_views';
+
+CREATE VIEW sales_v AS
+SELECT region, SUM(amount) AS MEASURE revenue
+FROM lake.sales.orders;
+
+SELECT region, AGGREGATE(revenue) FROM sales_v;
+```
+
+The setting selects the **attachment, schema, and table**. The schema must already
+exist; Yardstick creates the definitions table on the first permanent measure-view
+declaration. It uses four `VARCHAR` columns: `view_catalog`, `view_schema`,
+`view_name`, and `definition_sql`.
+One reserved row has empty catalog, schema, and view names and holds the
+transaction concurrency guard. To list only view definitions, filter with
+`WHERE view_name <> ''`.
+
+The selected table is the sole source of truth. `CREATE VIEW ... AS MEASURE`
+inserts a definition, `CREATE OR REPLACE VIEW` updates it, and `DROP VIEW` removes
+it. Replacing a managed view with an ordinary view definition keeps that definition
+in the selected table. These writes use ordinary attachment table operations in
+the caller's transaction, so `ROLLBACK` also rolls back definition changes. Source
+data is never copied or materialized.
+
+Definition writes update and verify that guard in the same transaction before
+changing a view. Competing writers can receive a transaction conflict and should
+retry in a fresh transaction. This works without requiring UNIQUE constraints
+from the attachment. Direct external edits to the table bypass this protection.
+
+An existing definitions table without a guard remains readable. Before writing,
+initialize its guard once with exclusive writer access:
+
+```sql
+INSERT INTO lake.semantic.yardstick_views
+    (view_catalog, view_schema, view_name, definition_sql)
+VALUES ('', '', '', 'yardstick_guard_v1:' || uuid()::VARCHAR);
+```
+
+In a later session, attach the same databases and set the same
+`yardstick_definition_table`; queries resolve the stored definitions automatically.
+The setting is session-local. Reattach source catalogs under the same names:
+Yardstick qualifies table references when saving definitions so later `USE` or
+`search_path` changes do not redirect them.
+
+Configured definitions are resolved during binding, without creating duplicate
+native view entries. Inspect the selected table to list them; they do not appear
+in `duckdb_views()`. Ordinary unmanaged DuckDB views keep their usual behavior.
+
+For a completely session-local store, use the temporary catalog:
+
+```sql
+SET yardstick_definition_table = 'temp.main.yardstick_views';
+```
+
+Queries that use stored definitions read the table during binding, using the
+caller's attachment transaction and DuckDB's existing file/catalog caches.
+Yardstick does not maintain a separate durable copy or a TTL cache. Simple queries
+that directly read native tables skip the definitions scan. Prepared semantic
+queries rebind so replacements and drops are visible on subsequent executions.
+
+`RESET yardstick_definition_table` restores the existing in-memory catalog behavior.
+
 On DuckDB 1.5+, queries containing `AGGREGATE()` are automatically intercepted by the extension's parser override, so no special prefix is needed. On older versions, the `SEMANTIC` prefix is still supported as a fallback.
 
 The native frontend also supports measures directly in `PIVOT`:

@@ -154,6 +154,7 @@ endif()
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/yardstick-rs/include)
 
 set(EXTENSION_SOURCES
+    src/definition_store.cpp
     src/yardstick_extension.cpp
     src/yardstick_parser_ffi.cpp
     src/frontend_peg.cpp

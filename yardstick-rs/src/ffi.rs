@@ -203,6 +203,30 @@ pub extern "C" fn yardstick_pop_measure_view_overlay() {
 }
 
 #[no_mangle]
+pub extern "C" fn yardstick_push_measure_view_namespace() {
+    crate::sql::measures::push_measure_view_namespace();
+}
+
+#[no_mangle]
+pub extern "C" fn yardstick_pop_measure_view_namespace() {
+    crate::sql::measures::pop_measure_view_namespace();
+}
+
+#[no_mangle]
+pub extern "C" fn yardstick_rename_measure_view(old_name: *const c_char, new_name: *const c_char) {
+    if old_name.is_null() || new_name.is_null() {
+        return;
+    }
+    let (Ok(old_name), Ok(new_name)) = (
+        unsafe { CStr::from_ptr(old_name) }.to_str(),
+        unsafe { CStr::from_ptr(new_name) }.to_str(),
+    ) else {
+        return;
+    };
+    crate::sql::measures::rename_measure_view(old_name, new_name);
+}
+
+#[no_mangle]
 pub extern "C" fn yardstick_set_measure_view_overlay(name: *const c_char, snapshot: *const c_void) {
     if name.is_null() {
         return;
