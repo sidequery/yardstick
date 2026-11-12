@@ -84,7 +84,7 @@ class DefinitionStoreTests(unittest.TestCase):
             "rollback;"
             "select aggregate(revenue) from sales_v;"
             "drop view sales_v;"
-            "select count(*) from store.main.definitions;"
+            "select count(*) from store.main.definitions where view_name<>'';"
         )
         self.assertEqual(rows, [["140"], ["70"], ["0"]])
         error = self.run_sql(
@@ -125,9 +125,88 @@ class DefinitionStoreTests(unittest.TestCase):
             "select region, sum(amount * 2) as measure revenue from store.main.sales;"
             "execute sales_total('N');"
             "drop view sales_v;"
-            "select count(*) from store.main.definitions;"
+            "select count(*) from store.main.definitions where view_name<>'';"
         )
         self.assertEqual(rows, [["30"], ["60"], ["0"]])
+
+    def test_drop_respects_temporary_view_shadowing(self):
+        self.create_sales_view()
+        rows = self.run_sql(
+            "set yardstick_definition_table='store.main.definitions';"
+            "create temp view sales_v as select 1 as value;"
+            "drop view sales_v;"
+            "select count(*) from duckdb_views() where temporary and view_name='sales_v';"
+            "select count(*) from store.main.definitions where view_name<>'';"
+            "select aggregate(revenue) from sales_v;"
+            "create temp view sales_v as select 2 as value;"
+            "drop view memory.main.sales_v;"
+            "select value from sales_v;"
+            "select count(*) from store.main.definitions where view_name<>'';"
+            "drop view temp.main.sales_v;"
+        )
+        self.assertEqual(rows, [["0"], ["1"], ["70"], ["2"], ["0"]])
+
+    def test_nested_ctes_do_not_redirect_stored_sources(self):
+        self.run_sql(
+            "create schema store.original; create schema store.other;"
+            "create table store.original.sales as select 7 amount;"
+            "create table store.other.sales as select 99 amount;"
+            "set schema='store.original';"
+            "set yardstick_definition_table='store.main.definitions';"
+            "create view store.main.nested_cte as "
+            "select sum(amount) as measure total from sales "
+            "where exists (with sales as (select 1) select * from sales);"
+            "create view store.main.derived_cte as "
+            "select sum(amount) as measure total from sales, "
+            "(with sales as (select 1 marker) select * from sales) nested where nested.marker=1;"
+            "create view store.main.self_named_cte as "
+            "with sales as (select amount from sales), copy as (select * from sales) "
+            "select sum(amount) as measure total from copy;"
+        )
+        rows = self.run_sql(
+            "set schema='store.other';"
+            "set yardstick_definition_table='store.main.definitions';"
+            "select aggregate(total) from store.main.nested_cte;"
+            "select aggregate(total) from store.main.derived_cte;"
+            "select aggregate(total) from store.main.self_named_cte;"
+        )
+        self.assertEqual(rows, [["7"], ["7"], ["7"]])
+
+    def test_existing_table_guard_initialization_preserves_definitions(self):
+        self.create_sales_view()
+        rows = self.run_sql(
+            "delete from store.main.definitions where view_name='';"
+            "set yardstick_definition_table='store.main.definitions';"
+            "select aggregate(revenue) from sales_v;"
+        )
+        self.assertEqual(rows, [["70"]])
+        error = self.run_sql(
+            "set yardstick_definition_table='store.main.definitions'; drop view sales_v;",
+            expect_error=True,
+        )
+        self.assertIn("exclusive writer access", error)
+        rows = self.run_sql(
+            "insert into store.main.definitions values ('', '', '', 'yardstick_guard_v1:' || uuid()::varchar);"
+            "set yardstick_definition_table='store.main.definitions';"
+            "create or replace view sales_v as "
+            "select region, sum(amount * 2) as measure revenue from store.main.sales;"
+            "select aggregate(revenue) from sales_v;"
+        )
+        self.assertEqual(rows, [["140"]])
+
+    def test_invalid_or_duplicate_guard_is_rejected(self):
+        self.create_sales_view()
+        self.run_sql("update store.main.definitions set definition_sql='invalid' where view_name='';")
+        query = "set yardstick_definition_table='store.main.definitions'; select aggregate(revenue) from sales_v;"
+        error = self.run_sql(query, expect_error=True)
+        self.assertIn("Invalid or duplicate Yardstick concurrency guard", error)
+        self.run_sql(
+            "update store.main.definitions set definition_sql='yardstick_guard_v1:' || uuid()::varchar "
+            "where view_name='';"
+            "insert into store.main.definitions values ('', '', '', 'yardstick_guard_v1:' || uuid()::varchar);"
+        )
+        error = self.run_sql(query, expect_error=True)
+        self.assertIn("Invalid or duplicate Yardstick concurrency guard", error)
 
     def test_source_binding_survives_schema_changes(self):
         rows = self.run_sql(
@@ -156,12 +235,16 @@ class DefinitionStoreTests(unittest.TestCase):
         rows = self.run_sql(
             "set yardstick_definition_table='store.main.definitions';"
             "select aggregate(revenue) from sales_v;"
+            "begin;"
+            "create or replace view sales_v as select region, sum(amount * 3) as measure revenue from store.main.sales;"
+            "select aggregate(revenue) from sales_v;"
+            "rollback; select aggregate(revenue) from sales_v;"
             "create or replace view sales_v as select region, sum(amount * 2) as measure revenue from store.main.sales;"
             "select aggregate(revenue) from sales_v;"
-            "drop view sales_v; select count(*) from store.main.definitions;",
+            "drop view sales_v; select count(*) from store.main.definitions where view_name<>'';",
             ducklake=True,
         )
-        self.assertEqual(rows, [["70"], ["140"], ["0"]])
+        self.assertEqual(rows, [["70"], ["210"], ["70"], ["140"], ["0"]])
 
 
 if __name__ == "__main__":

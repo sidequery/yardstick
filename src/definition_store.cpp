@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/replacement_scan.hpp"
@@ -25,11 +26,14 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/list.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
@@ -58,6 +62,8 @@ void yardstick_free(char *ptr);
 namespace duckdb {
 namespace {
 constexpr const char *DEFINITION_SETTING = "yardstick_definition_table";
+constexpr const char *GUARD_PREDICATE = "view_catalog = '' AND view_schema = '' AND view_name = ''";
+constexpr const char *GUARD_TOKEN_PREFIX = "yardstick_guard_v1:";
 std::mutex routing_lock;
 std::unordered_map<const void *, idx_t> routing_sessions;
 thread_local idx_t parsing_bypass = 0;
@@ -211,29 +217,6 @@ public:
     }
 };
 
-// Keep CREATE/REPLACE/DROP's empty success result instead of exposing the
-// implementation's INSERT/UPDATE/DELETE row count to callers.
-class LogicalDefinitionWrite : public LogicalExtensionOperator {
-public:
-    explicit LogicalDefinitionWrite(unique_ptr<LogicalOperator> write) {
-        children.push_back(std::move(write));
-    }
-    string GetExtensionName() const override { return "yardstick"; }
-    bool SupportSerialization() const override { return false; }
-    vector<ColumnBinding> GetColumnBindings() override {
-#if YARDSTICK_NEW_EXPR_API
-        return {ColumnBinding(TableIndex(0), ProjectionIndex(0))};
-#else
-        return {ColumnBinding(0, 0)};
-#endif
-    }
-    void ResolveTypes() override { types = {LogicalType::BOOLEAN}; }
-    PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
-        auto &write = planner.CreatePlan(*children[0]);
-        return planner.Make<DefinitionRowsSink>(write, nullptr);
-    }
-};
-
 struct DefinitionProfilerScope {
     explicit DefinitionProfilerScope(ClientContext &context)
         : data(ClientData::Get(context)), previous(data.profiler) {
@@ -244,12 +227,10 @@ struct DefinitionProfilerScope {
     shared_ptr<QueryProfiler> previous;
 };
 
-vector<vector<Value>> ReadDefinitions(ClientContext &context, const string &table) {
-    auto statements = Parse("SELECT view_catalog, view_schema, view_name, definition_sql FROM " + table,
-                            YardstickBuiltinParserOptions());
-    auto &select = statements[0]->Cast<SelectStatement>().node->Cast<SelectNode>();
-    if (!FindNativeEntry(context, GetName(select.from_table->Cast<BaseTableRef>()))) return {};
+vector<vector<Value>> ExecuteDefinitionSQL(ClientContext &context, const string &sql) {
+    ParsingBypass bypass;
     DefinitionProfilerScope profiler(context);
+    auto statements = Parse(sql, YardstickBuiltinParserOptions());
     auto binder = Binder::CreateBinder(context);
     auto bound = binder->Bind(*statements[0]);
     PhysicalPlanGenerator generator(context);
@@ -276,6 +257,86 @@ vector<vector<Value>> ReadDefinitions(ClientContext &context, const string &tabl
     return rows;
 }
 
+vector<vector<Value>> ReadDefinitions(ClientContext &context, const string &table) {
+    auto sql = "SELECT view_catalog, view_schema, view_name, definition_sql FROM " + table;
+    auto statements = Parse(sql, YardstickBuiltinParserOptions());
+    auto &select = statements[0]->Cast<SelectStatement>().node->Cast<SelectNode>();
+    if (!FindNativeEntry(context, GetName(select.from_table->Cast<BaseTableRef>()))) return {};
+    return ExecuteDefinitionSQL(context, sql);
+}
+
+struct DefinitionWriteState : public GlobalSourceState {
+    bool finished = false;
+};
+
+// The guard and mutation must execute in order within one statement's
+// transaction. Separate statements would autocommit between these operations.
+class DefinitionWriteSource : public PhysicalOperator {
+public:
+    DefinitionWriteSource(PhysicalPlan &plan, string guard_sql, string mutation_sql, string table, string token)
+        : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, {LogicalType::BOOLEAN}, 1),
+          guard_sql(std::move(guard_sql)), mutation_sql(std::move(mutation_sql)),
+          table(std::move(table)), token(std::move(token)) {}
+
+    string guard_sql;
+    string mutation_sql;
+    string table;
+    string token;
+
+    bool IsSource() const override { return true; }
+    unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
+        return make_uniq<DefinitionWriteState>();
+    }
+    SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &, OperatorSourceInput &input) const override {
+        auto &state = input.global_state.Cast<DefinitionWriteState>();
+        if (state.finished) return SourceResultType::FINISHED;
+        state.finished = true;
+        ExecuteDefinitionSQL(context.client, guard_sql);
+        // Rebind after UPDATE: lake scans can capture transaction-local file
+        // lists at bind time. A prebound scan may miss our new guard row.
+        auto rows = ExecuteDefinitionSQL(context.client,
+            "SELECT definition_sql FROM " + table + " WHERE " + GUARD_PREDICATE);
+        if (rows.size() != 1 || rows[0][0].IsNull() || rows[0][0].GetValue<string>() != token) {
+            throw TransactionException("Concurrent Yardstick definition change; retry in a fresh transaction");
+        }
+        // Bind again after acquiring the guard so attachments that rewrite
+        // files on UPDATE do not leave the mutation with stale row identities.
+        ExecuteDefinitionSQL(context.client, mutation_sql);
+        return SourceResultType::FINISHED;
+    }
+};
+
+// Keep CREATE/REPLACE/DROP's empty success result instead of exposing the
+// implementation's INSERT/UPDATE/DELETE row count to callers.
+class LogicalDefinitionWrite : public LogicalExtensionOperator {
+public:
+    explicit LogicalDefinitionWrite(unique_ptr<LogicalOperator> write) {
+        children.push_back(std::move(write));
+    }
+    string guard_sql;
+    string mutation_sql;
+    string table;
+    string token;
+
+    string GetExtensionName() const override { return "yardstick"; }
+    bool SupportSerialization() const override { return false; }
+    vector<ColumnBinding> GetColumnBindings() override {
+#if YARDSTICK_NEW_EXPR_API
+        return {ColumnBinding(TableIndex(0), ProjectionIndex(0))};
+#else
+        return {ColumnBinding(0, 0)};
+#endif
+    }
+    void ResolveTypes() override { types = {LogicalType::BOOLEAN}; }
+    PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
+        if (!guard_sql.empty()) {
+            return planner.Make<DefinitionWriteSource>(guard_sql, mutation_sql, table, token);
+        }
+        auto &write = planner.CreatePlan(*children[0]);
+        return planner.Make<DefinitionRowsSink>(write, nullptr);
+    }
+};
+
 struct Definition {
     ViewName name;
     string sql;
@@ -297,6 +358,15 @@ public:
                     throw InvalidInputException("Yardstick definitions require non-NULL VARCHAR columns");
                 }
             }
+            if (row[0].GetValue<string>().empty() && row[1].GetValue<string>().empty() &&
+                row[2].GetValue<string>().empty()) {
+                auto token = row[3].GetValue<string>();
+                if (!guard_token.empty() || !StringUtil::StartsWith(token, GUARD_TOKEN_PREFIX)) {
+                    throw InvalidInputException("Invalid or duplicate Yardstick concurrency guard in %s", table);
+                }
+                guard_token = std::move(token);
+                continue;
+            }
             Definition definition {{row[0].GetValue<string>(), row[1].GetValue<string>(), row[2].GetValue<string>()},
                                    row[3].GetValue<string>(), "__yardstick_definition_" + std::to_string(definitions.size()), ""};
             for (auto &existing : definitions) {
@@ -316,6 +386,7 @@ public:
 
     ClientContext &context;
     ParserOptions options;
+    string guard_token;
     vector<Definition> definitions;
     DefinitionScope *previous;
 
@@ -458,9 +529,28 @@ BoundStatement BindSQL(ClientContext &context, Binder &parent, const string &sql
     return binder->Bind(*statements[0]);
 }
 
-BoundStatement BindDefinitionWrite(ClientContext &context, Binder &parent, const string &sql) {
+BoundStatement BindDefinitionWrite(ClientContext &context, Binder &parent, const string &sql,
+                                   const string &table = "", const string &guard_token = "") {
     auto bound = BindSQL(context, parent, sql, YardstickBuiltinParserOptions());
-    bound.plan = make_uniq<LogicalDefinitionWrite>(std::move(bound.plan));
+    auto write = make_uniq<LogicalDefinitionWrite>(std::move(bound.plan));
+    if (!table.empty()) {
+        if (guard_token.empty()) {
+            throw InvalidInputException(
+                "Yardstick definitions table %s has no concurrency guard. With exclusive writer access, run: "
+                "INSERT INTO %s (view_catalog, view_schema, view_name, definition_sql) "
+                "VALUES ('', '', '', 'yardstick_guard_v1:' || uuid()::VARCHAR)", table, table);
+        }
+        write->table = table;
+        write->token = GUARD_TOKEN_PREFIX + UUID::ToString(UUID::GenerateRandomUUID());
+        write->mutation_sql = sql;
+        write->guard_sql = "UPDATE " + table + " SET definition_sql = " + QuoteString(write->token) +
+            " WHERE " + GUARD_PREDICATE + " AND definition_sql = " + QuoteString(guard_token);
+        auto guard = BindSQL(context, parent, write->guard_sql, YardstickBuiltinParserOptions());
+        // Binding both commands here validates them and records their modified
+        // database in the caller's statement properties before execution starts.
+        write->children.push_back(std::move(guard.plan));
+    }
+    bound.plan = std::move(write);
     bound.names = {"Success"};
     bound.types = {LogicalType::BOOLEAN};
     parent.GetStatementProperties().return_type = StatementReturnType::NOTHING;
@@ -550,33 +640,112 @@ bool NeedsDefinitionLookup(ClientContext &context, const string &sql, const Pars
     return needs_definitions;
 }
 
+// Walk query boundaries explicitly: the engine's general iterator recursively
+// flattens nested queries and CTE bodies, losing lexical CTE visibility.
+class DefinitionSourceVisitor {
+public:
+    using CteNames = std::set<string>;
+    using Callback = std::function<void(BaseTableRef &, const CteNames &)>;
+
+    explicit DefinitionSourceVisitor(Callback callback) : callback(std::move(callback)) {}
+
+    void Query(QueryNode &node, CteNames visible = {}) {
+        for (auto &entry : node.cte_map.map) {
+#if YARDSTICK_NEW_EXPR_API
+            Query(*entry.second->query_node, visible);
+#else
+            Query(*entry.second->query->node, visible);
+#endif
+            // A nonrecursive CTE sees preceding CTEs, not itself. The main
+            // query and later CTEs can see this declaration.
+            visible.insert(StringUtil::Lower(NameString(entry.first)));
+        }
+        switch (node.type) {
+        case QueryNodeType::SELECT_NODE: {
+            auto &select = node.Cast<SelectNode>();
+            for (auto &expression : select.select_list) Expression(expression, visible);
+            for (auto &expression : select.groups.group_expressions) Expression(expression, visible);
+            Expression(select.where_clause, visible);
+            Expression(select.having, visible);
+            Expression(select.qualify, visible);
+            if (select.from_table) Table(*select.from_table, visible);
+            break;
+        }
+        case QueryNodeType::SET_OPERATION_NODE:
+            for (auto &child : node.Cast<SetOperationNode>().children) Query(*child, visible);
+            break;
+        case QueryNodeType::RECURSIVE_CTE_NODE: {
+            auto &recursive = node.Cast<RecursiveCTENode>();
+            Query(*recursive.left, visible);
+            visible.insert(StringUtil::Lower(NameString(recursive.ctename)));
+            Query(*recursive.right, visible);
+            for (auto &expression : recursive.key_targets) Expression(expression, visible);
+            break;
+        }
+        default:
+            throw NotImplementedException("Unsupported query in Yardstick definition");
+        }
+        ParsedExpressionIterator::EnumerateQueryNodeModifiers(node,
+            [&](unique_ptr<ParsedExpression> &expression) { Expression(expression, visible); });
+    }
+
+private:
+    Callback callback;
+
+    void Expression(unique_ptr<ParsedExpression> &expression, const CteNames &visible) {
+        if (!expression) return;
+        if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+            Query(SubqueryNode(expression->Cast<SubqueryExpression>()), visible);
+        }
+        ParsedExpressionIterator::EnumerateChildren(*expression,
+            [&](unique_ptr<ParsedExpression> &child) { Expression(child, visible); });
+    }
+
+    void Table(TableRef &ref, const CteNames &visible) {
+        switch (ref.type) {
+        case TableReferenceType::BASE_TABLE:
+            callback(ref.Cast<BaseTableRef>(), visible);
+            break;
+        case TableReferenceType::SUBQUERY:
+            Query(*ref.Cast<SubqueryRef>().subquery->node, visible);
+            break;
+        case TableReferenceType::JOIN: {
+            auto &join = ref.Cast<JoinRef>();
+            Table(*join.left, visible);
+            Table(*join.right, visible);
+            Expression(join.condition, visible);
+            break;
+        }
+        case TableReferenceType::PIVOT: {
+            auto &pivot = ref.Cast<PivotRef>();
+            Table(*pivot.source, visible);
+            for (auto &aggregate : pivot.aggregates) Expression(aggregate, visible);
+            break;
+        }
+        case TableReferenceType::EXPRESSION_LIST:
+            for (auto &row : ref.Cast<ExpressionListRef>().values)
+                for (auto &expression : row) Expression(expression, visible);
+            break;
+        case TableReferenceType::TABLE_FUNCTION: {
+            auto &function = ref.Cast<TableFunctionRef>();
+            Expression(function.function, visible);
+            if (function.subquery) Query(*function.subquery->node, visible);
+            break;
+        }
+        case TableReferenceType::EMPTY_FROM:
+            break;
+        default:
+            throw NotImplementedException("Unsupported table reference in Yardstick definition");
+        }
+    }
+};
+
 // Persist resolved source names, so USE/search_path changes in a later session
 // cannot redirect a stored measure to an unrelated table. Keep declaration SQL
 // intact, including AS MEASURE, comments, and header column aliases.
 string QualifyDefinitionSources(ClientContext &context, DefinitionScope &definitions, const string &sql,
                                 SelectStatement &query, bool temporary_store) {
     vector<std::pair<idx_t, std::pair<idx_t, string>>> replacements;
-    std::set<string> cte_names;
-    std::function<void(QueryNode &)> collect_ctes;
-    std::function<void(unique_ptr<ParsedExpression> &)> collect_expression;
-    collect_expression = [&](unique_ptr<ParsedExpression> &expression) {
-        if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
-            collect_ctes(SubqueryNode(expression->Cast<SubqueryExpression>()));
-        }
-        ParsedExpressionIterator::EnumerateChildren(*expression, collect_expression);
-    };
-    collect_ctes = [&](QueryNode &node) {
-        for (auto &entry : node.cte_map.map) {
-            cte_names.insert(StringUtil::Lower(NameString(entry.first)));
-#if YARDSTICK_NEW_EXPR_API
-            collect_ctes(*entry.second->query_node);
-#else
-            collect_ctes(*entry.second->query->node);
-#endif
-        }
-        ParsedExpressionIterator::EnumerateQueryNodeChildren(node, collect_expression);
-    };
-    collect_ctes(*query.node);
     auto identifier_end = [&](idx_t start) {
         if (sql[start] == '"') {
             auto end = start + 1;
@@ -596,18 +765,9 @@ string QualifyDefinitionSources(ClientContext &context, DefinitionScope &definit
         return end;
     };
     auto tokens = Parser::Tokenize(sql);
-    std::function<void(unique_ptr<ParsedExpression> &)> visit_expression;
-    std::function<void(TableRef &)> visit_ref;
-    visit_expression = [&](unique_ptr<ParsedExpression> &expression) {
-        if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
-            ParsedExpressionIterator::EnumerateQueryNodeChildren(
-                SubqueryNode(expression->Cast<SubqueryExpression>()), visit_expression, visit_ref);
-        }
-        ParsedExpressionIterator::EnumerateChildren(*expression, visit_expression);
-    };
-    visit_ref = [&](TableRef &ref) {
-        if (ref.type != TableReferenceType::BASE_TABLE || !ref.query_location.IsValid()) return;
-        auto input = GetName(ref.Cast<BaseTableRef>());
+    DefinitionSourceVisitor visitor([&](BaseTableRef &ref, const DefinitionSourceVisitor::CteNames &cte_names) {
+        if (!ref.query_location.IsValid()) return;
+        auto input = GetName(ref);
         if (input.catalog.empty() && input.schema.empty() && cte_names.count(StringUtil::Lower(input.name))) return;
         ViewName resolved;
         if (auto entry = FindNativeEntry(context, input)) {
@@ -638,8 +798,8 @@ string QualifyDefinitionSources(ClientContext &context, DefinitionScope &definit
             next++;
         }
         replacements.push_back({start, {end, resolved.SQL()}});
-    };
-    ParsedExpressionIterator::EnumerateQueryNodeChildren(*query.node, visit_expression, visit_ref);
+    });
+    visitor.Query(*query.node);
     auto result = sql;
     std::sort(replacements.begin(), replacements.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
     for (auto &replacement : replacements) {
@@ -730,6 +890,7 @@ void RegisterYardstickDefinitionStore(DBConfig &config) {
             auto &drop = target->Cast<LogicalSimple>().info->Cast<DropInfo>();
             if (drop.type != CatalogType::VIEW_ENTRY) return;
             name = GetName(drop);
+            if (FindNativeEntry(input.context, name)) return;
             sql = drop.ToString();
         } else {
             return;
@@ -771,7 +932,8 @@ BoundStatement BindYardstickDefinitionStatement(ClientContext &context, Binder &
         auto create = StringUtil::StartsWith(StringUtil::Lower(table), "\"temp\".")
             ? "CREATE TEMP TABLE IF NOT EXISTS " : "CREATE TABLE IF NOT EXISTS ";
         return BindSQL(context, parent, create + table +
-            " (view_catalog VARCHAR, view_schema VARCHAR, view_name VARCHAR, definition_sql VARCHAR)",
+            " AS SELECT ''::VARCHAR AS view_catalog, ''::VARCHAR AS view_schema, ''::VARCHAR AS view_name, "
+            "'yardstick_guard_v1:' || uuid()::VARCHAR AS definition_sql",
             YardstickBuiltinParserOptions());
     }
     if (FirstKeyword(data.sql) == "EXPLAIN") {
@@ -871,15 +1033,21 @@ BoundStatement BindYardstickDefinitionStatement(ClientContext &context, Binder &
             ? "UPDATE " + table + " SET definition_sql = " + QuoteString(definition_sql) + " WHERE " + KeyPredicate(name)
             : "INSERT INTO " + table + " (view_catalog, view_schema, view_name, definition_sql) VALUES (" +
               QuoteString(name.catalog) + ", " + QuoteString(name.schema) + ", " + QuoteString(name.name) + ", " + QuoteString(definition_sql) + ")";
-        return BindDefinitionWrite(context, parent, sql);
+        return BindDefinitionWrite(context, parent, sql, table, definitions.guard_token);
     }
     if (statement.type == StatementType::DROP_STATEMENT) {
         auto &drop = *statement.Cast<DropStatement>().info;
         if (drop.type == CatalogType::VIEW_ENTRY) {
-            auto definition = definitions.Find(GetName(drop));
+            auto name = GetName(drop);
+            // A native temporary view can shadow a stored permanent view.
+            // Match DuckDB's target precedence before deleting a durable row.
+            if (FindNativeEntry(context, name)) {
+                return BindYardstickUnstoredStatement(context, parent, data.sql, data.options);
+            }
+            auto definition = definitions.Find(name);
             if (definition) {
                 return BindDefinitionWrite(context, parent,
-                    "DELETE FROM " + table + " WHERE " + KeyPredicate(definition->name));
+                    "DELETE FROM " + table + " WHERE " + KeyPredicate(definition->name), table, definitions.guard_token);
             }
             return BindYardstickUnstoredStatement(context, parent, data.sql, data.options);
         }

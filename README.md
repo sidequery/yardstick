@@ -157,6 +157,9 @@ The setting selects the **attachment, schema, and table**. The schema must alrea
 exist; Yardstick creates the definitions table on the first permanent measure-view
 declaration. It uses four `VARCHAR` columns: `view_catalog`, `view_schema`,
 `view_name`, and `definition_sql`.
+One reserved row has empty catalog, schema, and view names and holds the
+transaction concurrency guard. To list only view definitions, filter with
+`WHERE view_name <> ''`.
 
 The selected table is the sole source of truth. `CREATE VIEW ... AS MEASURE`
 inserts a definition, `CREATE OR REPLACE VIEW` updates it, and `DROP VIEW` removes
@@ -164,6 +167,20 @@ it. Replacing a managed view with an ordinary view definition keeps that definit
 in the selected table. These writes use ordinary attachment table operations in
 the caller's transaction, so `ROLLBACK` also rolls back definition changes. Source
 data is never copied or materialized.
+
+Definition writes update and verify that guard in the same transaction before
+changing a view. Competing writers can receive a transaction conflict and should
+retry in a fresh transaction. This works without requiring UNIQUE constraints
+from the attachment. Direct external edits to the table bypass this protection.
+
+An existing definitions table without a guard remains readable. Before writing,
+initialize its guard once with exclusive writer access:
+
+```sql
+INSERT INTO lake.semantic.yardstick_views
+    (view_catalog, view_schema, view_name, definition_sql)
+VALUES ('', '', '', 'yardstick_guard_v1:' || uuid()::VARCHAR);
+```
 
 In a later session, attach the same databases and set the same
 `yardstick_definition_table`; queries resolve the stored definitions automatically.

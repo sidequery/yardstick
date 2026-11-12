@@ -147,7 +147,7 @@ statement ok
 DROP VIEW stored_sales;
 
 query I
-SELECT count(*) FROM definition_store.main.views;
+SELECT count(*) FROM definition_store.main.views WHERE view_name<>'';
 ----
 0
 
@@ -270,7 +270,7 @@ statement ok
 DROP VIEW stored_sales;
 
 query I
-SELECT count(*) FROM definition_store.main.views;
+SELECT count(*) FROM definition_store.main.views WHERE view_name<>'';
 ----
 0
 
@@ -281,6 +281,117 @@ statement error
 SET yardstick_definition_table='main.views';
 ----
 catalog.schema.table
+
+statement ok
+RESET yardstick_definition_table;
+
+# Competing sessions must not commit duplicate keys, including case variants.
+statement ok
+SET threads=1;
+
+statement ok
+SET yardstick_definition_table='definition_store.main.guarded_views';
+
+statement ok
+CREATE VIEW guard_seed AS SELECT SUM(amount) AS MEASURE total FROM definition_sales;
+
+statement ok guard_one
+SET yardstick_definition_table='definition_store.main.guarded_views';
+
+statement ok guard_two
+SET yardstick_definition_table='definition_store.main.guarded_views';
+
+statement ok guard_one
+BEGIN;
+
+query I guard_one
+SELECT count(*) FROM definition_store.main.guarded_views WHERE view_name<>'';
+----
+1
+
+statement ok guard_two
+BEGIN;
+
+query I guard_two
+SELECT count(*) FROM definition_store.main.guarded_views WHERE view_name<>'';
+----
+1
+
+statement ok guard_one
+CREATE VIEW GuardRace AS SELECT SUM(amount) AS MEASURE total FROM definition_sales;
+
+statement error guard_two
+CREATE VIEW guardrace AS SELECT SUM(amount * 2) AS MEASURE total FROM definition_sales;
+----
+Conflict
+
+statement ok guard_one
+COMMIT;
+
+statement ok guard_two
+ROLLBACK;
+
+query I
+SELECT count(*) FROM definition_store.main.guarded_views WHERE lower(view_name)='guardrace';
+----
+1
+
+query I
+SELECT AGGREGATE(total) FROM guardrace;
+----
+70
+
+# An old snapshot cannot insert a duplicate after the winning writer commits.
+statement ok guard_two
+BEGIN;
+
+query I guard_two
+SELECT count(*) FROM definition_store.main.guarded_views WHERE view_name<>'';
+----
+2
+
+statement ok
+CREATE VIEW GuardStale AS SELECT SUM(amount) AS MEASURE total FROM definition_sales;
+
+statement error guard_two
+CREATE VIEW guardstale AS SELECT SUM(amount * 3) AS MEASURE total FROM definition_sales;
+----
+Conflict
+
+statement ok guard_two
+ROLLBACK;
+
+query I
+SELECT AGGREGATE(total) FROM guard_seed;
+----
+70
+
+# Guard changes also roll back, allowing subsequent mutations to succeed.
+statement ok
+BEGIN;
+
+statement ok
+CREATE OR REPLACE VIEW guard_seed AS SELECT SUM(amount * 2) AS MEASURE total FROM definition_sales;
+
+statement ok
+DROP VIEW guard_seed;
+
+statement ok
+CREATE VIEW guard_seed AS SELECT SUM(amount * 3) AS MEASURE total FROM definition_sales;
+
+statement ok
+ROLLBACK;
+
+statement ok
+CREATE OR REPLACE VIEW guard_seed AS SELECT SUM(amount * 4) AS MEASURE total FROM definition_sales;
+
+query I
+SELECT AGGREGATE(total) FROM guard_seed;
+----
+280
+
+statement ok
+RESET threads;
 
 statement ok
 RESET yardstick_definition_table;
@@ -298,7 +409,7 @@ SELECT AGGREGATE(total) FROM session_only;
 70
 
 query I
-SELECT count(*) FROM temp.main.session_views;
+SELECT count(*) FROM temp.main.session_views WHERE view_name<>'';
 ----
 1
 
