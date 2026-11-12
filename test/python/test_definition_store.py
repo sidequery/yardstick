@@ -172,6 +172,23 @@ class DefinitionStoreTests(unittest.TestCase):
         )
         self.assertEqual(rows, [["7"], ["7"], ["7"]])
 
+    def test_commented_definitions_with_same_name_in_different_schemas(self):
+        self.run_sql(
+            "create schema store.first_schema; create schema store.second_schema;"
+            "create table store.main.sales as select 7 amount;"
+            "set yardstick_definition_table='store.main.definitions';"
+            "/* Keep the declaration comment. */ create view store.first_schema.same_name as "
+            "select sum(amount) as measure total from store.main.sales;"
+            "create view store.second_schema.same_name as "
+            "select sum(amount * 3) as measure total from store.main.sales;"
+        )
+        rows = self.run_sql(
+            "set yardstick_definition_table='store.main.definitions';"
+            "select aggregate(total) from store.first_schema.same_name;"
+            "select aggregate(total) from store.second_schema.same_name;"
+        )
+        self.assertEqual(rows, [["7"], ["21"]])
+
     def test_existing_table_guard_initialization_preserves_definitions(self):
         self.create_sales_view()
         rows = self.run_sql(

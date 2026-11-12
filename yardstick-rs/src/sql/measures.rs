@@ -1767,38 +1767,44 @@ pub fn extract_all_aggregate_calls(sql: &str) -> Vec<(String, usize, usize)> {
 // Nom Parsers - CREATE VIEW
 // =============================================================================
 
-/// Parse CREATE [OR REPLACE] VIEW name
-fn create_view_header(input: &str) -> IResult<&str, &str> {
-    let (input, _) = multispace0(input)?;
-    let (input, _) = tag_no_case("CREATE")(input)?;
-    let (input, _) = multispace1(input)?;
-
-    // Optional OR REPLACE
-    let (input, _) = opt(tuple((
-        tag_no_case("OR"),
-        multispace1,
-        tag_no_case("REPLACE"),
-        multispace1,
-    )))(input)?;
-
-    // Optional TEMP/TEMPORARY
-    let (input, _) = opt(tuple((
-        alt((tag_no_case("TEMPORARY"), tag_no_case("TEMP"))),
-        multispace1,
-    )))(input)?;
-
-    let (input, _) = tag_no_case("VIEW")(input)?;
-    let (input, _) = multispace1(input)?;
-    let (input, name) = identifier(input)?;
-
-    Ok((input, name))
-}
-
 /// Extract view name from CREATE VIEW statement
 pub fn extract_view_name(sql: &str) -> Option<String> {
-    create_view_header(sql)
-        .ok()
-        .map(|(_, name)| name.to_string())
+    let upper = sql.to_ascii_uppercase();
+    let mut idx = skip_ws_and_comments(sql, 0);
+    if !matches_keyword_at(&upper, idx, "CREATE") {
+        return None;
+    }
+    idx = skip_ws_and_comments(sql, idx + "CREATE".len());
+    if matches_keyword_at(&upper, idx, "OR") {
+        idx = skip_ws_and_comments(sql, idx + "OR".len());
+        if !matches_keyword_at(&upper, idx, "REPLACE") {
+            return None;
+        }
+        idx = skip_ws_and_comments(sql, idx + "REPLACE".len());
+    }
+    for keyword in ["TEMPORARY", "TEMP"] {
+        if matches_keyword_at(&upper, idx, keyword) {
+            idx = skip_ws_and_comments(sql, idx + keyword.len());
+            break;
+        }
+    }
+    if !matches_keyword_at(&upper, idx, "VIEW") {
+        return None;
+    }
+    idx = skip_ws_and_comments(sql, idx + "VIEW".len());
+    if matches_keyword_at(&upper, idx, "IF") {
+        idx = skip_ws_and_comments(sql, idx + "IF".len());
+        if !matches_keyword_at(&upper, idx, "NOT") {
+            return None;
+        }
+        idx = skip_ws_and_comments(sql, idx + "NOT".len());
+        if !matches_keyword_at(&upper, idx, "EXISTS") {
+            return None;
+        }
+        idx = skip_ws_and_comments(sql, idx + "EXISTS".len());
+    }
+    let end = parse_qualified_name_span(sql, idx)?;
+    extract_last_qualified_identifier(&sql[idx..end])
 }
 
 /// Extract view name from DROP VIEW statement
@@ -10825,6 +10831,18 @@ FROM orders"#;
         assert_eq!(
             extract_view_name("CREATE OR REPLACE TEMPORARY VIEW temp_bar AS SELECT 1"),
             Some("temp_bar".to_string())
+        );
+        assert_eq!(
+            extract_view_name("/* declaration */ CREATE VIEW catalog.schema.foo AS SELECT 1"),
+            Some("foo".to_string())
+        );
+        assert_eq!(
+            extract_view_name("-- declaration\nCREATE VIEW IF /* gap */ NOT EXISTS \"schema\".\"foo.bar\" (x) AS SELECT 1"),
+            Some("foo.bar".to_string())
+        );
+        assert_eq!(
+            extract_view_name("CREATE /* gap */ OR REPLACE VIEW \"foo\"\"bar\" AS SELECT 1"),
+            Some("foo\"bar".to_string())
         );
     }
 
