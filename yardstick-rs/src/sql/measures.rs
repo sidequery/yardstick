@@ -64,8 +64,28 @@ enum MeasureOverlayEntry {
 }
 
 thread_local! {
+    // Configured definition stores hydrate only the current binding. Never
+    // publish these entries to the legacy, process-global namespace.
+    static MEASURE_VIEW_NAMESPACES: RefCell<Vec<HashMap<String, MeasureView>>> =
+        const { RefCell::new(Vec::new()) };
     static MEASURE_VIEW_OVERLAYS: RefCell<Vec<HashMap<String, MeasureOverlayEntry>>> =
         const { RefCell::new(Vec::new()) };
+}
+
+pub fn push_measure_view_namespace() {
+    MEASURE_VIEW_NAMESPACES.with(|namespaces| namespaces.borrow_mut().push(HashMap::new()));
+}
+
+pub fn pop_measure_view_namespace() {
+    MEASURE_VIEW_NAMESPACES.with(|namespaces| { namespaces.borrow_mut().pop(); });
+}
+
+pub fn rename_measure_view(old_name: &str, new_name: &str) {
+    if let Some(mut view) = get_measure_view(old_name) {
+        write_measure_view(old_name, None);
+        view.view_name = new_name.to_string();
+        write_measure_view(new_name, Some(view));
+    }
 }
 
 pub fn push_measure_view_overlay() {
@@ -95,7 +115,8 @@ pub fn bypass_measure_view_overlay(name: &str) {
 // Return owned data: callers may invoke parser callbacks, including nested
 // lookups, without holding either the global mutex or a thread-local borrow.
 fn measure_views_snapshot() -> HashMap<String, MeasureView> {
-    let permanent = MEASURE_VIEWS.lock().unwrap().clone();
+    let permanent = MEASURE_VIEW_NAMESPACES.with(|namespaces| namespaces.borrow().last().cloned())
+        .unwrap_or_else(|| MEASURE_VIEWS.lock().unwrap().clone());
     if MEASURE_VIEW_OVERLAYS.with(|overlays| overlays.borrow().iter().all(HashMap::is_empty)) {
         return permanent;
     }
@@ -131,6 +152,18 @@ fn write_measure_view(name: &str, view: Option<MeasureView>) {
         false
     });
     if !scoped {
+        let namespaced = MEASURE_VIEW_NAMESPACES.with(|namespaces| {
+            let mut namespaces = namespaces.borrow_mut();
+            let Some(views) = namespaces.last_mut() else { return false; };
+            remove_measure_view_case_insensitive(views, name);
+            if let Some(view) = view.clone() {
+                views.insert(view.view_name.clone(), view);
+            }
+            true
+        });
+        if namespaced {
+            return;
+        }
         let mut views = MEASURE_VIEWS.lock().unwrap();
         remove_measure_view_case_insensitive(&mut views, name);
         if let Some(view) = view {
@@ -5248,9 +5281,10 @@ fn find_expression_start(sql: &str, end: usize) -> usize {
         }
     }
 
-    // Find actual start by looking for comma
-    let byte_pos: usize = chars[..pos].iter().collect::<String>().len();
-    sql[..byte_pos].rfind(',').map(|p| p + 1).unwrap_or(0)
+    // The scan stopped after SELECT or a projection separator. Searching for
+    // an earlier comma loses the first projection (and can include CREATE VIEW
+    // in its expression when there is no preceding comma).
+    chars[..pos].iter().collect::<String>().len()
 }
 
 // =============================================================================
@@ -8992,6 +9026,40 @@ mod tests {
             dimension_exprs: HashMap::new(),
             group_by_cols: Vec::new(),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_definition_namespaces_are_isolated_and_nested() {
+        let name = "definition_namespace_view";
+        restore_measure_view(overlay_test_view(name));
+        push_measure_view_namespace();
+        assert!(get_measure_view(name).is_none());
+        let mut local = overlay_test_view(name);
+        local.measures[0].expression = "SUM(amount * 2)".to_string();
+        restore_measure_view(local);
+        std::thread::spawn(move || {
+            assert_eq!(get_measure_view(name).unwrap().measures[0].expression, "SUM(amount)");
+        }).join().unwrap();
+        push_measure_view_namespace();
+        assert!(get_measure_view(name).is_none());
+        pop_measure_view_namespace();
+        assert_eq!(get_measure_view(name).unwrap().measures[0].expression, "SUM(amount * 2)");
+        pop_measure_view_namespace();
+        assert_eq!(get_measure_view(name).unwrap().measures[0].expression, "SUM(amount)");
+        drop_measure_view(name);
+    }
+
+    #[test]
+    #[serial]
+    fn test_first_projection_measure_preserves_create_header() {
+        let result = process_create_view(
+            "CREATE VIEW first_projection AS SELECT SUM(amount) AS MEASURE total FROM source",
+        );
+        assert!(result.error.is_none());
+        assert_eq!(result.measures[0].expression, "SUM(amount)");
+        assert!(result.clean_sql.starts_with("CREATE VIEW first_projection AS SELECT NULL AS total"));
+        drop_measure_view("first_projection");
     }
 
     #[test]

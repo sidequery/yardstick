@@ -13,6 +13,7 @@
 #include "frontend_peg.hpp"
 #include "aggregate_decorations.hpp"
 #include "measure_windows.hpp"
+#include "definition_store.hpp"
 #if YARDSTICK_GRAMMAR_EXTENSION
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
@@ -1006,8 +1007,10 @@ static void CollectTablesFromTableRef(TableRef* ref, std::vector<YardstickTableR
         case TableReferenceType::BASE_TABLE: {
             auto* base = static_cast<BaseTableRef*>(ref);
             YardstickTableRef t {};
-            t.table_name = safe_strdup(YsBaseTableName(*base));
+            auto stored_name = duckdb::YardstickStoredRelationName(*base);
+            t.table_name = safe_strdup(stored_name.empty() ? YsBaseTableName(*base) : stored_name);
             t.alias = base->alias.empty() ? nullptr : safe_strdup(YsName(base->alias));
+            if (!stored_name.empty() && !t.alias) t.alias = safe_strdup(YsBaseTableName(*base));
             t.is_subquery = false;
 #if YARDSTICK_GRAMMAR_EXTENSION
             t.schema_qualified = !base->GetQualifiedName().Schema().empty();

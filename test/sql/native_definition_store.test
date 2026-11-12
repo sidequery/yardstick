@@ -1,0 +1,67 @@
+# name: test/sql/native_definition_store.test
+# description: Native header aliases, windows and temporary views with table-backed definitions.
+# group: [yardstick]
+
+require-env YARDSTICK_NATIVE_PEG 1
+
+require yardstick
+
+statement ok
+ATTACH ':memory:' AS native_definition_store;
+
+statement ok
+CREATE TABLE native_definition_sales(region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO native_definition_sales VALUES ('N', 10), ('N', 20), ('S', 40);
+
+statement ok
+SET yardstick_definition_table='native_definition_store.main.views';
+
+statement ok
+CREATE VIEW stored_header(area, total) AS
+SELECT region, SUM(amount) AS MEASURE original_total FROM native_definition_sales;
+
+query TI rowsort
+SELECT area, AGGREGATE(total) FROM stored_header;
+----
+N	30
+S	40
+
+statement ok
+CREATE TEMP VIEW stored_temporary(r, total) AS
+SELECT region, SUM(amount) AS MEASURE revenue FROM native_definition_sales;
+
+query TI rowsort
+SELECT r, AGGREGATE(total) FROM stored_temporary;
+----
+N	30
+S	40
+
+query I
+SELECT count(*) FROM native_definition_store.main.views WHERE view_name='stored_temporary';
+----
+0
+
+statement ok
+DROP VIEW stored_temporary;
+
+statement ok
+CREATE TEMP VIEW stored_temporary AS SELECT 17 AS total;
+
+query I
+SELECT total FROM stored_temporary;
+----
+17
+
+statement ok
+DROP VIEW stored_temporary;
+
+statement ok
+CREATE VIEW stored_window AS SELECT region, amount,
+SUM(amount) OVER () AS MEASURE total FROM native_definition_sales;
+
+query I
+SELECT AGGREGATE(total) AT (ALL) FROM stored_window;
+----
+70

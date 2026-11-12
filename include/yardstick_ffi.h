@@ -19,6 +19,11 @@ extern "C" {
 /* Consult the current measure namespace without treating placeholder columns as dimensions. */
 bool yardstick_is_measure_column(const char* view_name, const char* column_name);
 
+/* Query-local namespace used by configured definition tables. */
+void yardstick_push_measure_view_namespace(void);
+void yardstick_pop_measure_view_namespace(void);
+void yardstick_rename_measure_view(const char* old_name, const char* new_name);
+
 /* =============================================================================
  * AT Modifier Types (matches ContextModifier enum in Rust)
  * ============================================================================= */

@@ -8,6 +8,9 @@
 #include "yardstick_parser_extension.hpp"
 #include "frontend_peg.hpp"
 #include "aggregate_state.hpp"
+#include "definition_store.hpp"
+#include "duckdb/parser/statement/multi_statement.hpp"
+#include "duckdb/parser/statement/prepare_statement.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -155,7 +158,7 @@ static std::string RewritePercentileWithinGroup(const std::string &sql) {
 //=============================================================================
 
 static std::string AggregateWarnings(YardstickAggregateResult &result);
-static void HandleAggregateWarnings(ClientContext &context, const string &warnings);
+void HandleAggregateWarnings(ClientContext &context, const string &warnings);
 
 // DuckDB 2.0 uses Identifier for result and table-function column names.
 using YardstickColumnName = std::decay<decltype(std::declval<QueryResult>().ColumnName(0))>::type;
@@ -1104,7 +1107,7 @@ static bool WarningsAsErrors(ClientContext &context) {
     return setting.GetValue<bool>();
 }
 
-static void HandleAggregateWarnings(ClientContext &context, const string &warnings) {
+void HandleAggregateWarnings(ClientContext &context, const string &warnings) {
     if (warnings.empty()) {
         return;
     }
@@ -2059,6 +2062,79 @@ static vector<unique_ptr<SQLStatement>> DeferMeasureColumnListBatch(const string
 ParserOverrideResult yardstick_parser_override(ParserExtensionInfo *info,
                                                 const std::string &query,
                                                 ParserOptions &options) {
+    if (RouteYardstickDefinitionStatements(query, options)) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+        NativeYardstickParseScope definition_parse_scope(info, options);
+#endif
+        vector<unique_ptr<SQLStatement>> statements;
+        auto defer = [&](const string &sql, bool initialize = false) {
+            auto statement = make_uniq<YardstickDefinitionStatement>(YardstickParserExtension(),
+                make_uniq_base<ParserExtensionParseData, YardstickDefinitionParseData>(sql, options, initialize));
+            auto syntax_options = options;
+#if YARDSTICK_GRAMMAR_EXTENSION
+            syntax_options = *CurrentNativeYardstickParserOptions();
+#endif
+            syntax_options.extensions = nullptr;
+            try {
+                Parser syntax(syntax_options);
+                syntax.ParseQuery(sql);
+                if (syntax.statements.size() == 1) {
+                    statement->named_param_map = syntax.statements[0]->named_param_map;
+#if YARDSTICK_GRAMMAR_EXTENSION
+                    statement->has_anonymous_parameters = syntax.statements[0]->has_anonymous_parameters;
+#endif
+                }
+            } catch (const ParserException &) {
+                // Compatibility syntax is parsed after Yardstick lowering.
+            }
+            return statement;
+        };
+        for (auto &sql : SplitSqlStatements(query)) {
+            StringUtil::Trim(sql);
+            if (sql.empty()) continue;
+            string definition_body;
+            if (StartsWithSemantic(sql, definition_body)) sql = std::move(definition_body);
+            auto pos = SkipWhitespaceAndComments(sql, 0);
+            auto prepare_pos = pos;
+            if (ConsumeKeyword(sql, prepare_pos, "PREPARE")) {
+                auto as_pos = FindTopLevelKeyword(sql, "AS");
+                if (as_pos == string::npos) throw ParserException("Expected AS in PREPARE");
+                Parser parser(YardstickBuiltinParserOptions());
+                parser.ParseQuery(sql.substr(0, as_pos + 2) + " SELECT true");
+                auto &prepare = parser.statements[0]->Cast<PrepareStatement>();
+                prepare.statement = defer(sql.substr(as_pos + 2));
+                statements.push_back(std::move(parser.statements[0]));
+                continue;
+            }
+            // Keep engine-visible session/transaction statements intact. The
+            // setting can be selected earlier in this very statement batch.
+            bool engine_statement = false;
+            for (auto keyword : {"SET", "RESET", "BEGIN", "START", "COMMIT", "ROLLBACK", "ABORT", "ATTACH",
+                                 "DETACH", "LOAD", "INSTALL", "PRAGMA", "EXECUTE"}) {
+                auto next = pos;
+                if (ConsumeKeyword(sql, next, keyword)) {
+                    engine_statement = true;
+                    break;
+                }
+            }
+            if (engine_statement) {
+                Parser parser(YardstickBuiltinParserOptions());
+                parser.ParseQuery(sql);
+                for (auto &statement : parser.statements) statements.push_back(std::move(statement));
+                continue;
+            }
+            auto statement = defer(sql);
+            if (StartsWithCreateViewStatement(sql) && !IsTemporaryCreateViewStatement(sql)) {
+                auto multi = make_uniq<MultiStatement>();
+                multi->statements.push_back(defer(sql, true));
+                multi->statements.push_back(std::move(statement));
+                statements.push_back(std::move(multi));
+            } else {
+                statements.push_back(std::move(statement));
+            }
+        }
+        return ParserOverrideResult(std::move(statements));
+    }
 #if YARDSTICK_GRAMMAR_EXTENSION
     NativeYardstickParseScope native_scope(info, options);
 #endif
@@ -2387,7 +2463,7 @@ public:
 
 // Temporary entries belong to the originating session. A thread-local overlay
 // exposes them to the lowerer without modifying another binder's catalog.
-class DeferredTemporaryMeasureScope {
+class DeferredTemporaryMeasureScope : public YardstickTemporaryDefinitionScope {
 public:
     explicit DeferredTemporaryMeasureScope(DeferredMeasureCatalogState &state) {
         yardstick_push_measure_view_overlay();
@@ -2558,6 +2634,12 @@ static BoundStatement BindDeferredMeasureStatement(ClientContext &context, Binde
 }
 
 static unique_ptr<TableRef> DeferredMeasureSelectBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+    if (YardstickDefinitionStoreConfigured(context)) {
+        auto &info = input.info->Cast<DeferredMeasureFunctionInfo>();
+        input.binder->GetStatementProperties().always_require_rebind = true;
+        return YardstickDefinitionQueryRef(context, input.inputs[0].GetValue<string>(),
+                                           YardstickContextParserOptions(context), info.parser_info.get());
+    }
     auto &info = input.info->Cast<DeferredMeasureFunctionInfo>();
     NativeYardstickBindScope bind_scope(context);
     NativeYardstickParseScope parse_scope(info.parser_info.get(), YardstickContextParserOptions(context));
@@ -2594,6 +2676,29 @@ static unique_ptr<TableRef> DeferredMeasureSelectBindReplace(ClientContext &cont
 }
 #endif
 
+unique_ptr<YardstickTemporaryDefinitionScope> EnterYardstickTemporaryDefinitions(ClientContext &context) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    auto state = context.registered_state->GetOrCreate<DeferredMeasureCatalogState>("yardstick_deferred_catalog");
+    return make_uniq<DeferredTemporaryMeasureScope>(*state);
+#else
+    return nullptr;
+#endif
+}
+
+BoundStatement BindYardstickUnstoredStatement(ClientContext &context, Binder &parent,
+                                             const string &sql, const ParserOptions &options) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+    auto deferred_options = options;
+    if (auto current = CurrentNativeYardstickParserOptions()) deferred_options = *current;
+    return BindDeferredMeasureStatement(context, parent, YardstickDeferredParseData(sql, deferred_options));
+#else
+    Parser parser(options);
+    parser.ParseQuery(sql);
+    auto binder = Binder::CreateBinder(context, &parent);
+    return binder->Bind(*parser.statements[0]);
+#endif
+}
+
 ParserExtensionPlanResult yardstick_plan(ParserExtensionInfo *,
                                           ClientContext &context,
                                           unique_ptr<ParserExtensionParseData> parse_data) {
@@ -2605,6 +2710,17 @@ ParserExtensionPlanResult yardstick_plan(ParserExtensionInfo *,
 
 BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
                                OperatorExtensionInfo *info, SQLStatement &statement) {
+#if !YARDSTICK_GRAMMAR_EXTENSION
+    if (statement.type != StatementType::EXTENSION_STATEMENT &&
+        !YardstickDefinitionParsingBypassed() && YardstickDefinitionStoreConfigured(context)) {
+        auto sql = statement.query.empty() ? context.GetCurrentQuery() : statement.query;
+        if (statement.stmt_length > 0 && statement.stmt_location < sql.size()) {
+            sql = sql.substr(statement.stmt_location, statement.stmt_length);
+        }
+        return BindYardstickDefinitionStatement(context, binder,
+            YardstickDefinitionParseData(sql, context.GetParserOptions()), nullptr);
+    }
+#endif
     switch (statement.type) {
     case StatementType::EXTENSION_STATEMENT: {
         auto &ext_statement = dynamic_cast<ExtensionStatement &>(statement);
@@ -2613,6 +2729,15 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
             auto lookup = context.registered_state->Get<YardstickState>("yardstick");
             if (lookup) {
                 auto state = (YardstickState *)lookup.get();
+                if (auto *definition = dynamic_cast<YardstickDefinitionParseData *>(state->parse_data.get())) {
+#if YARDSTICK_GRAMMAR_EXTENSION
+                    auto *operator_info = dynamic_cast<YardstickOperatorInfo *>(info);
+                    return BindYardstickDefinitionStatement(context, binder, *definition,
+                        operator_info ? operator_info->parser_info.get() : nullptr);
+#else
+                    return BindYardstickDefinitionStatement(context, binder, *definition, nullptr);
+#endif
+                }
 #if YARDSTICK_GRAMMAR_EXTENSION
                 if (auto *deferred = dynamic_cast<YardstickDeferredParseData *>(state->parse_data.get())) {
                     return BindDeferredMeasureStatement(context, binder, *deferred);
@@ -2684,6 +2809,21 @@ BoundStatement yardstick_bind(ClientContext &context, Binder &binder,
 // EXTENSION LOADING
 //=============================================================================
 
+static unique_ptr<TableRef> StoredQueryBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+    if (!YardstickDefinitionStoreConfigured(context)) return nullptr;
+    if (input.inputs.size() > 1) HandleAggregateWarnings(context, input.inputs[1].GetValue<string>());
+    if (input.binder) input.binder->GetStatementProperties().always_require_rebind = true;
+    ParserExtensionInfo *parser_info = nullptr;
+    auto options = YardstickBuiltinParserOptions();
+#if YARDSTICK_GRAMMAR_EXTENSION
+    parser_info = input.info->Cast<DeferredMeasureFunctionInfo>().parser_info.get();
+    options = YardstickContextParserOptions(context);
+#else
+    options = context.GetParserOptions();
+#endif
+    return YardstickDefinitionQueryRef(context, input.inputs[0].GetValue<string>(), options, parser_info);
+}
+
 static void RegisterQueryFunction(ExtensionLoader &loader, TableFunction function,
                                   vector<string> parameter_names, const string &description,
                                   const string &example) {
@@ -2741,6 +2881,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
     auto &db = loader.GetDatabaseInstance();
     auto &config = DBConfig::GetConfig(db);
+    RegisterYardstickDefinitionStore(config);
 
     // Enable parser_override so yardstick intercepts queries before DuckDB's native parser.
     // FALLBACK mode: if our override doesn't handle the query, DuckDB's parser takes over.
@@ -2767,6 +2908,7 @@ static void LoadInternal(ExtensionLoader &loader) {
     // Register table function for AGGREGATE() expansion
     TableFunction query_func("yardstick", {LogicalType::VARCHAR},
                              YardstickQueryFunction, YardstickQueryBind);
+    query_func.bind_replace = StoredQueryBindReplace;
 #if YARDSTICK_GRAMMAR_EXTENSION
     query_func.function_info = make_shared_ptr<DeferredMeasureFunctionInfo>(parser.parser_info);
 #endif
@@ -2775,6 +2917,7 @@ static void LoadInternal(ExtensionLoader &loader) {
                           "SELECT * FROM yardstick('SELECT 1 AS value');");
     TableFunction query_func_with_warnings("yardstick", {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                            YardstickQueryFunction, YardstickQueryBind);
+    query_func_with_warnings.bind_replace = StoredQueryBindReplace;
 #if YARDSTICK_GRAMMAR_EXTENSION
     query_func_with_warnings.function_info = make_shared_ptr<DeferredMeasureFunctionInfo>(parser.parser_info);
 #endif
